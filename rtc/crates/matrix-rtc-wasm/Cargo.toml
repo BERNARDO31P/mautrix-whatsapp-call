@@ -1,0 +1,48 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+[package]
+name = "matrix-rtc-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+matrix-rtc-core = { path = "../matrix-rtc-core" }
+matrix-rtc-call = { path = "../matrix-rtc-call" }
+# The media roster/pool engine (its actor runs on `spawn_local` here); the
+# transport contract, shared key handler and MSC4195 identity derivation and
+# token shapes. Neither pulls livekit/libwebrtc — the browser's media is
+# livekit-js.
+# Without features: no LiveKit client, no matrix-sdk.
+matrix-rtc-call-sdk = { path = "../matrix-rtc-call-sdk" }
+matrix-rtc-transport = { path = "../matrix-rtc-transport" }
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen.workspace = true
+serde-wasm-bindgen.workspace = true
+tokio.workspace = true
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
+async-trait.workspace = true
+futures = "0.3"
+wasm-bindgen-futures = "0.4"
+log.workspace = true
+# Routes the workspace's `log` records to the browser console; see
+# `src/logging.rs`.
+console_log = { version = "1", features = ["color"] }
+console_error_panic_hook = "0.1"
+# `RUST_LOG`-style filter specs, so the same spec works here and over the FFI.
+# No regex: it is a large dependency to put in a wasm bundle.
+env_filter = { version = "0.1", default-features = false }
+
+[dev-dependencies]
+serde_json.workspace = true
+wasm-bindgen-test.workspace = true
+

@@ -1,0 +1,65 @@
+# Build and package output
+/dist/
+/bin/
+.cache/
+**/target/
+target/
+*.log
+*.tmp
+*.test
+*.out
+*.prof
+*.pprof
+coverage.out
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+
+# Downloaded archives and compiled artifacts
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.xz
+*.7z
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Runtime state, credentials and databases
+.env
+.env.*
+generated/
+worker-state/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.pem
+*.key
+*.p12
+
+# Runtime binaries copied into deployment contexts by the build
+/deployment/mautrix-whatsapp-call/bridge/mautrix-whatsapp-call-bridge
+/deployment/mautrix-whatsapp-call/worker/mautrix-whatsapp-call-worker
+/deployment/mautrix-whatsapp-call/worker/mautrix-whatsapp-call-provision
+/bridge/mautrix-whatsapp
+/bridge/start
+
+# IDE / OS state
+.idea/
+.vscode/
+.vs/
+*.user
+*.suo
+.DS_Store
+Thumbs.db

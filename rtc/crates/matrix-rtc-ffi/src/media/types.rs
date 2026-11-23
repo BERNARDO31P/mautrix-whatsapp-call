@@ -1,0 +1,1065 @@
+// Copyright 2026 Element Creations Ltd.
+//
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+// Please see LICENSE in the repository root for full details.
+
+//! FFI DTOs mirroring the transport-agnostic media model, plus the
+//! host-implemented OpenID token provider.
+
+use std::time::Duration;
+
+/// The kind of media stream (mirrors `matrix_rtc_transport::MediaStreamKind`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiStreamKind {
+    Microphone,
+    Camera,
+    ScreenShare,
+    ScreenShareAudio,
+    Data,
+}
+
+impl From<FfiStreamKind> for matrix_rtc_transport::MediaStreamKind {
+    fn from(kind: FfiStreamKind) -> Self {
+        match kind {
+            FfiStreamKind::Microphone => Self::Microphone,
+            FfiStreamKind::Camera => Self::Camera,
+            FfiStreamKind::ScreenShare => Self::ScreenShare,
+            FfiStreamKind::ScreenShareAudio => Self::ScreenShareAudio,
+            FfiStreamKind::Data => Self::Data,
+        }
+    }
+}
+
+impl From<matrix_rtc_transport::MediaStreamKind> for FfiStreamKind {
+    fn from(kind: matrix_rtc_transport::MediaStreamKind) -> Self {
+        use matrix_rtc_transport::MediaStreamKind as Kind;
+        match kind {
+            Kind::Microphone => Self::Microphone,
+            Kind::Camera => Self::Camera,
+            Kind::ScreenShare => Self::ScreenShare,
+            Kind::ScreenShareAudio => Self::ScreenShareAudio,
+            Kind::Data => Self::Data,
+        }
+    }
+}
+
+/// The connection carrying someone's media (034 R23, R28). Contract C6.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiConnectionState {
+    /// Up; a peer's connection also while it is opened for the first time.
+    Connected,
+    /// Our own media only: not yet up for the first time. The call is still
+    /// starting, so not an interruption.
+    Connecting,
+    /// Being re-established after a loss, for as long as that takes; never
+    /// given up while a member publishes there.
+    Reconnecting,
+    /// No transport can serve what the member advertises.
+    Unreachable,
+}
+
+impl From<matrix_rtc_call_sdk::ConnectionState> for FfiConnectionState {
+    fn from(state: matrix_rtc_call_sdk::ConnectionState) -> Self {
+        use matrix_rtc_call_sdk::ConnectionState as State;
+        match state {
+            State::Connected => Self::Connected,
+            State::Connecting => Self::Connecting,
+            State::Reconnecting => Self::Reconnecting,
+            State::Unreachable => Self::Unreachable,
+        }
+    }
+}
+
+/// Why a member's media is not shown although it may be arriving (034 R33).
+/// Draw the avatar for every case. Contract C6.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiUnableToDecrypt {
+    /// Their key has not reached us; after `FfiStabilityConfig.key_grace_ms`
+    /// of failing frames.
+    MissingKey,
+    /// We hold a key for their frames but it does not decrypt them; after
+    /// `FfiStabilityConfig.key_grace_ms` of failing frames.
+    BadKey,
+    /// They published a track declared unencrypted, which is refused and
+    /// never played; at once.
+    NotEncrypted,
+}
+
+impl From<matrix_rtc_call_sdk::UnableToDecrypt> for FfiUnableToDecrypt {
+    fn from(reason: matrix_rtc_call_sdk::UnableToDecrypt) -> Self {
+        use matrix_rtc_call_sdk::UnableToDecrypt as Reason;
+        match reason {
+            Reason::MissingKey => Self::MissingKey,
+            Reason::BadKey => Self::BadKey,
+            Reason::NotEncrypted => Self::NotEncrypted,
+        }
+    }
+}
+
+/// What is interrupting the call now, cause by cause (034 R38). Contract C5.
+///
+/// Each cause changes on its own; the record is empty (reachable, not
+/// lapsed, connected, empty lists) when nothing is interrupted. Member lists
+/// hold `member_id`s on the roster; `unmappable` holds transport identities,
+/// which map to no member. `own_media` is authoritative for our own SFU from
+/// the first value, before our own tile exists.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct FfiInterruptions {
+    pub signalling: crate::FfiSignallingHealth,
+    pub own_membership_lapsed: bool,
+    pub own_media: FfiConnectionState,
+    pub members_reconnecting: Vec<String>,
+    pub members_unreachable: Vec<String>,
+    pub unable_to_decrypt: Vec<String>,
+    pub unmappable: Vec<String>,
+}
+
+impl From<matrix_rtc_call_sdk::Interruptions> for FfiInterruptions {
+    fn from(record: matrix_rtc_call_sdk::Interruptions) -> Self {
+        Self {
+            signalling: record.signalling.into(),
+            own_membership_lapsed: record.own_membership_lapsed,
+            own_media: record.own_media.into(),
+            members_reconnecting: record.members_reconnecting,
+            members_unreachable: record.members_unreachable,
+            unable_to_decrypt: record.unable_to_decrypt,
+            unmappable: record.unmappable,
+        }
+    }
+}
+
+/// Live state of one stream of a participant.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiStreamState {
+    pub kind: FfiStreamKind,
+    pub muted: bool,
+}
+
+/// One joined membership of the call, with its current media streams.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiParticipant {
+    /// `member.id` of the membership — unique per join, the roster key.
+    pub member_id: String,
+    pub user_id: String,
+    pub device_id: Option<String>,
+    pub is_local: bool,
+    /// The connection carrying this member's media; for our own row, our
+    /// own SFU's. Contract C6.
+    pub connection: FfiConnectionState,
+    /// Why their media cannot be shown, if it cannot; a key failure only
+    /// after `FfiStabilityConfig.key_grace_ms` (4 s) without a break, so a key rotation does not flicker it.
+    /// Always `None` for our own row.
+    pub unable_to_decrypt: Option<FfiUnableToDecrypt>,
+    pub streams: Vec<FfiStreamState>,
+    /// When this participant raised their hand (ms since the epoch), or
+    /// `None` while it is down.
+    pub hand_raised_at_ms: Option<u64>,
+    /// Place in the raised-hand queue, 1 for the earliest, among participants
+    /// on the roster; `None` while the hand is down. Read this rather than
+    /// sorting `hand_raised_at_ms`: the core owns the order.
+    pub hand_raised_position: Option<u32>,
+}
+
+impl From<matrix_rtc_call_sdk::Participant> for FfiParticipant {
+    fn from(participant: matrix_rtc_call_sdk::Participant) -> Self {
+        Self {
+            member_id: participant.member_id,
+            user_id: participant.user_id,
+            device_id: participant.device_id,
+            is_local: participant.is_local,
+            connection: participant.connection.into(),
+            unable_to_decrypt: participant.unable_to_decrypt.map(Into::into),
+            hand_raised_at_ms: participant.hand_raised_at_ms,
+            hand_raised_position: participant.hand_raised_position,
+            streams: participant
+                .streams
+                .into_iter()
+                .map(|stream| FfiStreamState {
+                    kind: stream.kind.into(),
+                    muted: stream.muted,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Identity of one call tile: the pair `(member_id, kind)`. Stable for as
+/// long as the tile is in the call. Join [`FfiTileRoster::detail`] to
+/// [`FfiTileRoster::order`] by this, never by index. Contract C1.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FfiTileId {
+    pub member_id: String,
+    pub kind: FfiTileKind,
+}
+
+/// What a tile is: a person — their camera, their microphone state — or a
+/// screen they are sharing. Not an [`FfiStreamKind`]: which stream a tile
+/// draws follows from this (person → camera, share → screen share), and a
+/// microphone is never a tile. Contract C1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiTileKind {
+    Person,
+    ScreenShare,
+}
+
+impl From<matrix_rtc_call_sdk::TileKind> for FfiTileKind {
+    fn from(kind: matrix_rtc_call_sdk::TileKind) -> Self {
+        match kind {
+            matrix_rtc_call_sdk::TileKind::Person => Self::Person,
+            matrix_rtc_call_sdk::TileKind::ScreenShare => Self::ScreenShare,
+        }
+    }
+}
+
+impl From<FfiTileKind> for matrix_rtc_call_sdk::TileKind {
+    fn from(kind: FfiTileKind) -> Self {
+        match kind {
+            FfiTileKind::Person => Self::Person,
+            FfiTileKind::ScreenShare => Self::ScreenShare,
+        }
+    }
+}
+
+impl From<matrix_rtc_call_sdk::TileId> for FfiTileId {
+    fn from(id: matrix_rtc_call_sdk::TileId) -> Self {
+        Self {
+            member_id: id.member_id,
+            kind: id.kind.into(),
+        }
+    }
+}
+
+impl From<FfiTileId> for matrix_rtc_call_sdk::TileId {
+    fn from(id: FfiTileId) -> Self {
+        Self {
+            member_id: id.member_id,
+            kind: id.kind.into(),
+        }
+    }
+}
+
+/// A tile's place in the order: identity, whose tile it is, and whether it
+/// is a hero — enough to place it and to draw it as an avatar with a name,
+/// nothing about what the member is doing. One per tile in the call, always.
+/// Contract C2.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiTileRef {
+    pub id: FfiTileId,
+    pub user_id: String,
+    pub hero: bool,
+}
+
+impl From<matrix_rtc_call_sdk::TileRef> for FfiTileRef {
+    fn from(r: matrix_rtc_call_sdk::TileRef) -> Self {
+        Self {
+            id: r.id.into(),
+            user_id: r.user_id,
+            hero: r.hero,
+        }
+    }
+}
+
+/// One renderable stream of one membership, with what a UI needs to place
+/// and decorate it. `microphone_muted` is the member's microphone; this
+/// tile's own stream state is `has_video`. Mirrors
+/// [`matrix_rtc_call_sdk::CallTile`], where every field is documented.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiCallTile {
+    pub member_id: String,
+    pub kind: FfiTileKind,
+    pub user_id: String,
+    pub device_id: Option<String>,
+    pub hero: bool,
+    pub has_video: bool,
+    pub microphone_muted: bool,
+    /// Speaking now, undamped: what a speaking ring means. Only the order is
+    /// damped (`FfiStabilityConfig`), so a tile can be speaking and not move.
+    pub speaking: bool,
+    pub hand_raised_at_ms: Option<u64>,
+    /// See `FfiParticipant.hand_raised_position`.
+    pub hand_raised_position: Option<u32>,
+    /// The connection carrying this member's media; on the own tile, our own
+    /// SFU's. Draw the avatar over a remote tile that is not `Connected` or
+    /// is `unable_to_decrypt`: `has_video` does not move for either.
+    /// Contract C6.
+    pub connection: FfiConnectionState,
+    /// See `FfiParticipant.unable_to_decrypt`. Always `None` on the own tile.
+    pub unable_to_decrypt: Option<FfiUnableToDecrypt>,
+}
+
+impl From<matrix_rtc_call_sdk::CallTile> for FfiCallTile {
+    // `joined_at_ms` stays on the Rust side: it only ranks, nothing decorates
+    // with it, and it is `None` for every native MSC4143 membership today.
+    fn from(t: matrix_rtc_call_sdk::CallTile) -> Self {
+        Self {
+            member_id: t.member_id,
+            kind: t.kind.into(),
+            user_id: t.user_id,
+            device_id: t.device_id,
+            hero: t.hero,
+            has_video: t.has_video,
+            microphone_muted: t.microphone_muted,
+            speaking: t.speaking,
+            hand_raised_at_ms: t.hand_raised_at_ms,
+            hand_raised_position: t.hand_raised_position,
+            connection: t.connection.into(),
+            unable_to_decrypt: t.unable_to_decrypt.map(Into::into),
+        }
+    }
+}
+
+/// The tile roster: every remote tile in rank order (`order`, never
+/// truncated) and full records for the declared detail window (`detail`, a
+/// subsequence of `order` — join by [`FfiTileId`]). Contract C2, C10, C12.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiTileRoster {
+    pub order: Vec<FfiTileRef>,
+    pub detail: Vec<FfiCallTile>,
+}
+
+impl From<matrix_rtc_call_sdk::TileRoster> for FfiTileRoster {
+    fn from(r: matrix_rtc_call_sdk::TileRoster) -> Self {
+        Self {
+            order: r.order.into_iter().map(Into::into).collect(),
+            detail: r.detail.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Our own tile, beside the roster and never in it, and whether we are
+/// sharing our screen — publication state (up and unmuted), not intent, so
+/// it goes false however the share ended. Contract C3, C8.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiLocalState {
+    pub tile: FfiCallTile,
+    pub is_screen_sharing: bool,
+}
+
+impl From<matrix_rtc_call_sdk::LocalState> for FfiLocalState {
+    fn from(s: matrix_rtc_call_sdk::LocalState) -> Self {
+        Self {
+            tile: s.tile.into(),
+            is_screen_sharing: s.is_screen_sharing,
+        }
+    }
+}
+
+/// How much the tile order (R10, R11) and a tile's key failures (034 C6) are
+/// damped. A product decision rather than a protocol one, so a host can tune it; the defaults are what
+/// `matrix_rtc_call_sdk::StabilityConfig` uses.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiStabilityConfig {
+    /// Sustained voice before a member ranks as speaking; the tile flag is not delayed.
+    #[uniffi(default = 1500)]
+    pub promote_ms: u64,
+    /// Silence before a speaking member stops ranking as one. Raising this above
+    /// `promote_ms` leaves a tile at the top of the order after the speaker
+    /// stopped, which reads as a stuck UI.
+    #[uniffi(default = 1500)]
+    pub demote_ms: u64,
+    /// Reorders inside this window are delivered as one.
+    #[uniffi(default = 300)]
+    pub coalesce_ms: u64,
+    /// How long a member's frames must fail to decrypt, without a break,
+    /// before `unable_to_decrypt` shows `MissingKey` or `BadKey`. Too short
+    /// and a key rotation flashes it.
+    #[uniffi(default = 4000)]
+    pub key_grace_ms: u64,
+}
+
+impl From<FfiStabilityConfig> for matrix_rtc_call_sdk::StabilityConfig {
+    fn from(c: FfiStabilityConfig) -> Self {
+        Self {
+            promote: Duration::from_millis(c.promote_ms),
+            demote: Duration::from_millis(c.demote_ms),
+            coalesce: Duration::from_millis(c.coalesce_ms),
+            key_grace: Duration::from_millis(c.key_grace_ms),
+        }
+    }
+}
+
+/// Whether a participant's frames are encrypting and decrypting cleanly
+/// (mirrors `matrix_rtc_transport::FrameEncryptionState`).
+///
+/// Reported per participant, not per stream: the frame cryptor is keyed by
+/// participant identity, so a failure does not say which of their tracks it
+/// came from.
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum FfiFrameEncryptionState {
+    /// Frames are being encrypted and decrypted normally.
+    Ok,
+    /// Frames carry a key index we hold no key for — their media key has not
+    /// reached us, or reached us under a different identity.
+    MissingKey,
+    /// We hold a key for that index but it does not decrypt their frames.
+    DecryptionFailed,
+    /// Our *own* outgoing frames failed to encrypt; peers get nothing usable
+    /// from us.
+    EncryptionFailed,
+    /// The cryptor failed internally.
+    InternalError,
+}
+
+/// What the media layer knows about a frame-encryption failure (mirrors
+/// `matrix_rtc_call_sdk::FrameEncryptionDiagnostic`).
+///
+/// The transport's cryptor reports *that* it cannot decrypt, never why. This says
+/// whether any key was installed for that participant at all, which splits a
+/// `MissingKey` into the two cases needing different investigations: nothing ever
+/// arrived (signalling or identity), versus frames carrying an index we have not
+/// been given yet (a rotation in flight).
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum FfiFrameEncryptionDiagnostic {
+    /// The state is not a failure, so there is nothing to explain.
+    NotApplicable,
+    /// No key installed for this participant under any index.
+    NoKeyInstalled,
+    /// Keys installed at these indices, so the frames carry a different one.
+    ///
+    /// Indices are MSC4143 `u8`s, widened here on purpose: uniffi maps
+    /// `Vec<u8>` to a Kotlin `ByteArray`, whose `Byte` is *signed*, so index
+    /// 200 would read as `-56` — while the `keyIndex` on `KeyImported` (a
+    /// scalar `u8`, mapped to `UByte`) would read as `200`. Indices above 127
+    /// are reachable: the core's index wraps at 256.
+    KeysInstalled { key_indices: Vec<u16> },
+}
+
+impl From<matrix_rtc_call_sdk::FrameEncryptionDiagnostic> for FfiFrameEncryptionDiagnostic {
+    fn from(diagnostic: matrix_rtc_call_sdk::FrameEncryptionDiagnostic) -> Self {
+        use matrix_rtc_call_sdk::FrameEncryptionDiagnostic as Diagnostic;
+        match diagnostic {
+            Diagnostic::NotApplicable => Self::NotApplicable,
+            Diagnostic::NoKeyInstalled => Self::NoKeyInstalled,
+            Diagnostic::KeysInstalled { key_indices } => Self::KeysInstalled {
+                key_indices: key_indices.into_iter().map(u16::from).collect(),
+            },
+        }
+    }
+}
+
+/// Why a media key was refused (mirrors `matrix_rtc_core::KeyRejection`).
+///
+/// Typed rather than a message so a host can act on it: `SenderNotConfirmed` is a
+/// "verify this device" prompt, not just something to log.
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum FfiKeyRejection {
+    /// Sent in cleartext, so the sender cannot be authenticated (MSC4143).
+    Cleartext,
+    /// The client does not confirm the sender (MSC4153).
+    SenderNotConfirmed,
+    /// The message named a different room than this session's.
+    RoomMismatch { claimed: String },
+    /// The sender does not match the one on the member event it claims.
+    SenderMismatch { expected: String, actual: String },
+    /// The member event names no sending device, so the required match cannot be
+    /// performed at all.
+    UnverifiableDevice,
+    /// The sending device is not the one that sent the member event.
+    DeviceMismatch {
+        expected: String,
+        actual: Option<String>,
+    },
+}
+
+impl From<matrix_rtc_core::KeyRejection> for FfiKeyRejection {
+    fn from(reason: matrix_rtc_core::KeyRejection) -> Self {
+        use matrix_rtc_core::KeyRejection as Rejection;
+        match reason {
+            Rejection::Cleartext => Self::Cleartext,
+            Rejection::SenderNotConfirmed => Self::SenderNotConfirmed,
+            Rejection::RoomMismatch { claimed } => Self::RoomMismatch { claimed },
+            Rejection::SenderMismatch { expected, actual } => {
+                Self::SenderMismatch { expected, actual }
+            }
+            Rejection::UnverifiableDevice => Self::UnverifiableDevice,
+            Rejection::DeviceMismatch { expected, actual } => {
+                Self::DeviceMismatch { expected, actual }
+            }
+        }
+    }
+}
+
+impl From<matrix_rtc_transport::FrameEncryptionState> for FfiFrameEncryptionState {
+    fn from(state: matrix_rtc_transport::FrameEncryptionState) -> Self {
+        use matrix_rtc_transport::FrameEncryptionState as State;
+        match state {
+            State::Ok => Self::Ok,
+            State::MissingKey => Self::MissingKey,
+            State::DecryptionFailed => Self::DecryptionFailed,
+            State::EncryptionFailed => Self::EncryptionFailed,
+            State::InternalError => Self::InternalError,
+        }
+    }
+}
+
+/// Cumulative receive-side RTP counters for one subscribed stream (mirrors
+/// `matrix_rtc_transport::ReceiveStats`). Obtain via
+/// [`MediaSession::receive_stats`](super::MediaSession::receive_stats).
+///
+/// These exist because the receive path emits frames at a fixed cadence
+/// whether or not RTP is arriving — an audio stream with no incoming packets
+/// still produces 10 ms buffers of jitter-buffer concealment (silence). So
+/// "silent" and "silent because nothing is arriving" are indistinguishable at
+/// the frame level. Every field is a monotonic total since subscription, so
+/// sample twice and compare:
+///
+/// - **Nothing arriving**: `packetsReceived` flat between samples.
+/// - **Arriving but not decoding**: `packetsReceived` climbing while
+///   `framesDecoded` stays flat (video), or `concealedSamples` climbing in
+///   step with `totalSamplesReceived` (audio). Corroborate with
+///   [`FfiCallEvent::FrameEncryptionState`].
+/// - **Arriving and decoding, but lossy**: both climbing, with `packetsLost`
+///   or `jitter` rising.
+///
+/// Fields that don't apply to the stream's media kind stay `0`, so a counter
+/// is only meaningful when read from a query for the kind being diagnosed.
+/// `framesDecoded` off a [`FfiStreamKind::Microphone`] query is `0` however
+/// well video is decoding — identical to what a stalled video decoder reports,
+/// and the reason to pass [`FfiStreamKind::Camera`] when the question is about
+/// video.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiReceiveStats {
+    /// RTP packets received since subscribing.
+    pub packets_received: u64,
+    /// Packets expected and never received; may go briefly negative on
+    /// reordering.
+    pub packets_lost: i64,
+    /// Payload bytes received.
+    pub bytes_received: u64,
+    /// Packet-arrival jitter in seconds.
+    pub jitter: f64,
+    /// Video frames the decoder produced.
+    pub frames_decoded: u64,
+    /// Video frames dropped before rendering.
+    pub frames_dropped: u64,
+    /// Audio samples handed to the output, real or concealed.
+    pub total_samples_received: u64,
+    /// Audio samples invented by the jitter buffer because the real ones never
+    /// arrived.
+    pub concealed_samples: u64,
+    /// The subset of `concealedSamples` emitted as pure silence.
+    pub silent_concealed_samples: u64,
+    /// How many separate times concealment kicked in — a better gap counter
+    /// than the sample totals, which one long outage inflates.
+    pub concealment_events: u64,
+    /// The codec being decoded, as a MIME type (`video/VP9`, `audio/opus`).
+    /// `null` until a report names one.
+    pub codec: Option<String>,
+}
+
+impl From<matrix_rtc_transport::ReceiveStats> for FfiReceiveStats {
+    fn from(stats: matrix_rtc_transport::ReceiveStats) -> Self {
+        Self {
+            packets_received: stats.packets_received,
+            packets_lost: stats.packets_lost,
+            bytes_received: stats.bytes_received,
+            jitter: stats.jitter,
+            frames_decoded: stats.frames_decoded,
+            frames_dropped: stats.frames_dropped,
+            total_samples_received: stats.total_samples_received,
+            concealed_samples: stats.concealed_samples,
+            silent_concealed_samples: stats.silent_concealed_samples,
+            concealment_events: stats.concealment_events,
+            codec: stats.codec,
+        }
+    }
+}
+
+/// Why the encoder is sending less than it was asked to (mirrors
+/// `matrix_rtc_transport::QualityLimitation`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiQualityLimitation {
+    None,
+    /// The device cannot encode fast enough.
+    Cpu,
+    /// The network estimate is too low.
+    Bandwidth,
+    Other,
+}
+
+impl From<matrix_rtc_transport::QualityLimitation> for FfiQualityLimitation {
+    fn from(reason: matrix_rtc_transport::QualityLimitation) -> Self {
+        use matrix_rtc_transport::QualityLimitation as Q;
+        match reason {
+            Q::None => Self::None,
+            Q::Cpu => Self::Cpu,
+            Q::Bandwidth => Self::Bandwidth,
+            Q::Other => Self::Other,
+        }
+    }
+}
+
+/// One encoded layer of a local video publication (mirrors
+/// `matrix_rtc_transport::SendLayerStats`). `frames_encoded` and `bytes_sent`
+/// are cumulative; sizes and frame rate are the encoder's current output.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiSendLayerStats {
+    /// The simulcast layer id (`q`, `h`, `f`), empty for a single layer.
+    pub rid: String,
+    pub frame_width: u32,
+    pub frame_height: u32,
+    pub frames_per_second: f64,
+    pub frames_encoded: u64,
+    pub bytes_sent: u64,
+    /// `false` once no subscriber wants the layer and the SFU paused it
+    /// (dynacast).
+    pub active: bool,
+    pub quality_limitation: FfiQualityLimitation,
+}
+
+/// Send-side statistics for a local video publication, one entry per encoded
+/// layer, smallest first. Obtain via [`FfiLocalTrack::send_stats`].
+///
+/// [`FfiLocalTrack::send_stats`]: super::FfiLocalTrack::send_stats
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiSendStats {
+    pub layers: Vec<FfiSendLayerStats>,
+    /// The codec being encoded, as a MIME type (`video/VP9`): the one
+    /// negotiated, which may not be the [`FfiVideoCodecPreference`] asked for.
+    pub codec: Option<String>,
+}
+
+impl From<matrix_rtc_transport::SendStats> for FfiSendStats {
+    fn from(stats: matrix_rtc_transport::SendStats) -> Self {
+        Self {
+            layers: stats
+                .layers
+                .into_iter()
+                .map(|layer| FfiSendLayerStats {
+                    rid: layer.rid,
+                    frame_width: layer.frame_width,
+                    frame_height: layer.frame_height,
+                    frames_per_second: layer.frames_per_second,
+                    frames_encoded: layer.frames_encoded,
+                    bytes_sent: layer.bytes_sent,
+                    active: layer.active,
+                    quality_limitation: layer.quality_limitation.into(),
+                })
+                .collect(),
+            codec: stats.codec,
+        }
+    }
+}
+
+/// One of a participant's streams, named for a request: the pair
+/// `(member_id, kind)`, of any kind.
+///
+/// Not [`FfiTileId`], on purpose: a tile is a *renderable* stream, camera or
+/// screen share (contract C1), and statistics are also wanted for the
+/// microphone. Build one from a tile with its `member_id` and `kind`.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FfiStreamRef {
+    pub member_id: String,
+    pub kind: FfiStreamKind,
+}
+
+impl From<FfiStreamRef> for (String, matrix_rtc_transport::MediaStreamKind) {
+    fn from(r: FfiStreamRef) -> Self {
+        (r.member_id, r.kind.into())
+    }
+}
+
+/// One entry of [`MediaSession::receive_stats_for`](super::MediaSession::receive_stats_for)'s
+/// answer: the stream asked about and its counters. `stats` is `null`
+/// exactly when [`MediaSession::receive_stats`](super::MediaSession::receive_stats)
+/// would be — not subscribed, or no RTCP report yet — so a host can tell
+/// "asked, and nothing there" from a stream it never asked about.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiStreamStats {
+    pub member_id: String,
+    pub kind: FfiStreamKind,
+    pub stats: Option<FfiReceiveStats>,
+}
+
+/// Zip a request with the engine's positional answer into self-describing
+/// records. Same length is the engine's guarantee.
+pub(super) fn zip_stream_stats(
+    streams: Vec<FfiStreamRef>,
+    results: Vec<Option<matrix_rtc_transport::ReceiveStats>>,
+) -> Vec<FfiStreamStats> {
+    debug_assert_eq!(streams.len(), results.len());
+    streams
+        .into_iter()
+        .zip(results)
+        .map(|(stream, stats)| FfiStreamStats {
+            member_id: stream.member_id,
+            kind: stream.kind,
+            stats: stats.map(Into::into),
+        })
+        .collect()
+}
+
+/// An event on the unified call stream (mirrors
+/// `matrix_rtc_call_sdk::CallEvent`). Consume via
+/// [`MediaSession::next_event`](super::MediaSession::next_event).
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum FfiCallEvent {
+    /// Someone joined while we were in the call; see the core's `CallEvent`.
+    ParticipantJoined {
+        member_id: String,
+        user_id: String,
+        /// Memberships in the call after this change, ourselves included.
+        participant_count: u32,
+    },
+    /// Someone left while we were in the call; see the core's `CallEvent`.
+    ParticipantLeft {
+        member_id: String,
+        /// Memberships in the call after this change, ourselves included.
+        participant_count: u32,
+    },
+    /// Frames for this stream can be obtained now (via `audio_stream` /
+    /// `video_stream`).
+    StreamStarted {
+        member_id: String,
+        kind: FfiStreamKind,
+    },
+    StreamStopped {
+        member_id: String,
+        kind: FfiStreamKind,
+    },
+    StreamMuted {
+        member_id: String,
+        kind: FfiStreamKind,
+    },
+    StreamUnmuted {
+        member_id: String,
+        kind: FfiStreamKind,
+    },
+    /// This participant's media is decryptable from here on.
+    KeyImported { member_id: String, key_index: u8 },
+    /// Frame encryption state for a participant's media changed.
+    ///
+    /// Anything but `Ok` means their frames are not decoding. The RTP may
+    /// still be arriving perfectly well, so the receive path keeps producing
+    /// frames — silence, or a frozen picture. Pair with
+    /// [`MediaSession::receive_stats`](super::MediaSession::receive_stats) to
+    /// tell a key failure from an empty network path.
+    FrameEncryptionState {
+        member_id: String,
+        state: FfiFrameEncryptionState,
+        /// Whether any key was installed for this participant — the half the
+        /// cryptor's own state cannot tell you.
+        diagnostic: FfiFrameEncryptionDiagnostic,
+    },
+    /// A media key for this participant was received and *refused*, so their
+    /// frames will not decrypt. Carries the reason.
+    ///
+    /// Distinct from a key that never arrived: this one arrived and failed a
+    /// check, which is a trust or configuration problem rather than a delivery
+    /// one, and the two are indistinguishable from `MissingKey` alone.
+    KeyDiscarded {
+        member_id: String,
+        key_index: Option<u8>,
+        sender_user_id: Option<String>,
+        sender_device_id: Option<String>,
+        reason: FfiKeyRejection,
+    },
+    /// A participant raised their hand while we are in the call, ours
+    /// included: the cue for a sound. Not sent for the hands up when we
+    /// arrive, a member arriving with a hand up, or a hand that stays up
+    /// across a membership refresh. The state is
+    /// `FfiParticipant.hand_raised_at_ms` / `hand_raised_position`.
+    HandRaised {
+        member_id: String,
+        raised_at_ms: u64,
+    },
+    /// A participant lowered their hand, or left with it up, while we are in
+    /// the call.
+    HandLowered { member_id: String },
+    /// A participant sent an emoji reaction. Transient: show `emoji` for a
+    /// few seconds (Element Call uses three) and, if reaction sounds are on,
+    /// play the asset named by `sound` (`clap`, `party`, …, `generic` for a
+    /// name without a sound of its own; see `reactionCatalog()`). `emoji` is
+    /// the catalogue's for a catalogue name, as Element Call shows. Sent only while we are in the call and for a recent
+    /// reaction (`FfiReactionsConfig.max_age_ms`), never as a replayed burst.
+    Reaction {
+        member_id: String,
+        emoji: String,
+        name: String,
+        sound: String,
+    },
+    /// A transport-level participant with no signalled membership; it gets
+    /// no subscription. Diagnostics only.
+    UnknownParticipant { identity: String },
+}
+
+impl FfiCallEvent {
+    /// The event as a host sees it, or `None` for one the FFI does not relay:
+    /// who is speaking is ranked into the roster (`FfiCallTile::speaking`) rather
+    /// than sent as an event — it was the noisiest thing on the stream and
+    /// nothing drew from it. `CallEvent::ActiveSpeakers` itself survives in the
+    /// core only because the wasm binding still relays it to a web client that
+    /// has no tile roster; once the roster is exposed to wasm, delete the event.
+    pub(super) fn relayed(event: matrix_rtc_call_sdk::CallEvent) -> Option<Self> {
+        use matrix_rtc_call_sdk::CallEvent as Event;
+        Some(match event {
+            Event::ParticipantJoined {
+                member_id,
+                user_id,
+                participant_count,
+            } => Self::ParticipantJoined {
+                member_id,
+                user_id,
+                participant_count,
+            },
+            Event::ParticipantLeft {
+                member_id,
+                participant_count,
+            } => Self::ParticipantLeft {
+                member_id,
+                participant_count,
+            },
+            Event::StreamStarted { member_id, kind } => Self::StreamStarted {
+                member_id,
+                kind: kind.into(),
+            },
+            Event::StreamStopped { member_id, kind } => Self::StreamStopped {
+                member_id,
+                kind: kind.into(),
+            },
+            Event::StreamMuted { member_id, kind } => Self::StreamMuted {
+                member_id,
+                kind: kind.into(),
+            },
+            Event::StreamUnmuted { member_id, kind } => Self::StreamUnmuted {
+                member_id,
+                kind: kind.into(),
+            },
+            Event::ActiveSpeakers { .. } => return None,
+            Event::KeyImported {
+                member_id,
+                key_index,
+                ..
+            } => Self::KeyImported {
+                member_id,
+                key_index,
+            },
+            Event::FrameEncryptionState {
+                member_id,
+                state,
+                diagnostic,
+            } => Self::FrameEncryptionState {
+                member_id,
+                state: state.into(),
+                diagnostic: diagnostic.into(),
+            },
+            Event::KeyDiscarded {
+                member_id,
+                key_index,
+                sender_user_id,
+                sender_device_id,
+                reason,
+            } => Self::KeyDiscarded {
+                member_id,
+                key_index,
+                sender_user_id,
+                sender_device_id,
+                reason: reason.into(),
+            },
+            Event::HandRaised {
+                member_id,
+                raised_at_ms,
+            } => Self::HandRaised {
+                member_id,
+                raised_at_ms,
+            },
+            Event::HandLowered { member_id } => Self::HandLowered { member_id },
+            Event::Reaction {
+                member_id,
+                emoji,
+                name,
+                sound,
+            } => Self::Reaction {
+                member_id,
+                emoji,
+                name,
+                sound,
+            },
+            Event::UnknownParticipant { identity } => Self::UnknownParticipant { identity },
+        })
+    }
+}
+
+/// Coarse quality cap, for callers that don't know their render size.
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum FfiQualityLimit {
+    Low,
+    Medium,
+    High,
+}
+
+/// How much detail to receive for a video stream; the variants are mutually
+/// exclusive. Prefer `Dimensions` — the renderer knows its surface size, the
+/// server knows the publisher's layer ladder.
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum FfiVideoDetail {
+    Auto,
+    Dimensions { width: u32, height: u32 },
+    Quality { limit: FfiQualityLimit },
+}
+
+/// Subscription constraints for one stream of one participant (mirrors
+/// `matrix_rtc_transport::MediaConstraints` — see its docs for the semantics).
+#[derive(Clone, Copy, Debug, uniffi::Record)]
+pub struct FfiMediaConstraints {
+    /// `false` releases the stream as fully as the transport supports; use
+    /// for closed tiles, not scroll-by invisibility.
+    pub enabled: bool,
+    /// `false` pauses the stream (no data, instant resume).
+    pub visible: bool,
+    pub detail: FfiVideoDetail,
+    /// Pause all video of this participant, keep audio.
+    pub low_bandwidth: bool,
+}
+
+impl From<FfiMediaConstraints> for matrix_rtc_transport::MediaConstraints {
+    fn from(constraints: FfiMediaConstraints) -> Self {
+        Self {
+            enabled: constraints.enabled,
+            visible: constraints.visible,
+            detail: match constraints.detail {
+                FfiVideoDetail::Auto => matrix_rtc_transport::VideoDetail::Auto,
+                FfiVideoDetail::Dimensions { width, height } => {
+                    matrix_rtc_transport::VideoDetail::Dimensions(
+                        matrix_rtc_transport::Dimensions { width, height },
+                    )
+                }
+                FfiVideoDetail::Quality { limit } => {
+                    matrix_rtc_transport::VideoDetail::Quality(match limit {
+                        FfiQualityLimit::Low => matrix_rtc_transport::QualityLimit::Low,
+                        FfiQualityLimit::Medium => matrix_rtc_transport::QualityLimit::Medium,
+                        FfiQualityLimit::High => matrix_rtc_transport::QualityLimit::High,
+                    })
+                }
+            },
+            low_bandwidth: constraints.low_bandwidth,
+        }
+    }
+}
+
+/// PCM format the host will push into an audio publication.
+#[derive(Clone, Copy, Debug, uniffi::Record)]
+pub struct FfiAudioSourceConfig {
+    pub sample_rate: u32,
+    pub num_channels: u32,
+}
+
+/// Capture resolution of a video publication.
+#[derive(Clone, Copy, Debug, uniffi::Record)]
+pub struct FfiVideoSourceConfig {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Video codec to publish with (mirrors
+/// `matrix_rtc_transport::VideoCodecPreference`). A preference: a codec this
+/// platform cannot encode falls back to the default; see
+/// [`supported_video_codecs`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiVideoCodecPreference {
+    /// The transport's default (VP8).
+    Auto,
+    Vp8,
+    H264,
+    Vp9,
+    Av1,
+}
+
+impl From<FfiVideoCodecPreference> for matrix_rtc_transport::VideoCodecPreference {
+    fn from(codec: FfiVideoCodecPreference) -> Self {
+        match codec {
+            FfiVideoCodecPreference::Auto => Self::Auto,
+            FfiVideoCodecPreference::Vp8 => Self::Vp8,
+            FfiVideoCodecPreference::H264 => Self::H264,
+            FfiVideoCodecPreference::Vp9 => Self::Vp9,
+            FfiVideoCodecPreference::Av1 => Self::Av1,
+        }
+    }
+}
+
+impl From<matrix_rtc_transport::VideoCodecPreference> for FfiVideoCodecPreference {
+    fn from(codec: matrix_rtc_transport::VideoCodecPreference) -> Self {
+        use matrix_rtc_transport::VideoCodecPreference as Codec;
+        match codec {
+            Codec::Auto => Self::Auto,
+            Codec::Vp8 => Self::Vp8,
+            Codec::H264 => Self::H264,
+            Codec::Vp9 => Self::Vp9,
+            Codec::Av1 => Self::Av1,
+        }
+    }
+}
+
+/// The video codecs this device can encode, for a codec picker. Depends on
+/// the platform and its hardware encoders, so ask rather than assume.
+#[uniffi::export]
+pub fn supported_video_codecs() -> Vec<FfiVideoCodecPreference> {
+    matrix_rtc_livekit::supported_video_codecs()
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+/// Encoder caps of a video publication (mirrors
+/// `matrix_rtc_transport::VideoEncodingLimits`). A `None` field is computed
+/// from the source resolution; with simulcast, the caps apply to the top
+/// layer.
+#[derive(Clone, Copy, Debug, Default, uniffi::Record)]
+pub struct FfiVideoEncodingLimits {
+    #[uniffi(default = None)]
+    pub max_bitrate_bps: Option<u64>,
+    #[uniffi(default = None)]
+    pub max_framerate: Option<u32>,
+}
+
+impl From<FfiVideoEncodingLimits> for matrix_rtc_transport::VideoEncodingLimits {
+    fn from(limits: FfiVideoEncodingLimits) -> Self {
+        Self {
+            max_bitrate_bps: limits.max_bitrate_bps,
+            max_framerate: limits.max_framerate,
+        }
+    }
+}
+
+/// What to publish (mirrors `matrix_rtc_transport::PublishOptions`).
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiPublishOptions {
+    pub kind: FfiStreamKind,
+    /// Required for audio kinds.
+    pub audio: Option<FfiAudioSourceConfig>,
+    /// Required for video kinds.
+    pub video: Option<FfiVideoSourceConfig>,
+    /// Publish multiple quality layers (video only).
+    pub simulcast: bool,
+    /// Publish already muted, for a lobby that joins muted.
+    pub muted: bool,
+    /// Codec to encode with (video only).
+    pub video_codec: FfiVideoCodecPreference,
+    /// Encoder caps (video only).
+    #[uniffi(default = None)]
+    pub video_encoding: Option<FfiVideoEncodingLimits>,
+}
+
+impl From<FfiPublishOptions> for matrix_rtc_transport::PublishOptions {
+    fn from(options: FfiPublishOptions) -> Self {
+        Self {
+            kind: options.kind.into(),
+            audio: options
+                .audio
+                .map(|audio| matrix_rtc_transport::AudioSourceConfig {
+                    sample_rate: audio.sample_rate,
+                    num_channels: audio.num_channels,
+                }),
+            video: options
+                .video
+                .map(|video| matrix_rtc_transport::VideoSourceConfig {
+                    width: video.width,
+                    height: video.height,
+                }),
+            simulcast: options.simulcast,
+            muted: options.muted,
+            video_codec: options.video_codec.into(),
+            video_encoding: options.video_encoding.unwrap_or_default().into(),
+        }
+    }
+}

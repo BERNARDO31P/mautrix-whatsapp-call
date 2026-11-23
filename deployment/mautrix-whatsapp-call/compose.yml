@@ -1,0 +1,119 @@
+# Docker Compose overlay for an existing Matrix/Synapse stack rooted at /opt/matrix.
+# Use: docker compose -f docker-compose.yml -f mautrix-whatsapp-call/compose.yml config
+services:
+  livekit:
+    image: livekit/livekit-server:v1.13.10
+    restart: unless-stopped
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ./mautrix-whatsapp-call/generated/livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "127.0.0.1:7880:7880/tcp"
+      - "7881:7881/tcp"
+      - "7882:7882/udp"
+
+  lk-jwt-service:
+    image: ghcr.io/element-hq/lk-jwt-service:0.9.0
+    restart: unless-stopped
+    depends_on:
+      - synapse
+      - livekit
+    environment:
+      LIVEKIT_URL: "wss://${MATRIXRTC_SERVER_NAME:?MATRIXRTC_SERVER_NAME is required}/livekit/sfu"
+      LIVEKIT_KEY: "lk-matrixrtc"
+      LIVEKIT_SECRET_FROM_FILE: "/run/secrets/livekit_secret"
+      LIVEKIT_FULL_ACCESS_HOMESERVERS: "${MATRIXRTC_SERVER_NAME:?MATRIXRTC_SERVER_NAME is required}"
+      LIVEKIT_JWT_BIND: ":8080"
+      LIVEKIT_HS_SERVER_NAME: "${MATRIXRTC_SERVER_NAME:?MATRIXRTC_SERVER_NAME is required}"
+      LIVEKIT_AS_REGISTRATION_FILE: "/run/secrets/matrixrtc-registration.yaml"
+      LIVEKIT_CS_API_URL_OVERRIDES: "${MATRIXRTC_SERVER_NAME:?MATRIXRTC_SERVER_NAME is required}=http://synapse:8008"
+    volumes:
+      - ./mautrix-whatsapp-call/generated/livekit_secret:/run/secrets/livekit_secret:ro
+      - ./mautrix-whatsapp-call/generated/matrixrtc-registration.yaml:/run/secrets/matrixrtc-registration.yaml:ro
+    ports:
+      - "127.0.0.1:${MATRIXRTC_JWT_HOST_PORT:-18080}:8080/tcp"
+
+  mautrix-whatsapp:
+    image: "mautrix-whatsapp-call-bridge:local"
+    build:
+      context: ./mautrix-whatsapp-call/bridge
+      dockerfile: Dockerfile
+      args:
+        MATRIXRTC_BRIDGE_BASE_IMAGE: "${MATRIXRTC_BRIDGE_BASE_IMAGE:-dock.mau.dev/mautrix/whatsapp:v0.2611.0}"
+    volumes:
+      - mautrix-whatsapp-call-worker-socket:/run/mautrix-whatsapp-call
+    environment:
+      GID: "${MATRIXRTC_SOCKET_GID:-29319}"
+    group_add:
+      - "${MATRIXRTC_SOCKET_GID:-29319}"
+
+  mautrix-whatsapp-call-worker:
+    image: "mautrix-whatsapp-call-worker:local"
+    build:
+      context: ./mautrix-whatsapp-call/worker
+    restart: unless-stopped
+    depends_on:
+      - synapse
+      - livekit
+      - lk-jwt-service
+    user: "0:${MATRIXRTC_SOCKET_GID:-29319}"
+    command: ["/usr/local/bin/mautrix-whatsapp-call-worker"]
+    environment:
+      MATRIX_HOMESERVER: "http://synapse:8008"
+      RTC_WORKER_SOCKET: "/run/mautrix-whatsapp-call/worker.sock"
+      RTC_WORKER_SOCKET_MODE: "0660"
+      RTC_WORKER_STATE_DIR: "/var/lib/mautrix-whatsapp-call"
+      RTC_REPLAY_RETENTION_DAYS: "${MATRIXRTC_REPLAY_RETENTION_DAYS:-90}"
+      RTC_WORKER_STORE_PASSPHRASE_FILE: "/run/secrets/matrixrtc_store_passphrase"
+      RTC_WORKER_FFMPEG: "/usr/bin/ffmpeg"
+      RTC_WORKER_ENABLE_CALLS: "${MATRIXRTC_ENABLE_CALLS:-0}"
+    volumes:
+      - mautrix-whatsapp-call-worker-socket:/run/mautrix-whatsapp-call
+      - ./mautrix-whatsapp-call/worker-state:/var/lib/mautrix-whatsapp-call
+      - ./mautrix-whatsapp-call/generated/matrixrtc_store_passphrase:/run/secrets/matrixrtc_store_passphrase:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=128m
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "mautrix-whatsapp-call-worker", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    stop_grace_period: 55s
+
+  mautrix-whatsapp-call-provisioner:
+    image: "mautrix-whatsapp-call-worker:local"
+    build:
+      context: ./mautrix-whatsapp-call/worker
+    restart: unless-stopped
+    depends_on:
+      - synapse
+    user: "0:0"
+    command: ["python3", "/usr/local/lib/mautrix-whatsapp-call/auto-provision-whatsapp-ghosts.py"]
+    environment:
+      MATRIX_HOMESERVER: "http://synapse:8008"
+      MATRIXRTC_SERVER_NAME: "${MATRIXRTC_SERVER_NAME:?MATRIXRTC_SERVER_NAME is required}"
+      RTC_WORKER_STATE_DIR: "/var/lib/mautrix-whatsapp-call"
+      RTC_WORKER_STORE_PASSPHRASE_FILE: "/run/secrets/matrixrtc_store_passphrase"
+      RTC_AUTOPROVISION_REGISTRATION: "/run/secrets/mautrix-whatsapp-registration.yaml"
+      RTC_AUTOPROVISION_CONFIG: "/run/secrets/mautrix-whatsapp-config.yaml"
+      RTC_AUTOPROVISION_INTERVAL_SECONDS: "${MATRIXRTC_AUTOPROVISION_INTERVAL_SECONDS:-15}"
+      RTC_AUTOPROVISION_CACHE_TTL_SECONDS: "${MATRIXRTC_AUTOPROVISION_CACHE_TTL_SECONDS:-21600}"
+      RTC_AUTOPROVISION_JOBS: "${MATRIXRTC_AUTOPROVISION_JOBS:-4}"
+    volumes:
+      - ./mautrix-whatsapp-call/worker-state:/var/lib/mautrix-whatsapp-call
+      - ./mautrix-whatsapp-call/generated/matrixrtc_store_passphrase:/run/secrets/matrixrtc_store_passphrase:ro
+      - ${MATRIXRTC_WHATSAPP_REGISTRATION_PATH:-./mautrix-whatsapp/registration.yaml}:/run/secrets/mautrix-whatsapp-registration.yaml:ro
+      - ./mautrix-whatsapp/config.yaml:/run/secrets/mautrix-whatsapp-config.yaml:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=128m
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
+
+volumes:
+  mautrix-whatsapp-call-worker-socket:

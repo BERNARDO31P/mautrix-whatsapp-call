@@ -1,0 +1,2027 @@
+// Copyright 2026 Element Creations Ltd.
+//
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+// Please see LICENSE in the repository root for full details.
+
+//! Native UniFFI bindings for the MatrixRTC core.
+//!
+//! The host implements one [`MatrixBackend`] with its Matrix client and
+//! builds an [`RtcClient`] over it; the client opens an [`RtcRoom`] per room,
+//! and a room hands out an [`RtcCall`] per slot joined. The library
+//! subscribes, orders and feeds itself.
+//! This module defines the UniFFI-facing DTOs and object wrappers and converts
+//! them into core DTOs so `matrix-rtc-core` stays decoupled from FFI types.
+
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock as TokioRwLock;
+use tokio::sync::watch;
+
+use matrix_rtc_call::{self as call, RtcError};
+use matrix_rtc_core::JoinedMembership as CoreJoinedMembership;
+#[cfg(feature = "media")]
+use matrix_rtc_core::MatrixBackend as CoreBackend;
+#[cfg(feature = "media")]
+use matrix_rtc_core::compat::DialectBackend;
+mod backend;
+pub mod compat;
+mod logging;
+mod params;
+mod runtime;
+pub use backend::{
+    BackendSubscription, FfiBackend, FfiBackendError, FfiEventEncryption, FfiEventIn,
+    FfiOpenIdToken, FfiRoomSubjects, FfiToDeviceDelivery, FfiToDeviceMessageIn,
+    FfiToDeviceRecipient, MatrixBackend, RoomSink, ToDeviceSink,
+};
+pub use compat::FfiMembershipFormat;
+pub use logging::{
+    RtcLogConfig, RtcLogLevel, RtcLogRecord, RtcLogSink, dropped_log_record_count, log_event,
+    setup_logging,
+};
+pub use params::{
+    FfiCallIntent, FfiCallKind, FfiEncryptionConfig, FfiGroupNotify, FfiJoinSessionParams,
+    FfiJoinTransport, FfiLeaveSessionParams, FfiReactionsConfig, FfiRingConfig,
+};
+
+/// Participants with observable frame streams, publishing, and constraints —
+/// see the module docs. Pulls the LiveKit client (libwebrtc): default off.
+#[cfg(feature = "media")]
+pub mod media;
+#[cfg(feature = "testing")]
+pub mod testing;
+
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum MatrixRtcFfiError {
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+    #[error("internal lock poisoned")]
+    InternalLockPoisoned,
+    /// A reaction or raised hand could not be sent: not joined, reactions
+    /// disabled, inside the send cooldown, or the host's send failed. The
+    /// message says which.
+    #[error("reaction: {0}")]
+    Reaction(String),
+    /// The room is open already (for `RtcClient::room`), or has been shut down.
+    #[error("room attachment: {0}")]
+    Attachment(String),
+    /// The call has left, or its room was shut down; join again for a new one.
+    #[error("the call is over: {0}")]
+    CallOver(String),
+    /// The host's backend failed a read.
+    #[error("backend: {0}")]
+    Backend(String),
+    /// The room's state holds no open slot of this id, so the join was
+    /// refused; somebody with the power level has to open it first.
+    #[error("slot '{0}' is not open in this room")]
+    SlotClosed(String),
+    /// The join did not complete within its 30 s budget: the homeserver kept
+    /// failing, or did not answer (034 R6, R27).
+    #[error("the join timed out")]
+    JoinTimedOut,
+    /// The homeserver refused the join for good (034 R6, R27); `errcode` is
+    /// its Matrix error code when it gave one.
+    #[error("the join was refused: {reason}")]
+    JoinRefused {
+        errcode: Option<String>,
+        reason: String,
+    },
+    /// The homeserver advertises no LiveKit transport of the room's format
+    /// to publish on (spec 038 R18).
+    #[error("the homeserver advertises no usable {transport_type} transport")]
+    NoLiveKitTransport { transport_type: String },
+    /// Our homeserver lacks MSC4195's `get_token` (spec 038 R44).
+    #[error("the homeserver does not support MSC4195 get_token")]
+    TokenEndpointUnsupported,
+}
+
+impl From<matrix_rtc_call::ReactionError> for MatrixRtcFfiError {
+    fn from(error: matrix_rtc_call::ReactionError) -> Self {
+        Self::Reaction(error.to_string())
+    }
+}
+
+impl From<RtcError> for MatrixRtcFfiError {
+    fn from(error: RtcError) -> Self {
+        match error {
+            RtcError::RoomAlreadyOpen(error) => Self::Attachment(error.to_string()),
+            RtcError::Backend(error) => Self::Backend(error.to_string()),
+            RtcError::Reaction(error) => Self::Reaction(error.to_string()),
+            error @ RtcError::SessionOver => Self::CallOver(error.to_string()),
+            RtcError::Join(matrix_rtc_core::JoinError::SlotClosed { slot_id }) => {
+                Self::SlotClosed(slot_id)
+            }
+            RtcError::Join(matrix_rtc_core::JoinError::TimedOut) => Self::JoinTimedOut,
+            RtcError::Join(matrix_rtc_core::JoinError::NoLiveKitTransport { transport_type }) => {
+                Self::NoLiveKitTransport { transport_type }
+            }
+            RtcError::Join(matrix_rtc_core::JoinError::TokenEndpointUnsupported) => {
+                Self::TokenEndpointUnsupported
+            }
+            RtcError::Join(matrix_rtc_core::JoinError::Refused { errcode, message }) => {
+                Self::JoinRefused {
+                    errcode,
+                    reason: message,
+                }
+            }
+            error => Self::InvalidInput(error.to_string()),
+        }
+    }
+}
+
+impl From<matrix_rtc_core::BackendError> for MatrixRtcFfiError {
+    fn from(error: matrix_rtc_core::BackendError) -> Self {
+        Self::Backend(error.to_string())
+    }
+}
+
+/// MSC4143 `leave_reason`: a machine-readable `code` plus an optional
+/// human-readable `reason`.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FfiLeaveReason {
+    pub code: String,
+    pub reason: Option<String>,
+}
+
+impl From<FfiLeaveReason> for matrix_rtc_core::LeaveReason {
+    fn from(value: FfiLeaveReason) -> Self {
+        matrix_rtc_core::LeaveReason {
+            code: matrix_rtc_core::LeaveCode::from_code(&value.code),
+            reason: value.reason,
+        }
+    }
+}
+
+impl From<matrix_rtc_core::LeaveReason> for FfiLeaveReason {
+    fn from(value: matrix_rtc_core::LeaveReason) -> Self {
+        FfiLeaveReason {
+            code: value.code.as_str().to_owned(),
+            reason: value.reason,
+        }
+    }
+}
+
+/// The RTC encryption mechanism an `m.rtc.slot` prescribes for its members.
+///
+/// Its presence is what turns RTC encryption on for the slot; its absence turns
+/// it off. MSC4143 requires it in an encrypted room and forbids it elsewhere, and
+/// a slot that gets this wrong resolves *closed* for every client — which reads
+/// as the call simply never starting.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiSlotEncryption {
+    /// MSC4143 `m.per_member`: each member distributes its own media key. The
+    /// only mechanism this SDK implements, and what an encrypted room wants.
+    PerMember,
+    /// A mechanism named by string. Opening a slot with one this SDK does not
+    /// implement means it cannot join that slot itself; it is here so a host can
+    /// still publish one rather than being unable to express it.
+    Other { encryption_type: String },
+}
+
+impl From<FfiSlotEncryption> for matrix_rtc_core::SlotEncryption {
+    fn from(value: FfiSlotEncryption) -> Self {
+        matrix_rtc_core::SlotEncryption {
+            encryption_type: match value {
+                FfiSlotEncryption::PerMember => "m.per_member".to_owned(),
+                FfiSlotEncryption::Other { encryption_type } => encryption_type,
+            },
+            extra: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// A transport a member publishes media on (MSC4143 `transports.published`).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiRtcTransport {
+    /// MSC4195 LiveKit transport: an SFU `url`, the legacy JWT service's
+    /// `livekit_service_url`, or both; `server_name` names the SFU's
+    /// homeserver when it is not the publisher's.
+    LiveKit {
+        url: Option<String>,
+        livekit_service_url: Option<String>,
+        server_name: Option<String>,
+    },
+    /// A transport this SDK does not know; kept for forward compatibility.
+    Unsupported { transport_type: String },
+}
+
+impl From<&matrix_rtc_core::RtcTransport> for FfiRtcTransport {
+    fn from(transport: &matrix_rtc_core::RtcTransport) -> Self {
+        match transport {
+            matrix_rtc_core::RtcTransport::LiveKit(livekit) => FfiRtcTransport::LiveKit {
+                url: livekit.url().map(str::to_owned),
+                livekit_service_url: livekit.livekit_service_url().map(str::to_owned),
+                server_name: livekit.server_name().map(str::to_owned),
+            },
+            matrix_rtc_core::RtcTransport::Unsupported(unsupported) => {
+                FfiRtcTransport::Unsupported {
+                    transport_type: unsupported.transport_type.clone(),
+                }
+            }
+        }
+    }
+}
+
+/// A member whose hand is up (mirrors `matrix_rtc_call::RaisedHand`).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FfiRaisedHand {
+    /// `member.id` of the membership the hand belongs to.
+    pub member_id: String,
+    /// The member's user id.
+    pub sender: String,
+    /// The `m.reaction` event that raised it.
+    pub reaction_event_id: String,
+    /// When it was raised (ms since the epoch, by the server's clock). Sort
+    /// ascending to order speakers.
+    pub raised_at_ms: u64,
+}
+
+impl From<matrix_rtc_call::RaisedHand> for FfiRaisedHand {
+    fn from(hand: matrix_rtc_call::RaisedHand) -> Self {
+        Self {
+            member_id: hand.member_id,
+            sender: hand.sender,
+            reaction_event_id: hand.reaction_event_id,
+            raised_at_ms: hand.raised_at_ms,
+        }
+    }
+}
+
+/// One entry of Element Call's reaction catalogue (see [`reaction_catalog`]).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FfiReactionKind {
+    /// The `name` to send, and the key peers pick a sound by.
+    pub name: String,
+    /// The emoji Element Call shows for it.
+    pub emoji: String,
+    /// Base name of the sound asset Element Call plays for it (`clap`,
+    /// `party`, …, or `generic` for an entry without a sound of its own).
+    pub sound: String,
+}
+
+/// The SDK release version (e.g. `0.5.0-rc.1`), to show or attach to log
+/// reports.
+#[uniffi::export]
+pub fn sdk_version() -> String {
+    matrix_rtc_core::SDK_VERSION.to_owned()
+}
+
+/// Element Call's reaction catalogue, in the order its picker shows them.
+///
+/// The names are the interoperable part: a reaction sent with one of these
+/// names plays the same sound on Element Call as on a host that bundles the
+/// assets under the `sound` base names here (`generic` among them, which also
+/// plays for names outside the catalogue). The SDK plays nothing itself.
+#[uniffi::export]
+pub fn reaction_catalog() -> Vec<FfiReactionKind> {
+    matrix_rtc_call::KNOWN_REACTIONS
+        .iter()
+        .map(|kind| FfiReactionKind {
+            name: kind.name.to_owned(),
+            emoji: kind.emoji.to_owned(),
+            sound: matrix_rtc_call::sound_for(kind.name)
+                .asset_name()
+                .to_owned(),
+        })
+        .collect()
+}
+
+/// The sound asset to play for a reaction `name`: a catalogue entry's sound,
+/// or `generic` for any other name.
+#[uniffi::export]
+pub fn reaction_sound_for(name: String) -> String {
+    matrix_rtc_call::sound_for(&name).asset_name().to_owned()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct JoinedMembership {
+    pub room_id: String,
+    pub slot_id: String,
+    pub sender: String,
+    pub sender_device_id: Option<String>,
+    pub sticky_key: String,
+    pub member_id: String,
+    /// Event id of the member's latest membership event. Moves on every sticky
+    /// refresh.
+    pub membership_event_id: Option<String>,
+    pub application: Option<String>,
+    /// Transports this member publishes media on (MSC4143).
+    pub transports: Vec<FfiRtcTransport>,
+    /// Transport types this member can subscribe to (MSC4143).
+    pub can_subscribe: Vec<String>,
+}
+
+/// How a room is opened.
+#[derive(Clone, Debug, Default, uniffi::Record)]
+pub struct FfiRoomOptions {
+    /// Which MatrixRTC generation the room is read and written for. Unset (or
+    /// `Off`) is spec-current. One decision for the room: what the library
+    /// subscribes to, how it renders our sends, the `member.id` we join with,
+    /// how an inbound media key is bound, the SFU identity and the token
+    /// endpoint. See [`crate::compat`].
+    #[uniffi(default = None)]
+    pub format: Option<FfiMembershipFormat>,
+}
+
+/// One per Matrix session, over the host's backend. Creating it does no I/O;
+/// the library holds nothing about a room until the host opens one.
+#[derive(uniffi::Object)]
+pub struct RtcClient {
+    client: call::RtcClient<FfiBackend>,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl RtcClient {
+    #[uniffi::constructor]
+    pub fn new(backend: Arc<dyn MatrixBackend>) -> Arc<Self> {
+        log::info!("client: created over the host backend");
+        Arc::new(Self {
+            client: call::RtcClient::new(Arc::new(FfiBackend::new(backend))),
+        })
+    }
+
+    /// Whether the homeserver is answering the library's sends (034 R9).
+    pub fn signalling_health(&self) -> FfiSignallingHealth {
+        self.client.signalling_health().into()
+    }
+
+    /// Signalling health, current value first, then each change. Live from
+    /// the client, before any call or media exists.
+    pub fn subscribe_signalling_health(&self) -> Arc<SignallingHealthSubscription> {
+        SignallingHealthSubscription::new(self.client.subscribe_signalling_health())
+    }
+
+    /// Reports the host's Matrix client offline, or online once a request to
+    /// the homeserver has succeeded since it was offline — never on sync merely
+    /// starting (034 R11). Online retries every pending send at once. Optional:
+    /// a host that never reports leaves the library to its own sends.
+    pub fn report_connectivity(&self, online: bool) {
+        self.client.report_connectivity(online);
+    }
+
+    /// Whether our homeserver offers what the MSC format needs (spec 038
+    /// R45). `server_features` are the `unstable_features` of `/versions`
+    /// that are on, which the host reads from its SDK; the transports are
+    /// asked of the backend. Names each missing piece; never picks the
+    /// format.
+    pub async fn msc_support(
+        &self,
+        server_features: Vec<String>,
+    ) -> Result<FfiMscSupport, MatrixRtcFfiError> {
+        Ok(self.client.msc_support(&server_features).await?.into())
+    }
+
+    /// Opens a room: the library subscribes to what the room needs in the
+    /// given mode and applies its current state. Resolves once that state is
+    /// applied, so a `join_call` issued afterwards sees it.
+    ///
+    /// Opening a room that already has a live room object is an error.
+    /// Cancelling the call leaves nothing behind. Dropping the returned room
+    /// ends its subscriptions without leaving; `shutdown` leaves first.
+    pub async fn room(
+        self: Arc<Self>,
+        room_id: String,
+        options: FfiRoomOptions,
+    ) -> Result<Arc<RtcRoom>, MatrixRtcFfiError> {
+        let compat = compat::resolve(options.format);
+        log::info!("client: [{room_id}] opening in {compat:?} mode");
+        // On the library's runtime: the room's feeds are spawned from here.
+        runtime::on_runtime(async move {
+            let room = self
+                .client
+                .room(
+                    room_id.clone(),
+                    matrix_rtc_core::RoomOptions { format: compat },
+                )
+                .await?;
+            room.seeded().await;
+            log::info!("client: [{room_id}] open and seeded");
+            Ok(Arc::new(RtcRoom {
+                room_id,
+                room: TokioRwLock::new(Some(room)),
+            }))
+        })
+        .await
+    }
+}
+
+/// One open room. Everything room-scoped is here; our own participation is on
+/// the [`RtcCall`] that `join_call` returns.
+#[derive(uniffi::Object)]
+pub struct RtcRoom {
+    room_id: String,
+    /// `None` once shut down.
+    room: TokioRwLock<Option<call::RtcRoom<FfiBackend>>>,
+}
+
+impl RtcRoom {
+    async fn open(
+        &self,
+    ) -> Result<tokio::sync::RwLockReadGuard<'_, call::RtcRoom<FfiBackend>>, MatrixRtcFfiError>
+    {
+        tokio::sync::RwLockReadGuard::try_map(self.room.read().await, Option::as_ref).map_err(
+            |_| MatrixRtcFfiError::Attachment(format!("{} has been shut down", self.room_id)),
+        )
+    }
+
+    /// [`Self::join_call`] with the keep-alive interval spelled out, so a test
+    /// can beat faster than a call ships with. On the library's runtime: the
+    /// call's upkeep is spawned from here.
+    pub(crate) async fn join_call_every(
+        self: Arc<Self>,
+        params: FfiJoinSessionParams,
+        interval: Option<Duration>,
+    ) -> Result<Arc<RtcCall>, MatrixRtcFfiError> {
+        runtime::on_runtime(async move { self.join_on_runtime(params, interval).await }).await
+    }
+
+    async fn join_on_runtime(
+        &self,
+        params: FfiJoinSessionParams,
+        interval: Option<Duration>,
+    ) -> Result<Arc<RtcCall>, MatrixRtcFfiError> {
+        log::info!(
+            "room: [{}] join requested {}",
+            self.room_id,
+            params.summary()
+        );
+        let mut options = params.into_call()?;
+        options.join.keep_alive_interval_ms = interval.map(|interval| interval.as_millis() as u64);
+        let room = self.open().await?;
+        let joined = room.join_call(options).await.inspect_err(|error| {
+            log::warn!("room: [{}] join failed: {error}", self.room_id);
+        })?;
+        let joined = Arc::new(joined);
+        log::info!(
+            "room: [{}/{}] joined as {}",
+            self.room_id,
+            joined.slot_id(),
+            joined.member_id()
+        );
+        Ok(Arc::new(RtcCall {
+            call: joined,
+            #[cfg(feature = "media")]
+            compat: room.format(),
+            #[cfg(feature = "media")]
+            backend: room.backend().clone(),
+        }))
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl RtcRoom {
+    pub fn room_id(&self) -> String {
+        self.room_id.clone()
+    }
+
+    /// Opens a slot, by publishing its `m.rtc.slot` state event.
+    ///
+    /// A room has no slot until somebody with the power level opens one — an
+    /// administrator, or the room's creator as initial state — and a join into a
+    /// room whose state holds no open slot fails. The library never opens one on
+    /// its own; this is the helper for a host that does.
+    ///
+    /// `slot_id` must start with `{application_type}#` — MSC4143 makes the slot
+    /// id the state key and requires that shape, and a slot that ignores it is
+    /// one every client treats as closed. Rejected here rather than at the
+    /// homeserver, which would accept it.
+    ///
+    /// `encryption` must be [`FfiSlotEncryption::PerMember`] in an encrypted room
+    /// and `null` elsewhere; the mismatch resolves the slot closed for everyone.
+    pub async fn open_slot(
+        &self,
+        slot_id: String,
+        application_type: String,
+        encryption: Option<FfiSlotEncryption>,
+    ) -> Result<(), MatrixRtcFfiError> {
+        log::info!(
+            "room: [{}/{slot_id}] opening slot: application={application_type} \
+             encryption={encryption:?}",
+            self.room_id,
+        );
+        let room = self.open().await?;
+        room.open_slot(slot_id, application_type, encryption.map(Into::into))
+            .await
+            .map_err(|error| {
+                log::warn!("room: could not open the slot: {error}");
+                MatrixRtcFfiError::InvalidInput(error.to_string())
+            })
+    }
+
+    /// Closes a slot, by setting its `m.rtc.slot` status to `closed`.
+    ///
+    /// Every member of it becomes left as soon as clients apply the new state —
+    /// this ends the call for everyone, not just for us. Leaving is
+    /// [`RtcCall::leave`].
+    pub async fn close_slot(&self, slot_id: String) -> Result<(), MatrixRtcFfiError> {
+        log::info!("room: [{}/{slot_id}] closing slot", self.room_id);
+        let room = self.open().await?;
+        room.close_slot(slot_id).await.map_err(|error| {
+            log::warn!("room: could not close the slot: {error}");
+            MatrixRtcFfiError::InvalidInput(error.to_string())
+        })
+    }
+
+    /// The intent a join into `slot_id` would settle on, without joining:
+    /// `requested`, else the one its members agree on, else video. For a lobby
+    /// that previews the camera the join will start with.
+    pub async fn call_intent(
+        &self,
+        slot_id: String,
+        requested: Option<FfiCallIntent>,
+    ) -> Result<FfiCallIntent, MatrixRtcFfiError> {
+        let consensus = self.open().await?.call_intent_consensus(&slot_id).await;
+        Ok(consensus.resolve(requested.map(Into::into)).into())
+    }
+
+    /// How many members are joined to a slot, without joining it.
+    pub async fn member_count(&self, slot_id: String) -> Result<u64, MatrixRtcFfiError> {
+        Ok(self.open().await?.member_count(&slot_id).await as u64)
+    }
+
+    /// Observe a slot's joined roster, without joining it.
+    ///
+    /// The subscription yields the current roster on its first `next()` and
+    /// then only on change, so a host can attach at any point without missing
+    /// the state it attached to.
+    pub async fn subscribe_membership_snapshots(
+        &self,
+        slot_id: String,
+    ) -> Result<Arc<MembershipSnapshotSubscription>, MatrixRtcFfiError> {
+        let receiver = self.open().await?.observe(&slot_id).await;
+        Ok(MembershipSnapshotSubscription::new(receiver))
+    }
+
+    /// A JSON dump of everything the room currently believes: its room state,
+    /// and every candidate member of each slot with the reason it is or is not
+    /// projected as joined.
+    ///
+    /// For bug reports and for answering "what does Rust think the state is
+    /// right now?" without a debugger. Contains no key material.
+    pub async fn debug_snapshot(&self) -> Result<String, MatrixRtcFfiError> {
+        Ok(self.open().await?.debug_snapshot().await.to_string())
+    }
+
+    /// Joins a call slot, returning our participation in it.
+    ///
+    /// The SDK generates the `member.id` (read it from [`RtcCall::member_id`]);
+    /// hosts do not supply one. MSC4143 requires a fresh `member.id` on every
+    /// join, and reusing one is silently destructive: the MSC4195 participant
+    /// identity is derived from it, so a repeat join keeps the identity peers
+    /// already hold a key for while our key index restarts at 0 — every peer
+    /// then decrypts our media with the previous call's key and never recovers.
+    ///
+    /// The returned call keeps itself alive every 10 seconds, and performs its
+    /// key rotations when they fall due, until it leaves or is dropped. Fails
+    /// when the room's state holds no open slot of this id, or while the slot
+    /// is joined through a live call of this room.
+    pub async fn join_call(
+        self: Arc<Self>,
+        params: FfiJoinSessionParams,
+    ) -> Result<Arc<RtcCall>, MatrixRtcFfiError> {
+        self.join_call_every(params, None).await
+    }
+
+    /// Leaves every slot joined through this room, then ends its
+    /// subscriptions. Every call of the room is over afterwards; a second
+    /// shutdown is a no-op.
+    ///
+    /// (Named `shutdown` rather than `close`: uniffi already gives every
+    /// object a `close()` — Kotlin's `AutoCloseable` — that frees it, which
+    /// for a room is dropping it: its subscriptions end and nothing is left.)
+    pub async fn shutdown(&self) {
+        let room = self.room.write().await.take();
+        match room {
+            Some(room) => {
+                room.close().await;
+                log::info!("room: [{}] shut down", self.room_id);
+            }
+            None => log::debug!("room: [{}] already shut down", self.room_id),
+        }
+    }
+}
+
+/// Our participation in one call slot. Over after [`leave`](Self::leave), after
+/// its room shuts down, or once dropped; joining again yields a new one. Dropping
+/// it sends no leave: the keep-alive stops, and the membership expires through
+/// its delayed leave unless the slot is joined again, which leaves it first.
+#[derive(uniffi::Object)]
+pub struct RtcCall {
+    call: Arc<call::RtcCall<FfiBackend>>,
+    /// The room's mode and backend, for the media layer.
+    #[cfg(feature = "media")]
+    compat: matrix_rtc_core::compat::MembershipFormat,
+    #[cfg(feature = "media")]
+    backend: Arc<DialectBackend<FfiBackend>>,
+}
+
+impl RtcCall {
+    #[cfg(feature = "media")]
+    pub(crate) fn inner(&self) -> &Arc<call::RtcCall<FfiBackend>> {
+        &self.call
+    }
+
+    #[cfg(feature = "media")]
+    pub(crate) fn format(&self) -> matrix_rtc_core::compat::MembershipFormat {
+        self.compat
+    }
+
+    #[cfg(feature = "media")]
+    pub(crate) fn backend(&self) -> Arc<dyn CoreBackend> {
+        self.backend.clone()
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl RtcCall {
+    pub fn room_id(&self) -> String {
+        self.call.room_id().to_owned()
+    }
+
+    pub fn slot_id(&self) -> String {
+        self.call.slot_id().to_owned()
+    }
+
+    /// Our `member.id` in this participation.
+    pub fn member_id(&self) -> String {
+        self.call.member_id().to_owned()
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.call.is_live()
+    }
+
+    /// The event id of our current membership event, or `None` once over.
+    /// Moves on every sticky refresh, so read it at the moment of use.
+    pub async fn membership_event_id(&self) -> Option<String> {
+        self.call.membership_event_id().await
+    }
+
+    pub async fn member_count(&self) -> u64 {
+        self.call.member_count().await as u64
+    }
+
+    /// Whether this is a voice or a video call, as the join settled it. Start
+    /// the camera for [`FfiCallIntent::Video`] only.
+    pub fn call_intent(&self) -> FfiCallIntent {
+        self.call.intent().into()
+    }
+
+    /// The slot's joined roster as it changes; see
+    /// [`RtcRoom::subscribe_membership_snapshots`].
+    pub async fn subscribe_membership_snapshots(&self) -> Arc<MembershipSnapshotSubscription> {
+        MembershipSnapshotSubscription::new(self.call.subscribe_memberships().await)
+    }
+
+    /// Resolves once the call is over (left, slot closed, room closed), with
+    /// why. A host running its own media tears it down here. Never resolves
+    /// for a call dropped without leaving.
+    pub async fn wait_for_end(&self) -> FfiLeaveReason {
+        let mut ended = self.call.subscribe_ended();
+        let reason = ended
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|reason| reason.clone());
+        match reason {
+            Some(reason) => reason.into(),
+            // The sender lives as long as the call we hold.
+            None => std::future::pending().await,
+        }
+    }
+
+    // ---- Reactions and raised hands ----
+    //
+    // Element Call's reactions are ordinary room events relating to the
+    // reacting member's membership event. The library reads them from the
+    // room (timeline events, redactions and the relations of each membership
+    // event); the host plays any sound. Results surface on the media session
+    // as `FfiCallEvent::HandRaised` / `HandLowered` / `Reaction` and on
+    // `FfiParticipant.hand_raised_at_ms`, and here as `raised_hands`.
+
+    /// Sends an Element Call emoji reaction. `name` is what peers pick a sound
+    /// by (see [`reaction_catalog`]); only the first grapheme of `emoji` is
+    /// sent. Returns the event id.
+    ///
+    /// Fails inside the send cooldown (Element Call's three seconds by
+    /// default), since peers would drop the reaction anyway, and with
+    /// `Reaction("not sent")` when it has not landed within 5 s: it is dropped,
+    /// never delivered late, and the cooldown does not start (034 R4).
+    pub async fn send_reaction(
+        &self,
+        emoji: String,
+        name: String,
+    ) -> Result<String, MatrixRtcFfiError> {
+        Ok(self.call.send_reaction(&emoji, &name).await?)
+    }
+
+    /// Raises our hand. Shown on our tile at once; suspends until the hand
+    /// has landed, however long signalling is away, and resolves `Ok` early
+    /// when a lower supersedes it or the call ends. Fails only on a permanent
+    /// refusal, the hand back where it was. Cancelling the call leaves the
+    /// request standing: only a lower withdraws it (034 R5). Idempotent while
+    /// it is up; the hand follows our membership across sticky refreshes.
+    pub async fn raise_hand(&self) -> Result<(), MatrixRtcFfiError> {
+        Ok(self.call.raise_hand().await?)
+    }
+
+    /// Lowers our hand by redacting the annotation, as [`Self::raise_hand`]
+    /// raises it. A no-op when it is down.
+    pub async fn lower_hand(&self) -> Result<(), MatrixRtcFfiError> {
+        Ok(self.call.lower_hand().await?)
+    }
+
+    /// The slot's raised hands, oldest first.
+    pub async fn raised_hands(&self) -> Vec<FfiRaisedHand> {
+        self.call
+            .raised_hands()
+            .await
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    // ---- Where the call is ----
+    //
+    // The library combines our media, a DM's ring and pickup, and the end into
+    // one status. The host draws it; it never works one out itself.
+
+    /// Where the call is now.
+    pub fn status(&self) -> FfiCallStatus {
+        self.call.status().into()
+    }
+
+    /// The status as it changes, current value first. In a DM, every `Ended`
+    /// but `Left` is a leave the library makes itself: do not leave again.
+    pub fn subscribe_status(&self) -> Arc<CallStatusSubscription> {
+        CallStatusSubscription::new(self.call.subscribe_status())
+    }
+
+    /// Leaves the slot; the call is over and its media stopped at once, and
+    /// this returns without waiting for the leave to be sent (034 R8). The
+    /// send is one attempt; if it fails, the delayed leave — or the
+    /// membership's lifetime — removes us. Fails only with `CallOver`, when the
+    /// call was already over.
+    pub async fn leave(&self, params: FfiLeaveSessionParams) -> Result<(), MatrixRtcFfiError> {
+        log::info!(
+            "call: [{}/{}] leave requested reason={:?}",
+            self.call.room_id(),
+            self.call.slot_id(),
+            params.leave_reason,
+        );
+        self.call
+            .leave(params.into_core())
+            .await
+            .inspect_err(|error| log::warn!("call: leave failed: {error}"))?;
+        log::info!("call: leave succeeded");
+        Ok(())
+    }
+}
+
+/// Why a call ended.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiCallEnd {
+    /// We left, or the room was closed.
+    Left,
+    /// The callee declined our ring.
+    Declined,
+    /// Nobody answered before the ring ran out.
+    Unanswered,
+    /// The ring could not be sent in time.
+    RingNotSent,
+    /// Everyone else left a DM call.
+    OthersLeft,
+    /// A DM call joined without a ring had nobody in it.
+    Empty,
+    /// The slot was closed, which ended our participation without us asking.
+    SlotClosed,
+    /// Our own SFU connection was given up (034 R24): `reason` is for the
+    /// screen, `message` for logs only. Publishing has stopped and our leave
+    /// has been issued (contract C10).
+    ConnectionClosed {
+        reason: FfiConnectionLossReason,
+        message: String,
+    },
+}
+
+/// One thing the MSC format relies on (spec 038 R45).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiMscRequirement {
+    /// MatrixRTC (MSC4143).
+    MatrixRtc,
+    /// Sticky events (MSC4354).
+    StickyEvents,
+    /// Delayed events (MSC4140): without them a call works on a 5 minute
+    /// membership lifetime.
+    DelayedEvents,
+    /// An `m.livekit` transport with an SFU `url`.
+    LiveKitTransport,
+}
+
+/// What the MSC support check found missing.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FfiMscSupport {
+    /// Without these an MSC call cannot work.
+    pub missing: Vec<FfiMscRequirement>,
+    /// Without these an MSC call works, worse.
+    pub warnings: Vec<FfiMscRequirement>,
+}
+
+impl From<matrix_rtc_core::MscRequirement> for FfiMscRequirement {
+    fn from(value: matrix_rtc_core::MscRequirement) -> Self {
+        match value {
+            matrix_rtc_core::MscRequirement::MatrixRtc => Self::MatrixRtc,
+            matrix_rtc_core::MscRequirement::StickyEvents => Self::StickyEvents,
+            matrix_rtc_core::MscRequirement::DelayedEvents => Self::DelayedEvents,
+            matrix_rtc_core::MscRequirement::LiveKitTransport => Self::LiveKitTransport,
+        }
+    }
+}
+
+impl From<matrix_rtc_core::MscSupport> for FfiMscSupport {
+    fn from(value: matrix_rtc_core::MscSupport) -> Self {
+        Self {
+            missing: value.missing.into_iter().map(Into::into).collect(),
+            warnings: value.warnings.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Why our own SFU connection was given up. Contract C10.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiConnectionLossReason {
+    /// Lost, and not back within the reconnect budget.
+    Budget,
+    /// The SFU or its token service refused us.
+    Refused,
+    /// Never established within the budget from the connect request.
+    NeverConnected,
+    /// Our homeserver lacks MSC4195's `get_token` (spec 038 R44).
+    TokenEndpointUnsupported,
+}
+
+impl From<call::ConnectionLossReason> for FfiConnectionLossReason {
+    fn from(value: call::ConnectionLossReason) -> Self {
+        match value {
+            call::ConnectionLossReason::Budget => Self::Budget,
+            call::ConnectionLossReason::Refused => Self::Refused,
+            call::ConnectionLossReason::NeverConnected => Self::NeverConnected,
+            call::ConnectionLossReason::TokenEndpointUnsupported => Self::TokenEndpointUnsupported,
+        }
+    }
+}
+
+impl From<call::CallEnd> for FfiCallEnd {
+    fn from(value: call::CallEnd) -> Self {
+        match value {
+            call::CallEnd::Left => Self::Left,
+            call::CallEnd::Declined => Self::Declined,
+            call::CallEnd::Unanswered => Self::Unanswered,
+            call::CallEnd::RingNotSent => Self::RingNotSent,
+            call::CallEnd::OthersLeft => Self::OthersLeft,
+            call::CallEnd::Empty => Self::Empty,
+            call::CallEnd::SlotClosed => Self::SlotClosed,
+            call::CallEnd::ConnectionClosed { reason, message } => Self::ConnectionClosed {
+                reason: reason.into(),
+                message,
+            },
+        }
+    }
+}
+
+/// How far a DM call's ring has got.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiRingPhase {
+    /// The ring is being sent: show that we are calling, without a ringback.
+    Sending,
+    /// The ring went out at `sent_at_ms` and lasts `lifetime_ms`: play the
+    /// ringback.
+    Ringing { sent_at_ms: u64, lifetime_ms: u64 },
+}
+
+impl From<call::RingPhase> for FfiRingPhase {
+    fn from(value: call::RingPhase) -> Self {
+        match value {
+            call::RingPhase::Sending => Self::Sending,
+            call::RingPhase::Ringing {
+                sent_at_ms,
+                lifetime_ms,
+            } => Self::Ringing {
+                sent_at_ms,
+                lifetime_ms,
+            },
+        }
+    }
+}
+
+/// How far our own media has got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiMediaPhase {
+    Connecting,
+    /// `degraded` while a transport reconnects.
+    Connected {
+        degraded: bool,
+    },
+}
+
+impl From<call::MediaPhase> for FfiMediaPhase {
+    fn from(value: call::MediaPhase) -> Self {
+        match value {
+            call::MediaPhase::Connecting => Self::Connecting,
+            call::MediaPhase::Connected { degraded } => Self::Connected { degraded },
+        }
+    }
+}
+
+/// Where a joined call is. There is none before the join returns: the host
+/// shows its own joining state until then, and in a DM it already shows that
+/// it is calling.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiCallStatus {
+    /// Our media is not up yet, and there is somebody to talk to: a group
+    /// call, or a DM whose callee is already here.
+    Connecting,
+    /// A DM call waiting for `callee`, the user ID it rings: show that we
+    /// are calling them. `media` is how far our own side has got meanwhile.
+    Calling {
+        callee: String,
+        ring: FfiRingPhase,
+        media: FfiMediaPhase,
+    },
+    /// Media up and somebody to talk to. `since_ms` is the zero of the call's
+    /// duration and the moment to report the system call connected; it holds
+    /// through `degraded`.
+    Connected { since_ms: u64, degraded: bool },
+    /// Final.
+    Ended { reason: FfiCallEnd },
+}
+
+impl From<call::CallStatus> for FfiCallStatus {
+    fn from(value: call::CallStatus) -> Self {
+        match value {
+            call::CallStatus::Connecting => Self::Connecting,
+            call::CallStatus::Calling {
+                callee,
+                ring,
+                media,
+            } => Self::Calling {
+                callee,
+                ring: ring.into(),
+                media: media.into(),
+            },
+            call::CallStatus::Connected { since_ms, degraded } => {
+                Self::Connected { since_ms, degraded }
+            }
+            call::CallStatus::Ended { reason } => Self::Ended {
+                reason: reason.into(),
+            },
+        }
+    }
+}
+
+/// Whether the homeserver is answering the library's sends (034 R9). Distinct
+/// from the media `degraded` flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiSignallingHealth {
+    Reachable,
+    /// Since the first transient failure of a library send, or the host's
+    /// offline report, in epoch milliseconds; stable until reachable again.
+    Unreachable {
+        since_ms: u64,
+    },
+}
+
+impl From<call::SignallingHealth> for FfiSignallingHealth {
+    fn from(value: call::SignallingHealth) -> Self {
+        match value {
+            call::SignallingHealth::Reachable => Self::Reachable,
+            call::SignallingHealth::Unreachable { since_ms } => Self::Unreachable { since_ms },
+        }
+    }
+}
+
+/// Signalling health, pulled with an async [`Self::next`] like the call status.
+#[derive(uniffi::Object)]
+pub struct SignallingHealthSubscription {
+    receiver: tokio::sync::Mutex<watch::Receiver<call::SignallingHealth>>,
+}
+
+impl SignallingHealthSubscription {
+    fn new(mut receiver: watch::Receiver<call::SignallingHealth>) -> Arc<Self> {
+        // The first `next` yields the health as it is now.
+        receiver.mark_changed();
+        Arc::new(Self {
+            receiver: tokio::sync::Mutex::new(receiver),
+        })
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl SignallingHealthSubscription {
+    /// The current health on the first call, then each change. `None` once
+    /// the client is gone.
+    pub async fn next(&self) -> Option<FfiSignallingHealth> {
+        let mut receiver = self.receiver.lock().await;
+        receiver.changed().await.ok()?;
+        let health = *receiver.borrow_and_update();
+        Some(health.into())
+    }
+}
+
+/// A call's status, pulled with an async [`Self::next`] like the roster.
+#[derive(uniffi::Object)]
+pub struct CallStatusSubscription {
+    receiver: tokio::sync::Mutex<watch::Receiver<call::CallStatus>>,
+}
+
+impl CallStatusSubscription {
+    fn new(mut receiver: watch::Receiver<call::CallStatus>) -> Arc<Self> {
+        // The first `next` yields the status as it is now.
+        receiver.mark_changed();
+        Arc::new(Self {
+            receiver: tokio::sync::Mutex::new(receiver),
+        })
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl CallStatusSubscription {
+    /// The current status on the first call, then each change. `None` once
+    /// `Ended` has been handed out, since nothing follows it.
+    pub async fn next(&self) -> Option<FfiCallStatus> {
+        let mut receiver = self.receiver.lock().await;
+        let unseen = receiver.has_changed().unwrap_or(false);
+        if !unseen && matches!(*receiver.borrow(), call::CallStatus::Ended { .. }) {
+            return None;
+        }
+        receiver.changed().await.ok()?;
+        let status = receiver.borrow_and_update().clone();
+        Some(status.into())
+    }
+}
+
+/// A slot's joined roster, pulled with an async [`Self::next`] like the media
+/// frame streams.
+#[derive(uniffi::Object)]
+pub struct MembershipSnapshotSubscription {
+    receiver: tokio::sync::Mutex<watch::Receiver<Vec<CoreJoinedMembership>>>,
+}
+
+impl MembershipSnapshotSubscription {
+    fn new(mut receiver: watch::Receiver<Vec<CoreJoinedMembership>>) -> Arc<Self> {
+        // The first `next` yields the roster as it is now.
+        receiver.mark_changed();
+        Arc::new(Self {
+            receiver: tokio::sync::Mutex::new(receiver),
+        })
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl MembershipSnapshotSubscription {
+    /// The current roster on the first call, then the next one that differs.
+    /// `None` once the room is shut down or dropped.
+    pub async fn next(&self) -> Option<Vec<JoinedMembership>> {
+        let mut receiver = self.receiver.lock().await;
+        receiver.changed().await.ok()?;
+        let members = receiver.borrow_and_update().clone();
+        Some(members.into_iter().map(to_ffi_joined_membership).collect())
+    }
+}
+
+fn to_ffi_joined_membership(member: CoreJoinedMembership) -> JoinedMembership {
+    JoinedMembership {
+        room_id: member.room_id,
+        slot_id: member.slot_id,
+        sender: member.sender,
+        sender_device_id: member.origin.sender_device_id().map(str::to_owned),
+        sticky_key: member.sticky_key,
+        member_id: member.member_id,
+        membership_event_id: member.membership_event_id,
+        application: member.application.application_type,
+        transports: member.transports.iter().map(Into::into).collect(),
+        can_subscribe: member.can_subscribe,
+    }
+}
+
+uniffi::setup_scaffolding!();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::test_support::{Carrier, MockHost};
+    use crate::backend::{FfiEventEncryption, FfiEventIn};
+    use matrix_rtc_core::compat::STATE_MEMBER_EVENT_TYPE;
+
+    const ROOM: &str = "!room:example.org";
+    const SLOT: &str = "m.call#room";
+    /// The legacy JWT service the room-state format publishes on.
+    const SFU: &str = "https://sfu.example.org";
+    /// The SFU the MSC format publishes on (`m.livekit`).
+    const SFU_URL: &str = "wss://sfu.example.org";
+
+    fn cleartext() -> FfiEventEncryption {
+        FfiEventEncryption {
+            encrypted: false,
+            sender_device_id: None,
+            sender_confirmed: None,
+        }
+    }
+
+    fn encrypted(device: &str) -> FfiEventEncryption {
+        FfiEventEncryption {
+            encrypted: true,
+            sender_device_id: Some(device.to_owned()),
+            sender_confirmed: Some(true),
+        }
+    }
+
+    fn open_slot(encryption: Option<&str>) -> FfiEventIn {
+        let mut content =
+            serde_json::json!({ "status": "open", "application": { "type": "m.call" } });
+        if let Some(mechanism) = encryption {
+            content["encryption"] = serde_json::json!({ "type": mechanism });
+        }
+        FfiEventIn {
+            event_id: "$slot".to_owned(),
+            sender: "@admin:example.org".to_owned(),
+            event_type: matrix_rtc_core::SLOT_EVENT_TYPE.to_owned(),
+            state_key: Some(SLOT.to_owned()),
+            origin_server_ts: 1,
+            content_json: content.to_string(),
+            encryption: cleartext(),
+        }
+    }
+
+    fn member_event(sender: &str, device: &str, member_id: &str, event_id: &str) -> FfiEventIn {
+        FfiEventIn {
+            event_id: event_id.to_owned(),
+            sender: sender.to_owned(),
+            event_type: "m.rtc.member".to_owned(),
+            state_key: None,
+            origin_server_ts: 2,
+            content_json: serde_json::json!({
+                "slot_id": SLOT,
+                "msc4354_sticky_key": member_id,
+                "application": { "type": "m.call" },
+                "member": { "id": member_id, "membership": "join" },
+                "transports": {
+                    "published": [{ "type": "m.livekit", "url": SFU_URL }],
+                    "can_subscribe": ["m.livekit"],
+                },
+            })
+            .to_string(),
+            encryption: encrypted(device),
+        }
+    }
+
+    /// Seeds the room's gating subjects and `sticky`, then opens the room.
+    async fn open(
+        client: &Arc<RtcClient>,
+        mock: &MockHost,
+        compat: Option<FfiMembershipFormat>,
+        encrypted: bool,
+        slots: Vec<FfiEventIn>,
+        sticky: Vec<FfiEventIn>,
+    ) -> Arc<RtcRoom> {
+        // The open runs on the library's runtime, so it may not have
+        // subscribed by the time the seeder first looks.
+        mock.forget_room_sink(ROOM);
+        let open = client
+            .clone()
+            .room(ROOM.to_owned(), FfiRoomOptions { format: compat });
+        tokio::pin!(open);
+        // The mock stores the sink inside `subscribe_room`; deliver the current
+        // sets once it exists, the way a host does on subscribe.
+        let seed = async {
+            while mock.subjects(ROOM).is_none() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            let subjects = mock.subjects(ROOM).unwrap();
+            let sink = mock.room_sink(ROOM);
+            sink.on_encryption(encrypted);
+            for event_type in &subjects.state_event_types {
+                if event_type == matrix_rtc_core::SLOT_EVENT_TYPE {
+                    sink.on_state_events(event_type.clone(), slots.clone());
+                }
+            }
+            sink.on_joined_members(vec![
+                "@alice:example.org".to_owned(),
+                "@bob:example.org".to_owned(),
+                "@carl:example.org".to_owned(),
+            ]);
+            sink.on_sticky_events(sticky.clone());
+            if subjects
+                .state_event_types
+                .iter()
+                .any(|t| t == STATE_MEMBER_EVENT_TYPE)
+            {
+                sink.on_state_events(STATE_MEMBER_EVENT_TYPE.to_owned(), Vec::new());
+            }
+        };
+        let (result, ()) = tokio::join!(open, seed);
+        result.expect("open")
+    }
+
+    /// [`open`] with an open slot and nobody in it.
+    async fn open_call_room(client: &Arc<RtcClient>, mock: &MockHost) -> Arc<RtcRoom> {
+        open(client, mock, None, false, vec![open_slot(None)], Vec::new()).await
+    }
+
+    fn join_params() -> FfiJoinSessionParams {
+        FfiJoinSessionParams {
+            application_slot_id: None,
+            transport: FfiJoinTransport::Publish {
+                url: Some(SFU_URL.to_owned()),
+                livekit_service_url: None,
+            },
+            keep_alive_timeout_ms: None,
+            sticky_duration_ms: None,
+            degraded_lifetime_ms: None,
+            encryption_config: None,
+            kind: FfiCallKind::Group { notify: None },
+            reactions: None,
+            intent: None,
+        }
+    }
+
+    fn no_reason() -> FfiLeaveSessionParams {
+        FfiLeaveSessionParams { leave_reason: None }
+    }
+
+    fn beats(mock: &MockHost) -> usize {
+        mock.sent_types()
+            .into_iter()
+            .filter(|sent| sent == "restart_delayed_event")
+            .count()
+    }
+
+    async fn wait_until(mut condition: impl AsyncFnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !condition().await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "condition not met in time"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// 034 R27: a refused join names the code; a timed-out one says so, as
+    /// its own error.
+    #[tokio::test]
+    async fn join_failures_are_distinguishable() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+        *mock.refuse_sticky.lock().unwrap() = Some(FfiBackendError::Failed {
+            errcode: Some("M_FORBIDDEN".to_owned()),
+            status: Some(403),
+            retry_after_ms: None,
+            permanent: false,
+            reason: "not allowed".to_owned(),
+        });
+
+        let refused = room.clone().join_call(join_params()).await;
+        assert!(
+            matches!(
+                refused,
+                Err(MatrixRtcFfiError::JoinRefused { errcode: Some(ref code), .. }) if code == "M_FORBIDDEN"
+            ),
+            "{:?}",
+            refused.err()
+        );
+
+        assert!(matches!(
+            MatrixRtcFfiError::from(RtcError::Join(matrix_rtc_core::JoinError::TimedOut)),
+            MatrixRtcFfiError::JoinTimedOut
+        ));
+    }
+
+    /// 034 C3, C4: health is live from the client, current value first, and
+    /// follows the host's connectivity report.
+    #[tokio::test]
+    async fn signalling_health_follows_the_connectivity_report() {
+        let client = RtcClient::new(MockHost::new());
+        let health = client.subscribe_signalling_health();
+        assert_eq!(health.next().await, Some(FfiSignallingHealth::Reachable));
+
+        client.report_connectivity(false);
+        let Some(FfiSignallingHealth::Unreachable { since_ms }) = health.next().await else {
+            panic!("offline is unreachable at once");
+        };
+        assert!(since_ms > 0);
+        assert_eq!(
+            client.signalling_health(),
+            FfiSignallingHealth::Unreachable { since_ms }
+        );
+
+        client.report_connectivity(true);
+        assert_eq!(health.next().await, Some(FfiSignallingHealth::Reachable));
+    }
+
+    #[tokio::test]
+    async fn a_left_call_has_nothing_to_keep_alive() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+        let call = room.clone().join_call(join_params()).await.expect("join");
+
+        call.leave(no_reason()).await.expect("leave");
+        assert!(!call.is_live());
+        assert!(matches!(
+            call.leave(no_reason()).await,
+            Err(MatrixRtcFfiError::CallOver(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_shut_down_room_refuses_further_calls() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+        room.shutdown().await;
+        assert!(matches!(
+            room.clone().join_call(join_params()).await,
+            Err(MatrixRtcFfiError::Attachment(_))
+        ));
+        room.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn opening_subscribes_in_the_mode_and_seeds_the_roster() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open(
+            &client,
+            &mock,
+            None,
+            false,
+            vec![open_slot(None)],
+            vec![member_event("@bob:example.org", "BOBDEV", "bob-a", "$m1")],
+        )
+        .await;
+
+        let subjects = mock.subjects(ROOM).unwrap();
+        assert_eq!(
+            subjects.state_event_types,
+            vec![
+                matrix_rtc_core::SLOT_EVENT_TYPE.to_owned(),
+                "org.matrix.msc4143.rtc.slot".to_owned()
+            ]
+        );
+        assert!(mock.to_device_sink.lock().unwrap().is_some());
+
+        let subscription = room
+            .subscribe_membership_snapshots(SLOT.to_owned())
+            .await
+            .unwrap();
+        let joined = subscription.next().await.unwrap();
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].sender, "@bob:example.org");
+        assert_eq!(joined[0].sender_device_id.as_deref(), Some("BOBDEV"));
+        assert_eq!(joined[0].membership_event_id.as_deref(), Some("$m1"));
+        assert_eq!(
+            joined[0].transports,
+            vec![FfiRtcTransport::LiveKit {
+                url: Some(SFU_URL.to_owned()),
+                livekit_service_url: None,
+                server_name: None,
+            }]
+        );
+        assert_eq!(joined[0].can_subscribe, vec!["m.livekit".to_owned()]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), subscription.next())
+                .await
+                .is_err(),
+            "and then only on change"
+        );
+
+        room.shutdown().await;
+        assert_eq!(subscription.next().await, None, "the room's end ends it");
+    }
+
+    #[tokio::test]
+    async fn opening_twice_is_an_error_and_shutting_down_ends_every_subscription() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+
+        let again = client
+            .clone()
+            .room(ROOM.to_owned(), FfiRoomOptions::default())
+            .await;
+        assert!(matches!(again, Err(MatrixRtcFfiError::Attachment(_))));
+        // The refused open subscribed to nothing: the room and to-device.
+        assert_eq!(mock.live_subscriptions(), 2);
+
+        room.shutdown().await;
+        assert_eq!(
+            mock.live_subscriptions(),
+            0,
+            "the last room took the to-device subscription with it"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_room_ends_every_subscription() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+        assert_eq!(mock.live_subscriptions(), 2);
+
+        drop(room);
+        assert_eq!(mock.live_subscriptions(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_open_still_seeding_refuses_a_second_and_cancelling_it_frees_the_room() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        {
+            let first = client
+                .clone()
+                .room(ROOM.to_owned(), FfiRoomOptions::default());
+            tokio::pin!(first);
+            // Subscribed, never seeded.
+            tokio::select! {
+                _ = &mut first => panic!("an unseeded open must not resolve"),
+                _ = async {
+                    while mock.subjects(ROOM).is_none() {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                } => {}
+            }
+            let second = client
+                .clone()
+                .room(ROOM.to_owned(), FfiRoomOptions::default())
+                .await;
+            assert!(matches!(second, Err(MatrixRtcFfiError::Attachment(_))));
+        }
+        // The first open was dropped (its caller cancelled it): its room
+        // subscription ended, the room is free again, and with no room left
+        // the to-device subscription went too. Asynchronously: the open runs
+        // on the library's runtime, where the cancellation lands a moment later.
+        wait_until(async || mock.live_subscriptions() == 0).await;
+        let _room = open_call_room(&client, &mock).await;
+        assert_eq!(mock.live_subscriptions(), 2);
+    }
+
+    /// One room, three generations, one roster: a spec-current peer, a 2025
+    /// Element Call peer, and a pre-sticky one carried in room state.
+    #[tokio::test]
+    async fn membership_from_every_generation_lands_in_one_roster() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+
+        let spec = member_event("@alice:example.org", "ALICEDEV", "alice-a", "$a");
+        // No `membership`, no `transports` — that generation states neither.
+        let legacy_sticky = FfiEventIn {
+            event_id: "$b".to_owned(),
+            sender: "@bob:example.org".to_owned(),
+            event_type: "m.rtc.member".to_owned(),
+            state_key: None,
+            origin_server_ts: 2,
+            content_json: serde_json::json!({
+                "slot_id": SLOT,
+                "msc4354_sticky_key": "bob-a",
+                "application": { "type": "m.call" },
+                "member": { "id": "bob-a", "user_id": "@bob:example.org", "device_id": "BOBDEV" },
+                "rtc_transports": [{ "type": "livekit", "livekit_service_url": SFU }],
+                "versions": [],
+            })
+            .to_string(),
+            encryption: encrypted("BOBDEV"),
+        };
+        let pre_sticky = FfiEventIn {
+            event_id: "$c".to_owned(),
+            sender: "@carl:example.org".to_owned(),
+            event_type: STATE_MEMBER_EVENT_TYPE.to_owned(),
+            state_key: Some("_@carl:example.org_CARLDEV_m.call".to_owned()),
+            origin_server_ts: matrix_rtc_core::compat::room_state::now_ms(),
+            content_json: serde_json::json!({
+                "application": "m.call",
+                "call_id": "",
+                "device_id": "CARLDEV",
+                "expires": 14_400_000_u64,
+                "membershipID": "@carl:example.org:CARLDEV",
+                "foci_preferred": [{ "type": "livekit", "livekit_service_url": SFU }],
+            })
+            .to_string(),
+            encryption: cleartext(),
+        };
+
+        let room = open(
+            &client,
+            &mock,
+            Some(FfiMembershipFormat::RoomState),
+            false,
+            Vec::new(),
+            vec![spec, legacy_sticky],
+        )
+        .await;
+        mock.room_sink(ROOM)
+            .on_state_events(STATE_MEMBER_EVENT_TYPE.to_owned(), vec![pre_sticky]);
+        wait_until(async || room.member_count(SLOT.to_owned()).await.unwrap() == 3).await;
+
+        let subscription = room
+            .subscribe_membership_snapshots(SLOT.to_owned())
+            .await
+            .unwrap();
+        let mut joined = subscription.next().await.unwrap();
+        joined.sort_by(|a, b| a.sender.cmp(&b.sender));
+        assert_eq!(
+            joined
+                .iter()
+                .map(|member| member.sender_device_id.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("ALICEDEV"), Some("BOBDEV"), Some("CARLDEV")],
+        );
+        assert!(
+            joined
+                .iter()
+                .all(|member| member.transports.len() == 1 && member.can_subscribe.len() == 1),
+            "every generation's SFU must survive the translation: {joined:?}",
+        );
+    }
+
+    /// The SDK owns the `member.id`, and a rejoin must not reuse the previous
+    /// one. The transport comes from the backend when the join names none.
+    #[tokio::test]
+    async fn every_join_gets_a_fresh_member_id_and_the_advertised_transport() {
+        let mock = MockHost::new();
+        *mock.transports_json.lock().unwrap() =
+            serde_json::json!([{ "type": "m.livekit", "url": SFU_URL }]).to_string();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+
+        let first = room
+            .clone()
+            .join_call(FfiJoinSessionParams {
+                transport: FfiJoinTransport::Advertised,
+                ..join_params()
+            })
+            .await
+            .expect("first join");
+        let membership = mock
+            .sends()
+            .into_iter()
+            .find(|send| send.carrier == Carrier::Sticky)
+            .expect("the membership went out");
+        // The host sees the unstable id: peers do not match on `m.rtc.member`.
+        assert_eq!(membership.event_type, "org.matrix.msc4143.rtc.member");
+        assert_eq!(
+            membership
+                .content
+                .pointer("/transports/published/0/url")
+                .unwrap(),
+            &serde_json::json!(SFU_URL),
+        );
+
+        first.leave(no_reason()).await.expect("leave");
+        let second = room.clone().join_call(join_params()).await.expect("rejoin");
+        assert_ne!(
+            first.member_id(),
+            second.member_id(),
+            "a rejoin must not reuse the member id"
+        );
+    }
+
+    /// The first `next` is the status now, and nothing follows `Ended`, so a
+    /// host's loop over the subscription ends with the call.
+    #[tokio::test]
+    async fn the_status_subscription_ends_after_the_call_does() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+        let call = room.clone().join_call(join_params()).await.expect("join");
+        let subscription = call.subscribe_status();
+        assert_eq!(subscription.next().await, Some(FfiCallStatus::Connecting));
+
+        call.leave(no_reason()).await.expect("leave");
+        assert_eq!(
+            subscription.next().await,
+            Some(FfiCallStatus::Ended {
+                reason: FfiCallEnd::Left
+            })
+        );
+        assert_eq!(subscription.next().await, None);
+        assert_eq!(
+            call.status(),
+            FfiCallStatus::Ended {
+                reason: FfiCallEnd::Left
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_receive_only_join_publishes_nothing_and_subscribes_to_m_livekit() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+
+        let _call = room
+            .clone()
+            .join_call(FfiJoinSessionParams {
+                transport: FfiJoinTransport::ReceiveOnly,
+                ..join_params()
+            })
+            .await
+            .expect("join");
+        let membership = mock
+            .sends()
+            .into_iter()
+            .find(|send| send.carrier == Carrier::Sticky)
+            .expect("the membership went out");
+        assert_eq!(
+            membership.content.pointer("/transports").unwrap(),
+            // The MSC format's type (spec 038 R17).
+            &serde_json::json!({ "can_subscribe": ["m.livekit"] }),
+        );
+    }
+
+    #[tokio::test]
+    async fn an_application_slot_id_joins_that_call_slot() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let slot = FfiEventIn {
+            state_key: Some("m.call#test".to_owned()),
+            ..open_slot(None)
+        };
+        let room = open(&client, &mock, None, false, vec![slot], Vec::new()).await;
+
+        let call = room
+            .clone()
+            .join_call(FfiJoinSessionParams {
+                application_slot_id: Some("test".to_owned()),
+                ..join_params()
+            })
+            .await
+            .expect("join");
+        assert_eq!(call.slot_id(), "m.call#test");
+    }
+
+    #[tokio::test]
+    async fn a_second_call_in_a_joined_slot_is_refused() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+        let _call = room.clone().join_call(join_params()).await.expect("join");
+        assert!(matches!(
+            room.clone().join_call(join_params()).await,
+            Err(MatrixRtcFfiError::InvalidInput(_))
+        ));
+    }
+
+    /// A slot closing under a call makes it leave on its own, with
+    /// `slot_closed`, and tells a host that runs its own media.
+    #[tokio::test]
+    async fn closing_the_slot_leaves_and_reports_the_end() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+        let call = room.clone().join_call(join_params()).await.expect("join");
+
+        mock.room_sink(ROOM).on_state_events(
+            matrix_rtc_core::SLOT_EVENT_TYPE.to_owned(),
+            vec![FfiEventIn {
+                event_id: "$closed".to_owned(),
+                content_json: r#"{ "status": "closed" }"#.to_owned(),
+                ..open_slot(None)
+            }],
+        );
+
+        let reason = tokio::time::timeout(Duration::from_secs(2), call.wait_for_end())
+            .await
+            .expect("the call ended");
+        assert_eq!(reason.code, "slot_closed");
+        assert!(!call.is_live());
+        let leave = mock
+            .sends()
+            .into_iter()
+            .rev()
+            .find(|send| send.carrier == Carrier::Sticky)
+            .expect("a leave was sent");
+        assert_eq!(
+            leave.content["leave_reason"]["code"], "slot_closed",
+            "{:?}",
+            leave.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_join_into_a_room_with_no_open_slot_is_refused() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open(&client, &mock, None, false, Vec::new(), Vec::new()).await;
+
+        let result = room.clone().join_call(join_params()).await;
+        assert!(
+            matches!(result, Err(MatrixRtcFfiError::SlotClosed(ref slot_id)) if slot_id == SLOT),
+            "no open slot, no join"
+        );
+        assert!(mock.sends().is_empty(), "nothing should have been sent");
+    }
+
+    #[tokio::test]
+    async fn the_keep_alive_driver_restarts_the_delayed_leave() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+
+        let _call = room
+            .clone()
+            .join_call_every(join_params(), Some(Duration::from_millis(50)))
+            .await
+            .expect("join");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let beats = beats(&mock);
+        assert!(
+            beats >= 2,
+            "saw {beats} beats over 300ms at a 50ms interval"
+        );
+    }
+
+    #[tokio::test]
+    async fn leaving_stops_the_keep_alive_driver() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+
+        let call = room
+            .clone()
+            .join_call_every(join_params(), Some(Duration::from_millis(50)))
+            .await
+            .expect("join");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        call.leave(no_reason()).await.expect("leave");
+        let after_leave = beats(&mock);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(beats(&mock), after_leave, "no beat once the call has left");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_call_stops_its_keep_alive_without_leaving() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+
+        let call = room
+            .clone()
+            .join_call_every(join_params(), Some(Duration::from_millis(50)))
+            .await
+            .expect("join");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        drop(call);
+        let after_drop = beats(&mock);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(beats(&mock), after_drop, "no beat once the call is dropped");
+        assert!(
+            !mock
+                .sent_types()
+                .iter()
+                .any(|sent| sent == "cancel_delayed_event"),
+            "dropping sends no leave"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutting_down_leaves_the_joined_call() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+        let call = room.clone().join_call(join_params()).await.expect("join");
+
+        room.shutdown().await;
+        assert!(
+            mock.sent_types()
+                .iter()
+                .any(|sent| sent == "cancel_delayed_event"),
+            "the leave cancels the delayed leave: {:?}",
+            mock.sent_types()
+        );
+        assert!(!call.is_live());
+    }
+
+    /// Driven through the objects an FFI host holds: the rejoin must
+    /// distribute a key to the incumbent even though no sticky event moved.
+    #[tokio::test]
+    async fn a_rejoin_distributes_keys_without_new_sticky_events() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open(
+            &client,
+            &mock,
+            None,
+            true,
+            vec![open_slot(Some("m.per_member"))],
+            Vec::new(),
+        )
+        .await;
+
+        let first = room
+            .clone()
+            .join_call(join_params())
+            .await
+            .expect("first join");
+        mock.room_sink(ROOM).on_sticky_events(vec![member_event(
+            "@bob:example.org",
+            "BOBDEV",
+            "bob-a",
+            "$b",
+        )]);
+        wait_until(async || !mock.to_device_for("@bob:example.org", "BOBDEV").is_empty()).await;
+
+        first.leave(no_reason()).await.expect("leave");
+        mock.clear_to_device();
+
+        let second = room.clone().join_call(join_params()).await.expect("rejoin");
+        let sent = mock.to_device_for("@bob:example.org", "BOBDEV");
+        assert!(!sent.is_empty(), "the second call distributed no key");
+        assert_eq!(
+            sent[0].pointer("/member_id").and_then(|v| v.as_str()),
+            Some(second.member_id().as_str()),
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_and_closing_a_slot_publishes_the_state_a_peer_reads() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open(&client, &mock, None, false, Vec::new(), Vec::new()).await;
+
+        room.open_slot(
+            SLOT.to_owned(),
+            "m.call".to_owned(),
+            Some(FfiSlotEncryption::PerMember),
+        )
+        .await
+        .expect("open");
+        room.close_slot(SLOT.to_owned()).await.expect("close");
+
+        let sends = mock.sends();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[0].event_type, "org.matrix.msc4143.rtc.slot");
+        assert_eq!(sends[0].state_key.as_deref(), Some(SLOT));
+        assert_eq!(
+            sends[0].content,
+            serde_json::json!({
+                "status": "open",
+                "application": { "type": "m.call" },
+                "encryption": { "type": "m.per_member" },
+            }),
+        );
+        assert_eq!(
+            sends[1].content.get("status").unwrap(),
+            &serde_json::json!("closed")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slot_id_that_contradicts_its_application_is_refused() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open(&client, &mock, None, false, Vec::new(), Vec::new()).await;
+        let result = room
+            .open_slot(SLOT.to_owned(), "m.something.else".to_owned(), None)
+            .await;
+        assert!(result.is_err());
+        assert!(mock.sends().is_empty());
+    }
+
+    // --- Element Call compatibility ------------------------------------------
+    //
+    // The dialects are tested in `matrix_rtc_core::compat`. Tested here: the
+    // mode chosen when the room opens reaches every send, the two of the join
+    // included.
+
+    #[tokio::test]
+    async fn a_pre_sticky_join_publishes_room_state() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        // No slot state is asked for in this mode: that generation has none.
+        let room = open(
+            &client,
+            &mock,
+            Some(FfiMembershipFormat::RoomState),
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            mock.subjects(ROOM).unwrap().state_event_types,
+            vec![STATE_MEMBER_EVENT_TYPE.to_owned()]
+        );
+
+        let call = room
+            .clone()
+            .join_call(FfiJoinSessionParams {
+                keep_alive_timeout_ms: Some(30_000),
+                ..join_params()
+            })
+            .await
+            .expect("join");
+        let member_id = call.member_id();
+        assert_eq!(member_id, "@alice:example.org:DEVICE");
+
+        let sends = mock.sends();
+        assert!(sends.iter().all(|send| send.carrier != Carrier::Sticky));
+        let membership = sends
+            .iter()
+            .find(|send| send.carrier == Carrier::State)
+            .expect("the membership should be room state");
+        assert_eq!(membership.event_type, "org.matrix.msc3401.call.member");
+        assert_eq!(
+            membership.state_key.as_deref(),
+            Some("_@alice:example.org_DEVICE_m.call"),
+        );
+        assert_eq!(
+            membership.content.get("membershipID").unwrap(),
+            &serde_json::json!(member_id),
+        );
+        let delayed = sends
+            .iter()
+            .find(|send| send.carrier == Carrier::DelayedState)
+            .expect("the delayed leave should be a delayed state event");
+        assert_eq!(delayed.state_key, membership.state_key);
+        assert_eq!(delayed.content, serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn a_pre_sticky_join_survives_a_homeserver_without_delayed_events() {
+        let mock = MockHost::new();
+        mock.refuse_delayed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let client = RtcClient::new(mock.clone());
+        let room = open(
+            &client,
+            &mock,
+            Some(FfiMembershipFormat::RoomState),
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await;
+
+        room.clone()
+            .join_call(join_params())
+            .await
+            .expect("a refused delayed leave must not fail the join");
+        let sends = mock.sends();
+        assert!(
+            sends
+                .iter()
+                .all(|send| send.carrier != Carrier::DelayedState)
+        );
+        let membership = sends
+            .iter()
+            .find(|send| send.carrier == Carrier::State)
+            .expect("the membership is still published as room state");
+        assert!(
+            membership
+                .content
+                .get("expires")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|expires| expires > 0)
+        );
+    }
+
+    /// A mode is per room object: a later spec-current open of the same room
+    /// must not inherit the dialect a previous one installed.
+    #[tokio::test]
+    async fn shutting_down_forgets_the_dialect() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open(
+            &client,
+            &mock,
+            Some(FfiMembershipFormat::RoomState),
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await;
+        let _call = room.clone().join_call(join_params()).await.expect("join");
+        room.shutdown().await;
+        assert!(
+            mock.sends()
+                .iter()
+                .filter(|send| send.carrier == Carrier::State)
+                .any(|send| send.content == serde_json::json!({})),
+            "the leave emptied our state membership",
+        );
+
+        let room = open_call_room(&client, &mock).await;
+        let _call = room.clone().join_call(join_params()).await.expect("rejoin");
+        assert!(
+            mock.sends()
+                .iter()
+                .any(|send| send.carrier == Carrier::Sticky
+                    && send.event_type == "org.matrix.msc4143.rtc.member"),
+            "a spec-current rejoin goes back to a sticky membership",
+        );
+    }
+}

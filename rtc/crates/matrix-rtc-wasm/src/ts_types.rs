@@ -1,0 +1,346 @@
+// Copyright 2026 Element Creations Ltd.
+//
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+// Please see LICENSE in the repository root for full details.
+
+//! The TypeScript declarations for everything that crosses the boundary as a
+//! `JsValue`.
+//!
+//! wasm-bindgen types a `JsValue` parameter or return as `any`; this custom
+//! section supplies the real shapes, and the `unchecked_param_type` /
+//! `unchecked_return_type` attributes at each call site bind them. The
+//! declarations are hand-written and MUST track the serde shapes they
+//! describe (the structs are all in this crate — `WasmJoinSessionParams`,
+//! `WasmParticipant`, `WasmCallEvent`, the compat carriers, ...); the
+//! `web/` package's type-check test catches declarations that stop parsing,
+//! but a field rename only a human reads here.
+//!
+//! Conventions, mirroring the wire: input objects mark serde-defaulted fields
+//! `?:`; output objects type `Option` fields `| null` (serde serializes
+//! `None` as `null`, not absence).
+
+use wasm_bindgen::prelude::*;
+
+#[wasm_bindgen(typescript_custom_section)]
+const TS_TYPES: &'static str = r#"
+/** What the client reports about how an event or to-device message arrived. */
+export type EventEncryptionIn =
+    | { kind: "cleartext" }
+    /** `sender_confirmed`: whether the client confirms the sender under its own trust settings; absent when it cannot say, never inferred. */
+    | { kind: "encrypted"; sender_device_id?: string; sender_confirmed?: boolean };
+
+/** A room event as the client handed it over, content verbatim; the library parses it. */
+export interface EventIn {
+    event_id: string;
+    sender: string;
+    event_type: string;
+    /** Set for state events. */
+    state_key?: string;
+    origin_server_ts?: number;
+    content: Record<string, unknown>;
+    encryption: EventEncryptionIn;
+}
+
+/** A decrypted to-device message as the client handed it over. */
+export interface ToDeviceMessageIn {
+    sender: string;
+    event_type: string;
+    content: Record<string, unknown>;
+    encryption: EventEncryptionIn;
+}
+
+/** What the library wants delivered for one room (`subscribeRoom`). */
+export interface RoomSubjects {
+    /** Stable and unstable spellings both listed; deliver each under its own type. */
+    state_event_types: string[];
+    /** Message-like types to forward as they arrive, redactions included. */
+    timeline_event_types: string[];
+}
+
+/** What a `subscribeRoom` / `subscribeToDevice` call returns. */
+export interface BackendSubscription {
+    cancel(): void;
+}
+
+/** `WasmRtcClient.room`'s options. */
+export interface RoomOptionsIn {
+    format?: MembershipFormatMode;
+}
+
+/**
+ * The page's Matrix backend: the one object `WasmRtcClient` takes.
+ * Sends take the event type already in its wire spelling. The read half
+ * delivers into the sink classes (`WasmRoomSink`, `WasmToDeviceSink`): for
+ * sticky events, state events and joined members every call carries the
+ * room's complete current set, the first one on subscribe; an empty set
+ * means none.
+ *
+ * A send rejects with whatever its client threw; the library reads `errcode`,
+ * `httpStatus` and `data.retry_after_ms` off a matrix-js-sdk `MatrixError`,
+ * and `permanent: true` set by the host on a failure its client knows is final
+ * and has no Matrix code for (a room the user is not in). Attempt each send
+ * once and settle within 30 s: the library does the retrying.
+ */
+export interface MatrixBackendHost {
+    ownUserId(): string;
+    ownDeviceId(): string;
+    /** MSC4354 sticky send; pass `durationMs` through verbatim. Never called for a room opened in `room_state` mode, so a host without sticky support may reject it there. */
+    sendStickyEvent(roomId: string, eventType: string, content: Record<string, unknown>, durationMs: number): Promise<{ event_id: string } | { eventId: string } | string>;
+    sendStateEvent(roomId: string, eventType: string, stateKey: string, content: Record<string, unknown>): Promise<{ event_id: string } | { eventId: string } | string>;
+    /** MSC4140 delayed STATE event, the `room_state` mode's dead man's switch; resolves with the bare delay id. A rejection carrying `errcode` lets the library tell a homeserver without delayed events apart. */
+    sendDelayedStateEvent(roomId: string, eventType: string, stateKey: string, content: Record<string, unknown>, delayMs: number): Promise<string>;
+    /** MSC4140 delayed STICKY event (MSC4354), kept `stickyDurationMs` once it fires; resolves with the bare delay id. A client that cannot send one rejects with `errcode: 'M_UNRECOGNIZED'`; never send a plain delayed event instead, which fires without ending the membership. */
+    sendDelayedStickyEvent(roomId: string, eventType: string, content: Record<string, unknown>, stickyDurationMs: number, delayMs: number): Promise<string>;
+    /** MSC4140 `restart` — never cancel+resend. */
+    restartDelayedEvent(roomId: string, delayId: string): Promise<unknown>;
+    cancelDelayedEvent(roomId: string, delayId: string): Promise<unknown>;
+    /** Olm-encrypted, per specific device. Resolving with nothing reports every recipient served. */
+    sendToDeviceMessage(recipients: { userId: string; deviceId: string }[], messageType: string, content: Record<string, unknown>): Promise<{ userId: string; deviceId: string; error?: string }[] | void>;
+    /** Plain message-like send (reactions, raised hand); encrypted in an encrypted room. */
+    sendRoomEvent(roomId: string, eventType: string, content: Record<string, unknown>): Promise<{ event_id: string } | { eventId: string } | string>;
+    /** Redact one of our own events (lowering a raised hand). */
+    redactEvent(roomId: string, eventId: string, reason?: string): Promise<unknown>;
+    /** Synchronous: register listeners, deliver the current sets (now or soon), return the handle. */
+    subscribeRoom(roomId: string, subjects: RoomSubjects, sink: WasmRoomSink): BackendSubscription;
+    subscribeToDevice(eventTypes: string[], sink: WasmToDeviceSink): BackendSubscription;
+    /** `GET /rooms/{room}/relations/{event}/{relType}/{eventType}`, decrypted. */
+    relations(roomId: string, eventId: string, relType: string, eventType: string): Promise<EventIn[]>;
+    getOpenIdToken(): Promise<{ access_token: string; token_type: string; matrix_server_name: string; expires_in: number }>;
+    /**
+     * The homeserver's MSC4195 LiveKit token: `POST` `request` as the body to
+     * `/_matrix/client/v1/rtc/livekit/get_token` (homeservers serve it at
+     * `/_matrix/client/unstable/io.element.msc4195/rtc/livekit/get_token` so
+     * far) and resolve with the answer, `{ jwt }`. Used for transports naming an
+     * SFU `url` without a `livekit_service_url`.
+     */
+    getLivekitToken(request: { server_name?: string; url: string; room_id: string; slot_id: string; member_id: string }): Promise<{ jwt: string }>;
+    /** The transports array of `GET /_matrix/client/v1/rtc/transports` (`transports`; the unstable endpoint's `rtc_transports`), entries as served; `[]` when the endpoint is missing. */
+    rtcTransports(): Promise<unknown[]>;
+}
+
+/** One thing the MSC format relies on (spec 038 R45). */
+export type MscRequirement = "matrix_rtc" | "sticky_events" | "delayed_events" | "livekit_transport";
+
+/** `mscSupport`'s answer: `missing` stops an MSC call, `warnings` makes it worse. */
+export interface MscSupport {
+    missing: MscRequirement[];
+    warnings: MscRequirement[];
+}
+
+/** Whether the homeserver is answering the library's sends; distinct from the media `degraded` flag. */
+export type RtcSignallingHealth =
+    | { type: "reachable" }
+    | { type: "unreachable"; since_ms: number };
+
+/** The connection carrying someone's media (034 R23, R28). `connecting` is our own SFU before it is first up: the call is starting, not interrupted. */
+export type RtcConnectionState = "connected" | "connecting" | "reconnecting" | "unreachable";
+
+/** Why a member's media is not shown (034 R33): `missing_key` and `bad_key` after `key_grace_ms` (4 s) of failing frames, `not_encrypted` (a track declared unencrypted, refused) at once. */
+export type RtcUnableToDecrypt = "missing_key" | "bad_key" | "not_encrypted";
+
+/** What is interrupting the call now, cause by cause (034 R38); empty when nothing is. Member lists hold `member_id`s, `unmappable` transport identities. */
+export interface RtcInterruptions {
+    signalling: RtcSignallingHealth;
+    own_membership_lapsed: boolean;
+    /** Our own SFU, from the first value, before our own entry is on the roster. */
+    own_media: RtcConnectionState;
+    members_reconnecting: string[];
+    members_unreachable: string[];
+    unable_to_decrypt: string[];
+    unmappable: string[];
+}
+
+export type RtcStreamKind = "microphone" | "camera" | "screen_share" | "screen_share_audio" | "data";
+export type MembershipFormatMode = "msc" | "room_state";
+
+/** One roster entry, as `participants()` returns it. */
+export interface RtcParticipant {
+    member_id: string;
+    user_id: string;
+    device_id: string | null;
+    is_local: boolean;
+    /** The connection carrying their media; for our own entry, our own SFU's. */
+    connection: RtcConnectionState;
+    /** Why their media cannot be shown, or null; always null for our own entry. Draw the avatar when set or not connected. */
+    unable_to_decrypt: RtcUnableToDecrypt | null;
+    /** The livekit-js participant identity — the join key for `room.getParticipantByIdentity()`. */
+    rtc_identity: string | null;
+    streams: { kind: RtcStreamKind; muted: boolean }[];
+    /** When the participant raised their hand (ms since the epoch); `null` while it is down. */
+    hand_raised_at_ms: number | null;
+    /** Place in the raised-hand queue, 1 for the earliest; `null` while it is down. Read this rather than sorting. */
+    hand_raised_position: number | null;
+}
+
+/** An event on the unified call stream (`onEvent`). */
+export type RtcCallEvent =
+    | { type: "participant_joined"; member_id: string; user_id: string; participant_count: number }
+    | { type: "participant_left"; member_id: string; participant_count: number }
+    | { type: "stream_started"; member_id: string; kind: RtcStreamKind }
+    | { type: "stream_stopped"; member_id: string; kind: RtcStreamKind }
+    | { type: "stream_muted"; member_id: string; kind: RtcStreamKind }
+    | { type: "stream_unmuted"; member_id: string; kind: RtcStreamKind }
+    | { type: "active_speakers"; speakers: { member_id: string; level: number }[] }
+    | { type: "key_imported"; member_id: string; identity: string; key_index: number }
+    | { type: "frame_encryption_state"; member_id: string;
+        state: "ok" | "missing_key" | "decryption_failed" | "encryption_failed" | "internal_error";
+        installed_key_indices: number[] | null }
+    | { type: "key_discarded"; member_id: string; key_index: number | null;
+        sender_user_id: string | null; sender_device_id: string | null;
+        reason_code: "cleartext" | "sender_not_confirmed" | "room_mismatch" | "sender_mismatch" | "unverifiable_device" | "device_mismatch";
+        reason: string }
+    /** Only for a hand raised while we are in the call; the state is `hand_raised_at_ms` / `hand_raised_position`. */
+    | { type: "hand_raised"; member_id: string; raised_at_ms: number }
+    | { type: "hand_lowered"; member_id: string }
+    /** Transient: show `emoji` for ~3 s; `sound` is the asset base name to play (`generic` when it has none of its own).
+     *  Only while we are in the call, and only for a recent reaction (`reactions.max_age_ms`). */
+    | { type: "reaction"; member_id: string; emoji: string; name: string; sound: string }
+    | { type: "unknown_participant"; identity: string };
+
+/** How far our own media has got. */
+export type RtcMediaPhase =
+    | { type: "connecting" }
+    /** `degraded` while a transport reconnects. */
+    | { type: "connected"; degraded: boolean };
+
+/** Where a joined call is (`WasmRtcCall.status`, `onStatus`). Only `ended` is final. */
+export type RtcCallStatus =
+    /** Our media is not up yet, and there is somebody to talk to. */
+    | { type: "connecting" }
+    /** A DM call waiting for `callee`, the user ID it rings; `media` is how far our side has got. */
+    | { type: "calling";
+        callee: string;
+        ring: { type: "sending" } | { type: "ringing"; sent_at_ms: number; lifetime_ms: number };
+        media: RtcMediaPhase }
+    /** Media up and somebody to talk to; `since_ms` holds through `degraded`. */
+    | { type: "connected"; since_ms: number; degraded: boolean }
+    /** `loss_reason` and `message` (the transport's, for logs) are for `connection_closed` only. */
+    | { type: "ended";
+        reason: "left" | "declined" | "unanswered" | "ring_not_sent" | "others_left" | "empty" | "slot_closed" | "connection_closed";
+        loss_reason: "budget" | "refused" | "never_connected" | "token_endpoint_unsupported" | null;
+        message: string | null };
+
+/** `connectMedia`'s tuning. The room, slot, own focus and account are the call's. */
+export interface MediaSessionConfigIn {
+    /** Cross-check only: the mode comes from the room. */
+    format?: MembershipFormatMode;
+    /** How much the tile order is damped; omitted fields take the defaults. */
+    stability?: StabilityConfigIn;
+    /** How long our own SFU may stay unreachable before the call ends; 60 000 when omitted. */
+    own_reconnect_budget_ms?: number;
+}
+
+/**
+ * Tile-order damping. A product decision rather than a protocol one, so a
+ * page can tune it. A `demote_ms` above `promote_ms` leaves a tile at the top
+ * of the order after the speaker stopped, which reads as a stuck UI.
+ */
+export interface StabilityConfigIn {
+    /** Sustained voice before a member ranks as speaking; the tile flag is not delayed. Default 1500. */
+    promote_ms?: number;
+    /** Silence before a speaking member stops ranking as one. Default 1500. */
+    demote_ms?: number;
+    /** Reorders inside this window are delivered as one. Default 300. */
+    coalesce_ms?: number;
+    /** How long a member's frames must fail to decrypt before `unable_to_decrypt` shows `missing_key` or `bad_key`. Default 4000. */
+    key_grace_ms?: number;
+}
+
+/** The object driving livekit-js for `connectMedia`. */
+export interface MediaDelegate {
+    /** POST `body` as JSON to `url`; resolve with the HTTP status and raw response text. */
+    fetchJson(url: string, body: Record<string, unknown>): Promise<{ status: number; body: string }>;
+    /** Connect a livekit-js Room and register the RoomEvent translation onto `sink`. With `setWanted`, the room subscribes only to the identities it is handed (connect it with `autoSubscribe: false`), on every call; without it, to whatever the room subscribes to. */
+    connect(request: { connectionKey: string; sfuUrl: string; jwt: string; e2ee: boolean }, sink: WasmConnectionEventSink): Promise<{ close(): Promise<unknown>; setWanted?(identities: string[]): void }>;
+    /** Install a media key in livekit-js's key provider (per participant, HKDF material). */
+    setKey(identity: string, index: number, key: Uint8Array): Promise<boolean | void>;
+    /** Move the local sender onto a rotated key index. */
+    setLocalKeyIndex?(index: number): void;
+    /** The push half: the roster after each change. */
+    onParticipants?(roster: RtcParticipant[]): void;
+    /** The push half: the unified call event stream. */
+    onEvent?(event: RtcCallEvent): void;
+    /** The call's status: as it is first, then each change, last the end. */
+    onStatus?(status: RtcCallStatus): void;
+    /** What is interrupting the call: as it is first, then each change, after the roster of the same change. */
+    onInterruptions?(record: RtcInterruptions): void;
+}
+
+/** What a join publishes on: the homeserver's advertised LiveKit transport, a given LiveKit focus, or nothing. */
+export type JoinTransportIn =
+    | { kind: 'advertised' }
+    | { kind: 'publish'; url?: string; livekit_service_url?: string }
+    | { kind: 'receive_only' };
+
+/** `joinCall`'s parameters. */
+export interface JoinParamsIn {
+    /** The call slot to join, `m.call#{application_slot_id}`; omitted is the room-wide call, `room`. */
+    application_slot_id?: string;
+    /** What the join publishes on; omitted is `advertised`, the first LiveKit transport the homeserver advertises (`rtcTransports`). */
+    transport?: JoinTransportIn;
+    keep_alive_timeout_ms?: number;
+    sticky_duration_ms?: number;
+    degraded_lifetime_ms?: number;
+    encryption_config?: {
+        delay_before_use_ms?: number;
+        key_rotation_grace_period_ms?: number;
+        max_key_lifetime_ms?: number;
+        manage_media_keys?: boolean;
+        require_confirmed_sender?: boolean;
+    };
+    /** A group call's notification, sent by the member who starts the call; one targeting nobody is refused. */
+    notify?: {
+        notification_type: "notification";
+        intent?: string;
+        lifetime_ms?: number;
+        mention_user_ids?: string[];
+        mention_room?: boolean;
+    };
+    /** Element Call reactions and raised hand; omitted is enabled with the 3 s window. */
+    reactions?: {
+        enabled?: boolean;
+        active_window_ms?: number;
+        send_cooldown_ms?: number;
+        /** Older received reactions (by our clock) are dropped as stale; default 10 s. */
+        max_age_ms?: number;
+    };
+    /** The user's explicit choice, which wins over a call in progress; omitted follows the call (else video). */
+    intent?: "audio" | "video";
+}
+
+/** `leave`'s parameters (`{}` is a plain hang-up). */
+export interface LeaveParamsIn {
+    leave_reason?: { code: string; reason?: string };
+}
+
+/** A member whose hand is up (`raisedHands`). */
+export interface RaisedHand {
+    member_id: string;
+    sender: string;
+    reaction_event_id: string;
+    /** ms since the epoch, by the server's clock; sort ascending to order speakers. */
+    raised_at_ms: number;
+}
+
+/** One entry of Element Call's reaction catalogue (`reactionCatalog()`). */
+export interface ReactionKind {
+    name: string;
+    emoji: string;
+    /** Base name of the sound asset Element Call plays for it (`generic` when it has none of its own). */
+    sound: string;
+}
+
+/** MSC4143 `content.encryption` of an `m.rtc.slot` (`openSlot`). */
+export interface SlotEncryptionIn {
+    type: string;
+    [key: string]: unknown;
+}
+
+/** One entry of the sink's `activeSpeakers` payload. */
+export interface SpeakerIn {
+    identity: string;
+    /** 0.0 (silent) to 1.0; omit for transports that report no level. */
+    level?: number;
+}
+
+"#;
