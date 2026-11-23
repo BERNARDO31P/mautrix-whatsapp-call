@@ -1,5 +1,7 @@
 # Deployment overlay
 
+**Start here:** [Complete installation guide](INSTALLATION.md) (includes LiveKit installation, key generation, MatrixRTC setup, proxy and firewall). For upgrades, backups, recovery, troubleshooting and live testing, see [OPERATIONS.md](OPERATIONS.md).
+
 This directory is copied to `/opt/matrix/mautrix-whatsapp-call/` beside the existing Matrix/Synapse Compose project.
 
 The overlay adds LiveKit, the Element JWT service, the encrypted RTC worker, the automatic WhatsApp ghost identity provisioner, and a locally built mautrix-whatsapp image that contains the call bridge.

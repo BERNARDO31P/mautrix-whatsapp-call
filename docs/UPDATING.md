@@ -209,3 +209,5 @@ bash mautrix-whatsapp-call/verify-worker.sh
 ```
 
 Finally perform live outgoing/incoming audio/video acceptance tests before publishing the dependency bump as a release.
+
+For the complete server-side download, checksum, backup, rollback, credential-preservation and troubleshooting workflow, see the [operations guide](../deployment/mautrix-whatsapp-call/OPERATIONS.md) and [installation guide](../deployment/mautrix-whatsapp-call/INSTALLATION.md).

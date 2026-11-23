@@ -22,3 +22,5 @@ The full build additionally runs:
 - runtime package checksum/layout verification.
 
 Live WhatsApp/Matrix acceptance remains a deployment concern and is not simulated by the offline source tests.
+
+For the full real-world acceptance matrix (both call directions, modes, termination, business eligibility, reconnect, media, migration and ordinary messages), see [Live acceptance checklist](../deployment/mautrix-whatsapp-call/OPERATIONS.md#5-live-acceptance-checklist-for-every-deployment-or-dependency-update). Record actual observations; do not infer live-media success from offline test counts or worker health.

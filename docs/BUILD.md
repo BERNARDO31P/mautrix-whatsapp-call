@@ -2,6 +2,8 @@
 
 The checked-in `bridge/` and `rtc/` trees are the effective source. The build does not download or apply source patches.
 
+For the complete release publishing, checksum and build troubleshooting workflow, see [RELEASING.md](RELEASING.md). Server operators can use prebuilt runtime ZIPs without this toolchain; see the [installation guide](../deployment/mautrix-whatsapp-call/INSTALLATION.md).
+
 Pinned build inputs are prepared under `~/.cache/mautrix-whatsapp-call/`:
 
 - Go 1.27.4

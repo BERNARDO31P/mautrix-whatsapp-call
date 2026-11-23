@@ -4,6 +4,12 @@
 
 The repository contains the source required to build the modified mautrix-whatsapp bridge and the MatrixRTC call worker. Large build inputs such as Go, Rust, LLVM/Clang and the LiveKit WebRTC bundle are **not committed**; the bootstrap downloads pinned versions and verifies their SHA-256 digests.
 
+## Installation and documentation
+
+**Installing on a Matrix server? Start with the [complete installation guide](deployment/mautrix-whatsapp-call/INSTALLATION.md).** It covers the prebuilt runtime, an existing Synapse/WhatsApp stack, automatic LiveKit and JWT service installation, credential generation, actual configuration examples, DNS/TLS, reverse proxy, firewall, room migration and verification. No separate LiveKit installation or build toolchain is required on the runtime host.
+
+For upgrades, backup/restore, secret recovery, troubleshooting and the live test checklist, see the [operations guide](deployment/mautrix-whatsapp-call/OPERATIONS.md). Both guides are included in future runtime packages. Maintainers publishing builds should also see [Releasing](docs/RELEASING.md).
+
 ## What it provides
 
 - outgoing and incoming WhatsApp audio/video calls from MatrixRTC-capable Matrix clients;
