@@ -121,7 +121,7 @@ fi
 (
     cd "$BRIDGE_SRC"
     env CC="musl-gcc" CXX="musl-gcc" CGO_ENABLED="1" GOOS="linux" GOARCH="amd64" \
-        go build -p "$JOBS" -mod=readonly -tags "goolm,netgo,osusergo" -trimpath \
+        go build -p "$JOBS" -mod=readonly -buildvcs=false -tags "goolm,netgo,osusergo" -trimpath \
         -ldflags='-linkmode external -extldflags "-static"' \
         -o "$BIN/mautrix-whatsapp-call-bridge" ./cmd/mautrix-whatsapp | tee "$LOG/go-build.log"
 )
