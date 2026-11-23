@@ -4,7 +4,17 @@
 
 ## 1. Normal project release update
 
-For normal users, the recommended dependency-update path is to update this repository to a newer tested release rather than manually changing individual pins.
+For normal users, the recommended dependency-update path is to install a newer tested prebuilt release rather than manually changing individual pins or rebuilding dependencies.
+
+Download releases from:
+
+```text
+https://github.com/BERNARDO31P/mautrix-whatsapp-call/releases/latest
+```
+
+Download both `mautrix-whatsapp-call-<timestamp>.zip` and the matching `.zip.sha256`, verify them, then run the normal server upgrade flow.
+
+Maintainers or users who intentionally build from source can instead update the checkout:
 
 On the build machine:
 

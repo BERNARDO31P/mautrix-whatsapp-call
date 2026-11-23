@@ -1,5 +1,22 @@
 # Deployment
 
+## Download a prebuilt release
+
+Prebuilt Linux AMD64 runtime packages are published at:
+
+```text
+https://github.com/BERNARDO31P/mautrix-whatsapp-call/releases/latest
+```
+
+Download both the runtime ZIP and its matching `.sha256` file. For `v0.1.0`, the direct paths are:
+
+```text
+https://github.com/BERNARDO31P/mautrix-whatsapp-call/releases/download/v0.1.0/mautrix-whatsapp-call-20261123-233131.zip
+https://github.com/BERNARDO31P/mautrix-whatsapp-call/releases/download/v0.1.0/mautrix-whatsapp-call-20261123-233131.zip.sha256
+```
+
+A source build produces the same two files under `dist/`; see [BUILD.md](BUILD.md).
+
 Building does not enable calls by itself. The runtime overlay keeps the call worker controlled by `MATRIXRTC_ENABLE_CALLS`, whose default is `0`.
 
 The release deployment directory belongs at:

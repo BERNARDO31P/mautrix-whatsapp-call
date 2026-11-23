@@ -40,6 +40,30 @@ If the registration is elsewhere, set `MATRIXRTC_WHATSAPP_REGISTRATION_PATH` in 
 
 The build target is Linux AMD64. Windows builds use WSL2.
 
+## Prebuilt release download
+
+Most users do **not** need Go, Rust, LLVM/Clang or WebRTC build tooling. Download the prebuilt Linux AMD64 runtime ZIP and its checksum from GitHub Releases:
+
+```text
+https://github.com/BERNARDO31P/mautrix-whatsapp-call/releases/latest
+```
+
+Release assets use the build output name:
+
+```text
+mautrix-whatsapp-call-<timestamp>.zip
+mautrix-whatsapp-call-<timestamp>.zip.sha256
+```
+
+For the initial `v0.1.0` release, the direct asset path is:
+
+```text
+https://github.com/BERNARDO31P/mautrix-whatsapp-call/releases/download/v0.1.0/mautrix-whatsapp-call-20261123-233131.zip
+https://github.com/BERNARDO31P/mautrix-whatsapp-call/releases/download/v0.1.0/mautrix-whatsapp-call-20261123-233131.zip.sha256
+```
+
+See [docs/DEPLOY.md](docs/DEPLOY.md) for verification and installation commands.
+
 ## Repository layout
 
 ```text
