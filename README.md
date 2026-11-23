@@ -250,13 +250,32 @@ Force-stop/reopen Matrix clients once after an upgrade so cached call eligibilit
 
 ## Updating
 
-Pull/build a newer source revision, copy the new runtime ZIP to the server, replace only the deployment files with `rsync` while excluding `generated/` and `worker-state/`, then rerun:
+There are three different update paths: project releases, ordinary container-image updates, and upstream dependency bumps. They are intentionally separate. See [`docs/UPDATING.md`](docs/UPDATING.md) for the complete procedure.
+
+For a normal `mautrix-whatsapp-call` release upgrade, pull/build the newer source revision, copy the new runtime ZIP to the server, replace only the deployment files with `rsync` while excluding `generated/` and `worker-state/`, then rerun:
 
 ```bash
 bash /opt/matrix/mautrix-whatsapp-call/install-or-upgrade.sh
 ```
 
 The installer is designed to be idempotent and to preserve credentials/state.
+
+When updating unrelated containers in the Matrix stack, always include this project's Compose overlay. A safe pull is:
+
+```bash
+cd /opt/matrix
+docker compose \
+    -f docker-compose.yml \
+    -f mautrix-whatsapp-call/compose.yml \
+    pull --ignore-buildable
+
+docker compose \
+    -f docker-compose.yml \
+    -f mautrix-whatsapp-call/compose.yml \
+    up -d
+```
+
+`--ignore-buildable` deliberately skips the locally built call bridge and worker images. Do not run the base Compose file by itself when recreating `mautrix-whatsapp`, because that can recreate the ordinary upstream bridge image without the calling extension.
 
 ## Verification and tests
 
