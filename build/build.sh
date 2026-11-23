@@ -25,6 +25,17 @@ source "$CACHE/inputs.env"
 
 "$SCRIPT_DIR/verify-source.sh"
 
+# Keep the checked-out repository immutable. Some Go module operations may
+# update go.sum when resolving a pinned dependency graph, which would make a
+# second build fail the source-tree hash check. Do all Go module/test/build
+# work in an ephemeral copy instead.
+GO_SOURCE="$WORK/go-source"
+rm -rf "$GO_SOURCE"
+mkdir -p "$GO_SOURCE"
+cp -a "$REPO_ROOT/bridge" "$GO_SOURCE/bridge"
+BRIDGE_SRC="$GO_SOURCE/bridge"
+MEOW_SRC="$BRIDGE_SRC/third_party/meowcaller"
+
 export PATH="$GOROOT/bin:$PATH"
 export GOMODCACHE="$CACHE/go-mod"
 export GOCACHE="$CACHE/go-build"
