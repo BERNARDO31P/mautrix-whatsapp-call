@@ -202,3 +202,16 @@ Only mark tests passed after observing the expected outcome. Record not-applicab
 ## 6. Reporting and security
 
 For a bug report include the release tag, platform/architecture, relevant component versions, exact failing step, expected vs actual behavior and sanitized logs around the event. For a security problem use the repository's security reporting guidance; do not publish a proof containing real tokens or session data. Never upload `generated/`, `worker-state/`, bridge/Synapse databases, full `.env`, production registrations or private keys.
+
+### Element X membership compatibility
+
+For incoming calls the default `MATRIXRTC_INCOMING_MEMBERSHIP_FORMAT=room_state`
+uses MSC3401 membership, MSC4075 notifications and legacy SFU authorization.
+This matches the Element X client observed in the November 24 deployment.
+Set `MATRIXRTC_INCOMING_MEMBERSHIP_FORMAT=msc` in the deployment `.env` only for
+clients known to support the newer MSC4143/4354 invite and membership flow.
+The bridge must be recreated to apply that environment setting. Outgoing calls
+continue to select the dialect from the authenticated caller's invitation and
+related membership. An absent or mismatched membership must still prevent dial.
+Worker logs report the selected dialect and, on an admission timeout, the two
+roster snapshots (which contain identifiers, but not encryption key material).

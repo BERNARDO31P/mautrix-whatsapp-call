@@ -2,7 +2,7 @@
 param(
     [string]$DistroName = "",
     [string]$OutputRoot = "",
-    [int]$Jobs = 0,
+    [ValidateRange(0,256)][int]$Jobs = 4,
     [switch]$PrepareOnly
 )
 
@@ -15,3 +15,4 @@ $Parameters = @{
 }
 if ($PrepareOnly) { $Parameters.PrepareOnly = $true }
 & (Join-Path $PSScriptRoot "build\Build.ps1") @Parameters
+exit $LASTEXITCODE

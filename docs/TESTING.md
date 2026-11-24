@@ -38,3 +38,27 @@ These checks exercise the local wire protocol, media bus, lifecycle manager and 
 ```
 
 Release-layout tests use synthetic ELF headers, not real native binaries. The complete release gate must compile and test all three executables, then use real calls and migration/recovery tests in a non-production deployment. Source guards, hashes and successful fixture tests do not prove that external protocols interoperate.
+
+## Call compatibility regression gates
+
+A successful socket health probe alone is not a successful call test. The
+release build now runs the core, call, transport and native call SDK library
+suites, then invokes `mautrix-whatsapp-call-worker tls-self-test` on the actual
+compiled release executable. This constructs the Rustls and reqwest TLS clients
+without needing a homeserver, and fails packaging if the combined feature set
+cannot initialize a crypto provider. It does not prove a remote TLS handshake.
+
+For the legacy room-state dialect, the regression fixtures check encrypted-room
+membership, both legacy state event names, the historical uppercase `ROOM`
+slot and the user/device identity fallback. The native feeder delivers the
+room's state, encryption, joined members and sticky snapshot in one input; a
+failed state request is retried instead of treated as an empty roster.
+
+Before declaring the bridge release functional, verify the actual Element X
+client's call membership and token flow. On an isolated Matrix/LiveKit test
+stack, the bundled upstream `rtc/crates/matrix-rtc-call-sdk/tests/E2E_CALL.md`
+explains how to run the ignored end-to-end tests, including
+`e2e_call_single_focus_room_state` and `e2e_call_rejoin_room_state`.
+Those tests exercise Rust clients with encrypted media; they do not substitute
+for WhatsApp-to-Element X and Element X-to-WhatsApp acceptance tests.
+Do not run the throwaway-user or container-restart scenarios on production.

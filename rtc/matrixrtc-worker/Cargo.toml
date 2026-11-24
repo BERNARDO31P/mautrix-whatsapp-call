@@ -20,6 +20,7 @@ matrix-rtc-transport = { path = "../crates/matrix-rtc-transport", optional = tru
 matrix-sdk = { workspace = true, optional = true }
 matrix-sdk-ui = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
 rustls = { version = "0.23", features = ["aws_lc_rs"], optional = true }
 livekit = { workspace = true, optional = true }
 futures-util = { version = "0.3", optional = true }
@@ -27,7 +28,7 @@ futures-util = { version = "0.3", optional = true }
 [features]
 default = []
 provision = ["matrix-sdk"]
-rtc = ["provision", "matrix-rtc-call-sdk", "matrix-rtc-core", "matrix-rtc-call", "matrix-rtc-transport", "matrix-sdk-ui", "reqwest", "rustls", "livekit", "futures-util"]
+rtc = ["provision", "matrix-rtc-call-sdk", "matrix-rtc-core", "matrix-rtc-call", "matrix-rtc-transport", "matrix-sdk-ui", "reqwest", "rustls", "log", "livekit", "futures-util"]
 
 [[bin]]
 name = "matrixrtc-ghost-provision"

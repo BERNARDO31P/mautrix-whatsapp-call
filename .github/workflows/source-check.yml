@@ -19,3 +19,11 @@ jobs:
       - run: python -B deployment/mautrix-whatsapp-call/worker/auto-provision-whatsapp-ghosts.py --self-test
       - run: bash deployment/mautrix-whatsapp-call/sync-direct-chats.sh --self-test
       - run: for test in tests/shell/*.sh; do bash "$test"; done
+
+  windows-wrappers:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse and test Windows PowerShell entrypoints
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/windows/Test-Wrappers.ps1

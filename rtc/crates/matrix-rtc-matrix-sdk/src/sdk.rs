@@ -20,7 +20,7 @@ use matrix_rtc_core::{
     ToDeviceRecipient, ToDeviceSink,
 };
 use matrix_sdk::deserialized_responses::{
-    AlgorithmInfo, DeviceLinkProblem, EncryptionInfo, RawAnySyncOrStrippedState, VerificationLevel,
+    AlgorithmInfo, DeviceLinkProblem, EncryptionInfo, VerificationLevel,
     VerificationState,
 };
 use matrix_sdk::encryption::identities::Device;
@@ -826,6 +826,12 @@ async fn feed_room_subjects(room: Room, subjects: RoomSubjects, sink: Arc<dyn Ro
 
     let mut sticky = room.sticky_events().subscribe();
     let mut updates = room.subscribe_to_updates();
+    // Ghost clients use sliding sync and may not subscribe to every portal's
+    // legacy member state. Poll authoritative state while a legacy room is
+    // attached, even when that room produces no sync wakeup. This is not a
+    // global background poll: dropping the RTC subscription stops it.
+    let legacy_membership = subjects.state_event_types.iter().any(|name|
+        name == "org.matrix.msc3401.call.member" || name == "m.call.member");
 
     loop {
         let all_read = emit_room_subjects(&room, &subjects, &sink).await;
@@ -834,6 +840,7 @@ async fn feed_room_subjects(room: Room, subjects: RoomSubjects, sink: Arc<dyn Ro
             result = sticky.recv() => keep_going(result),
             result = updates.recv() => keep_going(result),
             _ = tokio::time::sleep(RETRY_AFTER), if !all_read => true,
+            _ = tokio::time::sleep(Duration::from_secs(1)), if legacy_membership => true,
         };
         if !woken {
             break;
@@ -852,70 +859,46 @@ async fn emit_room_subjects(
     sink: &Arc<dyn RoomSink>,
 ) -> bool {
     let room_id = room.room_id().to_string();
-    let mut all_read = true;
-
-    match room.latest_encryption_state().await {
-        Ok(state) => sink.on_encryption(state.is_encrypted()),
+    // Gather every required subject before delivering any. A failed state
+    // fetch must not open the feeder's gate with a falsely empty roster.
+    let encrypted = match room.latest_encryption_state().await {
+        Ok(state) => state.is_encrypted(),
         Err(error) => {
             log::warn!("[{room_id}] failed to read room encryption state: {error}");
-            all_read = false;
+            return false;
         }
-    }
-
-    // A type the SDK store already holds is read from it; one fetch answers
-    // every other requested type, each delivered under its own type: the
-    // library tells the spellings apart, not us.
-    for event_type in &subjects.state_event_types {
-        if held_by_store(event_type) {
-            sink.on_state_events(
-                event_type.clone(),
-                store_state_snapshot(room, event_type).await,
-            );
-        }
-    }
-    let fetched: Vec<&String> = subjects
-        .state_event_types
-        .iter()
-        .filter(|event_type| !held_by_store(event_type))
-        .collect();
-    if !fetched.is_empty() {
-        match state_snapshot(room, &fetched).await {
-            Some(events) => {
-                for event_type in fetched {
-                    let of_type = events
-                        .iter()
-                        .filter(|event| &event.event_type == event_type)
-                        .cloned()
-                        .collect();
-                    sink.on_state_events(event_type.clone(), of_type);
-                }
-            }
-            None => all_read = false,
-        }
-    }
-
-    match room.members(RoomMemberships::JOIN).await {
-        Ok(members) => sink.on_joined_members(
-            members
-                .into_iter()
-                // Service members such as mautrix bridge bots are deliberately
-                // present in encrypted DMs but are not human participants.
-                // Feeding them into matrix-rust-rtc would demote a direct call
-                // to a group call because direct-call semantics require one
-                // other human user.
-                .filter(|member| member.user_id() == room.own_user_id() || !member.is_service_member())
-                .map(|member| member.user_id().to_string())
-                .collect(),
-        ),
+    };
+    let fetched: Vec<&String> = subjects.state_event_types.iter().collect();
+    let snapshot = if fetched.is_empty() {
+        Vec::new()
+    } else {
+        let Some(events) = state_snapshot(room, &fetched).await else {
+            return false;
+        };
+        fetched.into_iter().map(|event_type| {
+            let of_type = events.iter()
+                .filter(|event| &event.event_type == event_type)
+                .cloned().collect();
+            (event_type.clone(), of_type)
+        }).collect()
+    };
+    let members = match room.members(RoomMemberships::JOIN).await {
+        Ok(members) => members.into_iter()
+            // Bridge bots are service members, not human participants.
+            .filter(|member| member.user_id() == room.own_user_id() || !member.is_service_member())
+            .map(|member| member.user_id().to_string())
+            .collect::<Vec<_>>(),
         Err(error) => {
             log::warn!("[{room_id}] failed to read room members: {error}");
-            all_read = false;
+            return false;
         }
+    };
+    if !members.iter().any(|id| id == room.own_user_id().as_str()) {
+        log::warn!("[{room_id}] joined-members snapshot has not loaded our own user");
+        return false;
     }
-
-    sink.on_sticky_events(sticky_snapshot(room));
-
-    all_read
+    sink.on_room_snapshot(encrypted, snapshot, members, sticky_snapshot(room));
+    true
 }
 
 /// The room's live sticky events, raw. The sticky map only files plaintext
@@ -958,13 +941,12 @@ fn sticky_snapshot(room: &Room) -> Vec<EventIn> {
         .collect()
 }
 
-/// The room's state events of `event_types` (in practice the `m.rtc.slot`
+/// The room's state events of `event_types` (RTC slot and legacy membership
 /// spellings), or `None` when it could not be read.
 ///
-/// Asks the homeserver (`GET /rooms/{id}/state`) instead of the SDK's store:
-/// the store only holds the types in sliding sync's `required_state`, which
-/// does not include the slot type, so it would report every room as slotless
-/// — and that closes every session. A failed fetch is `None`, never "none".
+/// Ask the homeserver (`GET /rooms/{id}/state`): the sliding-sync cache is
+/// not guaranteed to hold every requested state type for a ghost's room.
+/// A failed fetch is `None`, never an empty authoritative snapshot.
 async fn state_snapshot(room: &Room, event_types: &[&String]) -> Option<Vec<EventIn>> {
     let room_id = room.room_id().to_string();
     let request = get_state_events::v3::Request::new(room.room_id().to_owned());
@@ -972,6 +954,8 @@ async fn state_snapshot(room: &Room, event_types: &[&String]) -> Option<Vec<Even
         Ok(response) => response,
         Err(error) => {
             log::warn!("[{room_id}] failed to fetch room state: {error}");
+            #[cfg(not(target_arch = "wasm32"))]
+            eprintln!("RTC membership state request failed for {room_id}; retrying");
             return None;
         }
     };
@@ -1009,46 +993,6 @@ async fn state_snapshot(room: &Room, event_types: &[&String]) -> Option<Vec<Even
         events.len(),
     );
     Some(events)
-}
-
-/// Whether the SDK store keeps `event_type` current on its own, so it is read
-/// from there rather than fetched: `m.call.member` (the pre-sticky Element
-/// Call membership) is in sliding sync's default `required_state`.
-fn held_by_store(event_type: &str) -> bool {
-    StateEventType::from(event_type) == StateEventType::CallMember
-}
-
-/// The room's state of `event_type`, raw, from the SDK store. Stripped state
-/// belongs to a room we are only invited to and carries no `origin_server_ts`,
-/// so it is skipped.
-async fn store_state_snapshot(room: &Room, event_type: &str) -> Vec<EventIn> {
-    let room_id = room.room_id().to_string();
-    let raw = match room
-        .get_state_events(StateEventType::from(event_type))
-        .await
-    {
-        Ok(raw) => raw,
-        Err(error) => {
-            log::warn!("[{room_id}] could not read {event_type} state: {error}");
-            return Vec::new();
-        }
-    };
-    raw.into_iter()
-        .filter_map(|state| {
-            let RawAnySyncOrStrippedState::Sync(raw) = state else {
-                return None;
-            };
-            Some(EventIn {
-                event_id: raw.get_field("event_id").ok().flatten()?,
-                sender: raw.get_field("sender").ok().flatten()?,
-                event_type: event_type.to_owned(),
-                state_key: raw.get_field("state_key").ok().flatten(),
-                origin_server_ts: raw.get_field("origin_server_ts").ok().flatten()?,
-                content: raw.get_field("content").ok().flatten()?,
-                encryption: EventEncryption::Cleartext,
-            })
-        })
-        .collect()
 }
 
 /// A timeline event as the feeder takes it, or a redaction.

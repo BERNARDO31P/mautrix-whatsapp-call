@@ -555,3 +555,21 @@ async fn an_application_gets_its_sticky_types_before_the_set_is_narrowed() {
         ["$decline"]
     );
 }
+
+#[tokio::test]
+async fn room_snapshot_is_one_feeder_input() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let sink = ChannelRoomSink { tx };
+    sink.on_room_snapshot(true, vec![
+        ("org.matrix.msc3401.call.member".to_owned(), vec![]),
+        ("m.call.member".to_owned(), vec![]),
+    ], vec![ME.to_owned(), BOB.to_owned()], vec![]);
+    let Some(RoomInput::Snapshot(encrypted, subjects, members, sticky)) = rx.recv().await else {
+        panic!("a full state response must be delivered as one feeder input");
+    };
+    assert!(encrypted);
+    assert_eq!(subjects.len(), 2);
+    assert_eq!(members.len(), 2);
+    assert!(sticky.is_empty());
+    assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+}

@@ -20,9 +20,9 @@ mkdir -p "$CACHE" "$DIST"
 rm -rf "$BIN" "$LOG"
 mkdir -p "$BIN" "$LOG"
 
-"$REPO_ROOT/bootstrap/prepare-build-inputs.sh" "$CACHE"
+bash "$REPO_ROOT/bootstrap/prepare-build-inputs.sh" "$CACHE"
 source "$CACHE/inputs.env"
-"$SCRIPT_DIR/verify-source.sh"
+bash "$SCRIPT_DIR/verify-source.sh"
 
 # Keep Go dependency/test/build operations outside the checkout, preserving
 # the public repository's immutable-source build fix.
@@ -111,36 +111,41 @@ if [[ "$SKIP_TESTS" != "1" ]]; then
         cd "$BRIDGE_SRC"
         go test -p "$JOBS" -mod=readonly -tags "goolm" -count=1 \
             -run 'Test(RTC(EventProcessorDispatchClasses|RingLifetimeAfterAcceptAndCancellation|UnansweredRingExpires)|MatrixRTCDMPowerLevels|MatrixRTCCall(DeviceClassification|StaticJIDAvailability)|WhatsApp(BusinessCallOptionClassification|BusinessCallProfileResponseClassification|VoIPFeatureResponseClassification|EndReasonFormatting)|CombineWhatsAppMatrixRTCCallAvailabilityPrecedence|VoIPManagerRefinesEndReason)$' \
-            -v ./pkg/connector | tee "$LOG/go-focused.log"
-        go test -p "$JOBS" -mod=readonly -tags "goolm" -count=1 ./pkg/connector/voipbridge/... ./pkg/connector | tee "$LOG/go-connector.log"
+            -v ./pkg/connector 2>&1 | tee "$LOG/go-focused.log"
+        go test -p "$JOBS" -mod=readonly -tags "goolm" -count=1 ./pkg/connector/voipbridge/... ./pkg/connector 2>&1 | tee "$LOG/go-connector.log"
     )
     (
         cd "$MEOW_SRC"
-        go test -p "$JOBS" -mod=readonly -count=1 ./rtp ./mlow ./signaling . | tee "$LOG/meowcaller.log"
+        go test -p "$JOBS" -mod=readonly -count=1 ./rtp ./mlow ./signaling . 2>&1 | tee "$LOG/meowcaller.log"
     )
     (
         cd "$RTC_SRC"
-        cargo test --locked -p matrix-rtc-core --features testing --lib -j "$JOBS" | tee "$LOG/matrix-rtc-core.log"
-        cargo test --locked -p matrixrtc-whatsapp-worker -j "$JOBS" | tee "$LOG/rust-core.log"
-        cargo test --locked -p matrixrtc-whatsapp-worker --features rtc -j "$JOBS" | tee "$LOG/rust-rtc.log"
+        cargo test --locked -p matrix-rtc-core --features testing --lib -j "$JOBS" 2>&1 | tee "$LOG/matrix-rtc-core.log"
+        cargo test --locked -p matrix-rtc-call -p matrix-rtc-transport --lib -j "$JOBS" 2>&1 | tee "$LOG/matrix-rtc-call-transport.log"
+        cargo test --locked -p matrix-rtc-call-sdk --features matrix-sdk --lib -j "$JOBS" 2>&1 | tee "$LOG/matrix-rtc-call-sdk.log"
+        cargo test --locked -p matrix-rtc-matrix-sdk -p matrix-rtc-livekit --lib -j "$JOBS" 2>&1 | tee "$LOG/matrix-rtc-native-backends.log"
+        cargo test --locked -p matrixrtc-whatsapp-worker -j "$JOBS" 2>&1 | tee "$LOG/rust-core.log"
+        cargo test --locked -p matrixrtc-whatsapp-worker --features rtc -j "$JOBS" 2>&1 | tee "$LOG/rust-rtc.log"
     )
 fi
 
 (
     cd "$RTC_SRC"
-    cargo build --locked --release -p matrixrtc-whatsapp-worker --features rtc --bins -j "$JOBS" | tee "$LOG/rust-build.log"
+    cargo build --locked --release -p matrixrtc-whatsapp-worker --features rtc --bins -j "$JOBS" 2>&1 | tee "$LOG/rust-build.log"
 )
 (
     cd "$BRIDGE_SRC"
     env CC="musl-gcc" CXX="musl-gcc" CGO_ENABLED="1" GOOS="linux" GOARCH="amd64" \
         go build -p "$JOBS" -mod=readonly -buildvcs=false -tags "goolm,netgo,osusergo" -trimpath \
         -ldflags='-linkmode external -extldflags "-static"' \
-        -o "$BIN/mautrix-whatsapp-call-bridge" ./cmd/mautrix-whatsapp | tee "$LOG/go-build.log"
+        -o "$BIN/mautrix-whatsapp-call-bridge" ./cmd/mautrix-whatsapp 2>&1 | tee "$LOG/go-build.log"
 )
 
 cp "$CARGO_TARGET_DIR/release/matrixrtc-whatsapp-worker" "$BIN/mautrix-whatsapp-call-worker"
 cp "$CARGO_TARGET_DIR/release/matrixrtc-ghost-provision" "$BIN/mautrix-whatsapp-call-provision"
 strip "$BIN/mautrix-whatsapp-call-worker" "$BIN/mautrix-whatsapp-call-provision" || true
+
+"$BIN/mautrix-whatsapp-call-worker" tls-self-test 2>&1 | tee "$LOG/rust-tls-release.log"
 
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
 PACKAGE_NAME="mautrix-whatsapp-call-${STAMP}"
@@ -168,12 +173,12 @@ chmod 0755     "$RELEASE/bin/mautrix-whatsapp-call-bridge"     "$RELEASE/bin/mau
     cd "$RELEASE"
     find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
 )
-"$SCRIPT_DIR/verify-package.sh" "$RELEASE"
+bash "$SCRIPT_DIR/verify-package.sh" "$RELEASE"
 (
     cd "$PACKAGE_WORK"
     zip -qr "$ZIP_WORK" "$PACKAGE_NAME"
 )
-"$SCRIPT_DIR/verify-package.sh" "$ZIP_WORK"
+bash "$SCRIPT_DIR/verify-package.sh" "$ZIP_WORK"
 sha256sum "$ZIP_WORK" | sed "s#  .*#  $PACKAGE_NAME.zip#" > "$SHA_WORK"
 cp -f "$ZIP_WORK" "$DIST/$PACKAGE_NAME.zip"
 cp -f "$SHA_WORK" "$DIST/$PACKAGE_NAME.zip.sha256"

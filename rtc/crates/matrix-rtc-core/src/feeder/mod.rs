@@ -242,6 +242,7 @@ fn to_slot_event(room_id: &str, event: EventIn) -> Option<RawSlotEvent> {
 enum RoomInput {
     Sticky(Vec<EventIn>),
     State(String, Vec<EventIn>),
+    Snapshot(bool, Vec<(String, Vec<EventIn>)>, Vec<String>, Vec<EventIn>),
     Members(Vec<String>),
     Encryption(bool),
     Timeline(Vec<EventIn>),
@@ -260,6 +261,11 @@ impl RoomSink for ChannelRoomSink {
 
     fn on_state_events(&self, event_type: String, events: Vec<EventIn>) {
         let _ = self.tx.send(RoomInput::State(event_type, events));
+    }
+
+    fn on_room_snapshot(&self, encrypted: bool, state: Vec<(String, Vec<EventIn>)>,
+                        members: Vec<String>, sticky: Vec<EventIn>) {
+        let _ = self.tx.send(RoomInput::Snapshot(encrypted, state, members, sticky));
     }
 
     fn on_joined_members(&self, user_ids: Vec<String>) {
@@ -437,27 +443,18 @@ where
             let Some(input) = input else { break };
             match input {
                 RoomInput::Stop => break,
-                RoomInput::Encryption(encrypted) => {
-                    self.room
-                        .lock()
-                        .await
-                        .rtc()
-                        .on_encryption_received(encrypted)
-                        .await;
-                    self.state.seen_encryption = true;
-                }
+                RoomInput::Encryption(encrypted) => self.on_encryption(encrypted).await,
                 RoomInput::State(event_type, events) => self.on_state(event_type, events).await,
-                RoomInput::Members(user_ids) => self.on_members(user_ids).await,
-                RoomInput::Sticky(events) => {
-                    self.on_application_sticky(&events).await;
-                    self.state.sticky = Some(
-                        events
-                            .into_iter()
-                            .filter(|event| MEMBER_EVENT_TYPES.contains(&event.event_type.as_str()))
-                            .collect(),
-                    );
-                    self.state.membership_dirty = true;
+                RoomInput::Snapshot(encrypted, state, members, sticky) => {
+                    self.on_encryption(encrypted).await;
+                    for (event_type, events) in state {
+                        self.on_state(event_type, events).await;
+                    }
+                    self.on_members(members).await;
+                    self.on_sticky(sticky).await;
                 }
+                RoomInput::Members(user_ids) => self.on_members(user_ids).await,
+                RoomInput::Sticky(events) => self.on_sticky(events).await,
                 RoomInput::Timeline(events) => {
                     let events: Vec<RawTimelineEvent> = events
                         .into_iter()
@@ -475,6 +472,19 @@ where
             }
         }
         log::info!("[{}] feeder stopped", self.room_id);
+    }
+
+    async fn on_encryption(&mut self, encrypted: bool) {
+        self.room.lock().await.rtc().on_encryption_received(encrypted).await;
+        self.state.seen_encryption = true;
+    }
+
+    async fn on_sticky(&mut self, events: Vec<EventIn>) {
+        self.on_application_sticky(&events).await;
+        self.state.sticky = Some(events.into_iter()
+            .filter(|event| MEMBER_EVENT_TYPES.contains(&event.event_type.as_str()))
+            .collect());
+        self.state.membership_dirty = true;
     }
 
     /// Hands the application its sticky types before the set is narrowed to
@@ -602,6 +612,9 @@ where
                 "[{}] the current membership was not applied: {error}",
                 self.room_id
             );
+            // Keep the failed snapshot dirty so a later delivery retries it,
+            // but do not report readiness when it has not been applied.
+            return;
         }
         self.state.membership_dirty = false;
         if !*self.seeded.borrow() {

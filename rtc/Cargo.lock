@@ -3286,6 +3286,7 @@ dependencies = [
  "futures-util",
  "hex",
  "livekit",
+ "log",
  "matrix-rtc-call",
  "matrix-rtc-call-sdk",
  "matrix-rtc-core",

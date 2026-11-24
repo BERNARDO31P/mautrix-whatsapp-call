@@ -39,8 +39,63 @@ impl Writer {
     }
 }
 
+#[cfg(feature = "rtc")]
+fn init_tls_provider() -> io::Result<()> {
+    // Matrix SDK and LiveKit/reqwest enable different rustls backends. Select
+    // the same provider as the bundled SDK examples before building any TLS
+    // client, not only when the first call is received.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        return Err(io::Error::other("rustls CryptoProvider initialization failed"));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rtc")]
+fn verify_tls_client() -> io::Result<()> {
+    let _ = rustls::ClientConfig::builder()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    let _ = reqwest::Client::builder().build().map_err(io::Error::other)?;
+    Ok(())
+}
+
+// Only the legacy decoder's reason codes (never media keys, tokens, raw event
+// content or dependency-wide request tracing) are enabled in the sidecar.
+#[cfg(feature = "rtc")]
+struct LegacyDecoderLogger;
+#[cfg(feature = "rtc")]
+impl log::Log for LegacyDecoderLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.target() == "matrix_rtc_core::compat::room_state"
+            && metadata.level() <= log::Level::Debug
+    }
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            eprintln!("RTC legacy membership: {}", record.args());
+        }
+    }
+    fn flush(&self) {}
+}
+#[cfg(feature = "rtc")]
+static LEGACY_DECODER_LOGGER: LegacyDecoderLogger = LegacyDecoderLogger;
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    #[cfg(feature = "rtc")]
+    {
+        init_tls_provider()?;
+        if log::set_logger(&LEGACY_DECODER_LOGGER).is_ok() {
+            log::set_max_level(log::LevelFilter::Debug);
+        }
+        if std::env::args().nth(1).as_deref() != Some("healthcheck") {
+            verify_tls_client()?;
+        }
+        if std::env::args().nth(1).as_deref() == Some("tls-self-test") {
+            eprintln!("MatrixRTC TLS client construction: PASS");
+            return Ok(());
+        }
+    }
     let state_dir = PathBuf::from(std::env::var("RTC_WORKER_STATE_DIR").map_err(|_| {
         io::Error::new(io::ErrorKind::InvalidInput, "RTC_WORKER_STATE_DIR is required")
     })?);
@@ -338,5 +393,14 @@ mod writer_tests {
         let mut bytes = Vec::new();
         peer.read_to_end(&mut bytes).await.unwrap();
         assert!(!bytes.is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "rtc"))]
+mod tls_provider_tests {
+    #[tokio::test]
+    async fn combined_rtc_features_can_build_a_tls_client() {
+        super::init_tls_provider().unwrap();
+        super::verify_tls_client().unwrap();
     }
 }

@@ -136,7 +136,7 @@ async fn pre_sticky_state_membership_is_funnelled() {
     for event_type in [STATE_MEMBER_EVENT_TYPE, "m.call.member"] {
         let harness = Harness::attach(MembershipFormat::RoomState).await;
         let sink = harness.sink();
-        sink.on_encryption(false);
+        sink.on_encryption(true);
         sink.on_joined_members(vec![ME.to_owned(), BOB.to_owned()]);
         let now = crate::compat::room_state::now_ms();
         sink.on_state_events(
@@ -149,10 +149,9 @@ async fn pre_sticky_state_membership_is_funnelled() {
                 origin_server_ts: now,
                 content: json!({
                     "application": "m.call",
-                    "call_id": "",
+                    "call_id": "ROOM",
                     "scope": "m.room",
                     "device_id": "BOBDEVICE",
-                    "membershipID": format!("{BOB}:BOBDEVICE"),
                     "expires": 3_600_000,
                     "created_ts": now,
                     "focus_active": { "type": "livekit", "focus_selection": "multi_sfu" },
@@ -165,8 +164,14 @@ async fn pre_sticky_state_membership_is_funnelled() {
                 encryption: EventEncryption::Cleartext,
             }],
         );
-        harness.attachment.seeded().await;
+        tokio::time::timeout(Duration::from_secs(2), harness.attachment.seeded())
+            .await.expect("encrypted legacy membership must seed");
         assert_eq!(harness.member_count().await, Some(1));
+        let members = harness.manager.lock().await.subscribe_membership_snapshots(SLOT)
+            .expect("a room-wide legacy call").borrow().clone();
+        assert_eq!(members[0].member_id, format!("{BOB}:BOBDEVICE"));
+        assert_eq!(members[0].membership_event_id.as_deref(), Some("$legacy"));
+        assert_eq!(members[0].origin.sender_device_id(), Some("BOBDEVICE"));
     }
 }
 

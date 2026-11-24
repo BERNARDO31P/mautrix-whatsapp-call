@@ -44,7 +44,7 @@ use tokio::sync::{broadcast, watch};
 
 use crate::{CallEngine, CallEvent, MediaAttachment, Participant, StabilityConfig};
 use matrix_rtc_call::{
-    CallJoinOptions, CallKind, CallStatus, JoinOptions, JoinTransport, RaisedHand, ReactionError,
+    CallIntent, CallJoinOptions, CallKind, CallStatus, JoinOptions, JoinTransport, RaisedHand, ReactionError,
     ReactionsConfig, RtcCall, RtcClient, RtcError, RtcRoom,
 };
 use matrix_rtc_core::RoomOptions;
@@ -173,6 +173,8 @@ pub struct LiveKitCallOptions {
     /// A group call, with or without a notification, or a DM call, with or
     /// without a ring. The default is a quiet group join.
     pub kind: CallKind,
+    /// Explicit voice/video intent; None follows existing call consensus.
+    pub intent: Option<CallIntent>,
     /// How this call handles Element Call reactions and the raised hand.
     ///
     /// `None` — the default — is [`ReactionsConfig::default`]: enabled, with
@@ -207,6 +209,7 @@ impl Default for LiveKitCallOptions {
             auto_subscribe: true,
             format: MembershipFormat::default(),
             kind: CallKind::default(),
+            intent: None,
             reactions: None,
             stability: StabilityConfig::default(),
             sfu_fallback: false,
@@ -322,9 +325,7 @@ impl LiveKitCall {
                 join,
                 kind: options.kind.clone(),
                 reactions: options.reactions.clone(),
-                // Follows the call's voice or video intent; video when it
-                // starts one.
-                intent: None,
+                intent: options.intent,
             })).await;
         let call=match joined {
             Ok(Ok(call))=>Arc::new(call),

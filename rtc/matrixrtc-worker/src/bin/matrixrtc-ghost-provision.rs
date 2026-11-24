@@ -105,6 +105,9 @@ async fn wait_for_cross_signed_device(client: &Client) -> io::Result<()> {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    // Release builds enable rtc for both binaries, unifying rustls features.
+    #[cfg(feature = "rtc")]
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let homeserver = required("MATRIX_HOMESERVER")?;
     if !(homeserver.starts_with("https://") || (homeserver.starts_with("http://") && env::var("RTC_ALLOW_INSECURE_HOMESERVER").as_deref() == Ok("1"))) {
         return Err(error("MATRIX_HOMESERVER must use HTTPS"));

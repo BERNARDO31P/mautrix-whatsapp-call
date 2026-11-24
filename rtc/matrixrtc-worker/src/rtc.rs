@@ -2,13 +2,13 @@
 //! are created during a call; provisioning is an explicit offline step.
 use crate::{audio, protocol::{self, Message}, send, video, Writer};
 use futures_util::StreamExt;
-use matrix_rtc_call::{CallKind, CallStatus, GroupNotify, RingConfig, notification::Mentions};
+use matrix_rtc_call::{CallIntent, CallKind, CallStatus, GroupNotify, RingConfig, notification::Mentions};
 use matrix_rtc_call_sdk::{CallEvent, LiveKitCall, LiveKitCallOptions, Participant, SdkMatrixBackend};
 use matrix_rtc_call::{RtcClient, RtcRoom};
-use matrix_rtc_core::{RoomOptions, SlotState, RawSlotEventContent, JoinedMembership};
+use matrix_rtc_core::{RoomOptions, SlotState, RawSlotEventContent, JoinedMembership, IdentitySubject, RtcTransport};
 use matrix_sdk::ruma::{EventId, api::client::state::get_state_events};
 use matrix_rtc_core::{SlotEncryption, compat::MembershipFormat, wire_event_type};
-use matrix_rtc_transport::{AudioFrame, MediaStreamKind, PublishOptions, VideoSourceConfig, livekit::identity::{msc4195_identity, legacy_identity}};
+use matrix_rtc_transport::{AudioFrame, MediaStreamKind, PublishOptions, VideoSourceConfig, livekit::identity_for};
 use matrix_sdk::{Client, encryption::EncryptionSettings, authentication::matrix::MatrixSession, ruma::{RoomId, UserId}, RoomMemberships};
 use serde_json::json;
 use matrix_sdk_ui::sync_service::SyncService;
@@ -243,6 +243,8 @@ impl Accounts {
 
 pub async fn handle(incoming: Message, reader: ReadHalf<UnixStream>, writer: Writer, accounts: Arc<Accounts>, replay: Arc<crate::ReplayGuard>) -> io::Result<()> {
     let mut reader = protocol::FrameReader::new(reader);
+    eprintln!("RTC call start: direction={} format={} slot={} member_event={}",
+        incoming.kind, incoming.membership_format, incoming.slot_id, incoming.member_event);
     let result = async {
     let _reservation=accounts.reserve(&incoming.room_id,&incoming.slot_id)?;
     match incoming.kind.as_str() {
@@ -439,9 +441,7 @@ async fn create_slot(room:&matrix_sdk::Room,req:&Message,path:&Path)->io::Result
 }
 
 async fn run_incoming(incoming: &Message, reader: &mut protocol::FrameReader<ReadHalf<UnixStream>>, writer: &Writer, accounts: &Accounts, replay: &crate::ReplayGuard) -> io::Result<()> {
-    if membership_format(incoming)? != MembershipFormat::Msc {
-        return Err(error("incoming WhatsApp calls require current MSC MatrixRTC signalling"));
-    }
+    let format = membership_format(incoming)?;
     if incoming.video {
         video::verify_ffmpeg().await?;
     }
@@ -454,7 +454,10 @@ async fn run_incoming(incoming: &Message, reader: &mut protocol::FrameReader<Rea
     }
     let admission=Admission::inspect(&room,incoming).await?;
     if !admission.primary.members.borrow().is_empty() || !admission.alternate.members.borrow().is_empty() {return Err(error("incoming RTC slot already occupied"))}
-    let owned=!admission.open(incoming).await;
+    // MSC owns an explicit encrypted slot. Legacy Element Call has no slot
+    // state at all; creating an MSC slot for it would use a different SFU room
+    // and publish events its client cannot interpret.
+    let owned = format == MembershipFormat::Msc && !admission.open(incoming).await;
     if owned && matches!(admission.primary.room.slot_state(&incoming.slot_id).await,Some(SlotState::Open(_))) {return Err(error("existing RTC slot has an incompatible application or encryption mechanism"));}
     if replay.contains(&incoming.login_id, &incoming.call_id)? {
         return Err(error("duplicate or replayed call"));
@@ -469,6 +472,7 @@ async fn run_incoming(incoming: &Message, reader: &mut protocol::FrameReader<Rea
     let mut call = LiveKitCall::join_until(&room, LiveKitCallOptions {
         slot_id: incoming.slot_id.clone(),
         format: membership_format(incoming)?,
+        intent: Some(if incoming.video { CallIntent::Video } else { CallIntent::Audio }),
         kind: if incoming.group {
             CallKind::Group { notify: Some(GroupNotify {
                 intent: Some(if incoming.video { "video" } else { "audio" }.to_owned()),
@@ -499,9 +503,25 @@ async fn run_outgoing(incoming: &Message, reader: &mut protocol::FrameReader<Rea
     let (_ghost, room) = synced_room(incoming, accounts).await?;
     let mut admission=Admission::inspect(&room,incoming).await?;
     if admission.primary.members.borrow().is_empty(){
-        tokio::time::timeout(Duration::from_secs(6),admission.primary.members.wait_for(|m|!m.is_empty())).await.map_err(|_|error("calling membership absent"))?.map_err(io::Error::other)?;
+        // Drop the watch Ref before awaiting either diagnostic snapshot.
+        let ready = tokio::time::timeout(Duration::from_secs(6), admission.primary.members.wait_for(|m| !m.is_empty()))
+            .await.map(|result| result.map(|_| ()));
+        match ready {
+            Ok(result) => { result.map_err(io::Error::other)?; }
+            Err(_) => {
+                // Do not bypass the authenticated membership check. Capture
+                // both readers' candidate/slot state (no key material) so an
+                // absent, expired, or wrong-dialect member is distinguishable.
+                eprintln!("RTC admission timeout: format={} member_event={} primary={} alternate={}",
+                    incoming.membership_format, incoming.member_event,
+                    admission.primary.room.debug_snapshot().await,
+                    admission.alternate.room.debug_snapshot().await);
+                return Err(error("calling membership absent"));
+            }
+        }
     }
     let pin=admission.caller(incoming,&room,true).await?;
+    eprintln!("RTC outgoing: authenticated caller admitted; requesting WhatsApp dial");
     let mut wa_audio=None;
     let mut wa_video=None;
     if !replay.register(&incoming.login_id,&incoming.call_id)? {return Err(error("duplicate or replayed call"));}
@@ -543,7 +563,10 @@ async fn run_outgoing(incoming: &Message, reader: &mut protocol::FrameReader<Rea
             return Err(error("call ID mismatch"));
         }
         match accepted.kind.as_str() {
-            "whatsapp_answered" => break,
+            "whatsapp_answered" => {
+                eprintln!("RTC outgoing: WhatsApp peer accepted; joining MatrixRTC media");
+                break;
+            },
             "whatsapp_video_keyframe" => continue,
             "whatsapp_audio_mute" | "whatsapp_audio_unmute" => {wa_audio=Some(accepted.kind=="whatsapp_audio_mute");continue},
             "whatsapp_video_state" => {if matches!(accepted.state,0|1|6) {wa_video=Some(accepted.state);} continue},
@@ -562,6 +585,7 @@ async fn run_outgoing(incoming: &Message, reader: &mut protocol::FrameReader<Rea
     let mut call = LiveKitCall::join_until(&room, LiveKitCallOptions {
         slot_id: incoming.slot_id.clone(),
         format: membership_format(incoming)?,
+        intent: Some(if incoming.video { CallIntent::Video } else { CallIntent::Audio }),
         kind: if incoming.group { CallKind::Group { notify: None } } else { CallKind::Direct { ring: None } },
         ..Default::default()
     },Some(tokio::time::Instant::now()+Duration::from_secs(35))).await.map_err(io::Error::other)?;
@@ -571,11 +595,10 @@ async fn run_outgoing(incoming: &Message, reader: &mut protocol::FrameReader<Rea
     result
 }
 
-/// Derive the only permitted remote membership from authenticated Matrix
-/// membership signalling. A member ID is NOT a user ID. It must be mapped
-/// through the SDK roster and the verified E2EE key for its SFU identity.
-fn authorized_peer(roster: &[Participant], own_member_id: &str, expected: &str,
-                   format: MembershipFormat) -> io::Result<Option<(String, String)>> {
+/// Select the only permitted remote member and its device from the SDK roster.
+/// Verify the result against the core membership snapshot, then derive the
+/// SFU identity from that membership's published transport.
+fn authorized_peer(roster: &[Participant], own_member_id: &str, expected: &str) -> io::Result<Option<(String, String)>> {
     if roster.len() > 2 { return Err(error("RTC slot occupied by extra membership")); }
     let mut remote = None;
     for participant in roster {
@@ -590,13 +613,21 @@ fn authorized_peer(roster: &[Participant], own_member_id: &str, expected: &str,
             return Err(error("RTC participant device identity is unavailable"));
         };
         if remote.is_some() { return Err(error("multiple RTC devices or memberships")); }
-        let identity = match format {
-            MembershipFormat::Msc => msc4195_identity(&participant.user_id, &participant.member_id),
-            MembershipFormat::RoomState => legacy_identity(&participant.user_id, device),
-        };
-        remote = Some((participant.member_id.clone(), identity));
+        remote = Some((participant.member_id.clone(), device.to_owned()));
     }
     Ok(remote)
+}
+
+// Use the exact mapper that the SDK uses for its encryption key ring and SFU
+// connections. The token flow is a property of the peer's published transport,
+// not the local call's signalling dialect.
+fn peer_media_identity(user: &str, device: &str, member: &str, transports: &[RtcTransport]) -> Option<String> {
+    identity_for(&IdentitySubject {
+        user_id: user,
+        device_id: Some(device),
+        member_id: member,
+        transports,
+    })
 }
 
 async fn ensure_whatsapp_video_track(
@@ -631,7 +662,6 @@ async fn connected_session(incoming: &Message, reader: &mut protocol::FrameReade
     let mut roster_updates = call.subscribe_participants();
     let mut memberships=call.subscribe_memberships().await;
     let own_member_id = call.membership_id().to_owned();
-    let format = membership_format(incoming)?;
     let mut peer;
     let mut pinned = None;
     let mut topology=tokio::time::interval(Duration::from_secs(1));
@@ -660,21 +690,34 @@ async fn connected_session(incoming: &Message, reader: &mut protocol::FrameReade
         if let Some(decoder) = video_decoder.as_mut() {
             decoder.ensure_running()?;
         }
-        peer = authorized_peer(&call.participants(), &own_member_id, &incoming.expected_user_mxid, format)?;
-        if let Some((id,identity))=&peer {
-            let row=call.participants().into_iter().find(|p| &p.member_id==id).ok_or_else(||error("RTC membership changed"))?;
-            let device=row.device_id.as_deref().ok_or_else(||error("missing RTC device"))?;
-            let members=memberships.borrow().clone();
-            let membership=members.iter().find(|m|&m.member_id==id && m.sender==row.user_id && m.origin.sender_device_id()==Some(device))
-                .ok_or_else(||error("RTC device disappeared from the current membership"))?;
-            let generation=membership.membership_ts;
-            let current=(id.clone(),device.to_owned(),generation);
-            if (!incoming.expected_device.is_empty() && incoming.expected_device!=device) || expected_join.as_ref().is_some_and(|(wanted,ts)| wanted!=id || *ts!=generation)
-                || pinned.as_ref().is_some_and(|value| value!=&current) {return Err(error("RTC device or membership replaced"))}
-            if pinned.is_none() {trusted_device(room,&row.user_id,device).await?;pinned=Some(current);}
-            if answered && !call.imported_key_for(identity) {return Err(error("RTC peer media key no longer available"))}
+        // The roster is derived asynchronously from the core membership watch.
+        // Read each once: a join may reach one before the other. Do not enable
+        // media until both agree, and fail closed if an admitted peer leaves.
+        let roster = call.participants();
+        let members = memberships.borrow().clone();
+        if members.len() > 2 { return Err(error("RTC slot contains extra memberships")); }
+        peer = None;
+        if let Some((id, device)) = authorized_peer(&roster, &own_member_id, &incoming.expected_user_mxid)? {
+            if let Some(membership) = members.iter().find(|m| m.member_id == id
+                && m.sender == incoming.expected_user_mxid && m.origin.sender_device_id() == Some(device.as_str())) {
+                let generation = membership.membership_ts;
+                let current = (id.clone(), device.clone(), generation);
+                if (!incoming.expected_device.is_empty() && incoming.expected_device != device)
+                    || expected_join.as_ref().is_some_and(|(wanted, ts)| wanted != &id || *ts != generation)
+                    || pinned.as_ref().is_some_and(|value| value != &current) {
+                    return Err(error("RTC device or membership replaced"));
+                }
+                if pinned.is_none() {
+                    trusted_device(room, &membership.sender, &device).await?;
+                    pinned = Some(current);
+                }
+                if let Some(identity) = peer_media_identity(&membership.sender, &device, &id, &membership.transports) {
+                    if answered && !call.imported_key_for(&identity) { return Err(error("RTC peer media key no longer available")); }
+                    peer = Some((id, identity));
+                }
+            }
         }
-        if answered && peer.is_none() { return Err(error("authorized Matrix participant left the RTC slot")); }
+        if answered && peer.is_none() { return Err(error("authorized Matrix participant left the RTC slot or no longer has an eligible transport")); }
         if call.member_count().await > 2 { return Err(error("RTC slot contains extra memberships")); }
         // An already imported and verified key is queried as state, not only
         // through a transient broadcast which may predate subscription.
@@ -686,6 +729,7 @@ async fn connected_session(incoming: &Message, reader: &mut protocol::FrameReade
                 pinned.as_ref().map(|(id, device, _)| (id.as_str(), device.as_str())))?;
             send(writer, &Message::new("answer", &incoming.call_id)).await?;
             answered = true;
+            eprintln!("RTC answer gate: authenticated membership and peer media key present; local transport connected");
             // The local socket write above is serialized and completes before
             // media is enabled, so Go can never observe media before answer.
             media_active.store(true, Ordering::Release);
@@ -694,8 +738,7 @@ async fn connected_session(incoming: &Message, reader: &mut protocol::FrameReade
         if answered {
             if let Some((id,identity))=&peer {
                 if !call.imported_key_for(identity) {return Err(error("RTC peer key unavailable"))}
-                let parts=call.participants();
-                let participant=parts.iter().find(|p| &p.member_id==id).ok_or_else(||error("RTC peer left"))?;
+                let participant=roster.iter().find(|p| &p.member_id==id).ok_or_else(||error("RTC peer left"))?;
                 for (key,kind) in [("audio",MediaStreamKind::Microphone),("video",MediaStreamKind::Camera)] {
                     let state=participant.streams.iter().find(|s|s.kind==kind).map(|s|s.muted);
                     if state != Some(false) {
@@ -897,6 +940,8 @@ async fn connected_session(incoming: &Message, reader: &mut protocol::FrameReade
                 }
             }
             _ = &mut expiry, if !answered => {
+                eprintln!("RTC answer gate timeout: connected={connected} membership_count={} roster_count={} pinned={} identity_resolved={} peer_key_imported={encrypted_peer}",
+                    members.len(), roster.len(), pinned.is_some(), peer.is_some());
                 send(writer, &Message::new("reject", &incoming.call_id)).await?;
                 break;
             }
@@ -964,7 +1009,6 @@ mod authorization_tests {
             &[own.clone(), expected],
             "ghost-member",
             "@alice:example.org",
-            MembershipFormat::Msc,
         )
         .unwrap()
         .expect("expected participant must be authorized");
@@ -976,7 +1020,6 @@ mod authorization_tests {
             &[own, wrong],
             "ghost-member",
             "@alice:example.org",
-            MembershipFormat::Msc,
         )
         .unwrap_err();
 
@@ -995,7 +1038,6 @@ mod authorization_tests {
             &[own.clone(), no_device],
             "ghost-member",
             "@alice:example.org",
-            MembershipFormat::Msc,
         )
         .unwrap_err();
 
@@ -1011,7 +1053,6 @@ mod authorization_tests {
             &[own, alice_a, alice_b],
             "ghost-member",
             "@alice:example.org",
-            MembershipFormat::Msc,
         )
         .unwrap_err();
 
@@ -1022,7 +1063,7 @@ mod authorization_tests {
     }
 
     #[test]
-    fn legacy_identity_is_bound_to_the_authenticated_device() {
+    fn roster_identity_is_bound_to_the_authenticated_device() {
         let own = participant("ghost-member", "@ghost:example.org", Some("GHOSTDEV"), true);
         let expected = participant("alice-member", "@alice:example.org", Some("ALICEDEV"), false);
 
@@ -1030,14 +1071,29 @@ mod authorization_tests {
             &[own, expected],
             "ghost-member",
             "@alice:example.org",
-            MembershipFormat::RoomState,
         )
         .unwrap()
         .expect("expected legacy participant must be authorized");
 
-        assert_eq!(
-            authorized.1,
-            legacy_identity("@alice:example.org", "ALICEDEV")
-        );
+        assert_eq!(authorized.1, "ALICEDEV");
+    }
+
+    #[test]
+    fn peer_media_identity_follows_token_flow_not_membership_format() {
+        use matrix_rtc_core::LiveKitTransport;
+        use matrix_rtc_transport::livekit::identity::{legacy_identity, msc4195_identity};
+        let user = "@alice:example.org";
+        let device = "ALICEDEV";
+        let member = "custom-membership-id";
+        let legacy = RtcTransport::LiveKit(LiveKitTransport::service("https://example.org/jwt"));
+        let modern = RtcTransport::LiveKit(LiveKitTransport::sfu("wss://example.org/sfu"));
+        let both = RtcTransport::LiveKit(LiveKitTransport::new(
+            Some("wss://example.org/sfu".into()), Some("https://example.org/jwt".into()), None,
+        ).unwrap());
+        assert_eq!(peer_media_identity(user, device, member, &[legacy.clone()]), Some(legacy_identity(user, device)));
+        assert_eq!(peer_media_identity(user, device, member, &[modern.clone()]), Some(msc4195_identity(user, member)));
+        assert_eq!(peer_media_identity(user, device, member, &[both]), Some(legacy_identity(user, device)));
+        assert_eq!(peer_media_identity(user, device, member, &[modern, legacy]), Some(msc4195_identity(user, member)));
+        assert_eq!(peer_media_identity(user, device, member, &[]), None);
     }
 }

@@ -10,6 +10,7 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 	"net"
+	"os"
 	"strings"
 	"time"
 
@@ -194,6 +195,20 @@ func applyMatrixRTCMediaControl(call *meowcaller.Call, bus *voipbridge.MediaBus,
 	}
 }
 
+// Element X currently uses MSC3401 room-state membership and legacy SFU
+// authorization. A server supporting newer MSCs does not imply that the
+// receiving client uses them. Explicitly opt into MSC for newer clients.
+func incomingRTCMembershipFormat(value string) (string, error) {
+	switch value {
+	case "", "room_state":
+		return "room_state", nil
+	case "msc":
+		return "msc", nil
+	default:
+		return "", errors.New("invalid MATRIXRTC_INCOMING_MEMBERSHIP_FORMAT (expected room_state or msc)")
+	}
+}
+
 func (wa *WhatsAppClient) runIncomingRTCGateway(ctx context.Context, call *meowcaller.Call) error {
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
@@ -208,6 +223,10 @@ func (wa *WhatsAppClient) runIncomingRTCGateway(ctx context.Context, call *meowc
 			_ = call.Reject()
 		}
 	}()
+	format, err := incomingRTCMembershipFormat(os.Getenv("MATRIXRTC_INCOMING_MEMBERSHIP_FORMAT"))
+	if err != nil {
+		return err
+	}
 	roomID, ghostMXID, expectedMXID, peer, group, groupJID, err := wa.rtcRoomForCall(ctx, call)
 	if err != nil {
 		return err
@@ -224,7 +243,7 @@ func (wa *WhatsAppClient) runIncomingRTCGateway(ctx context.Context, call *meowc
 	wire := rtcwire.NewPeer(conn, conn)
 	err = wire.Send(rtcwire.Message{
 		Type: "incoming", LoginID: string(wa.UserLogin.ID),
-		CallID: call.ID(), RoomID: roomID, SlotID: matrixRTCSlotDefault, MembershipFormat: "msc", GhostMXID: ghostMXID, ExpectedUserMXID: expectedMXID,
+		CallID: call.ID(), RoomID: roomID, SlotID: matrixRTCSlotDefault, MembershipFormat: format, GhostMXID: ghostMXID, ExpectedUserMXID: expectedMXID,
 		Peer: peer, Group: group, GroupJID: groupJID, Video: call.IsVideo(),
 	})
 	if err != nil {

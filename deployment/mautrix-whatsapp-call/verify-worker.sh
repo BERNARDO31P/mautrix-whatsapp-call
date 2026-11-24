@@ -7,4 +7,5 @@ COMPOSE=(docker compose -f "$MATRIX_ROOT/docker-compose.yml" -f "$ROOT/compose.y
 "${COMPOSE[@]}" exec -T mautrix-whatsapp-call-worker sh -ec 'test -S /run/mautrix-whatsapp-call/worker.sock; test "$(stat -c %a /run/mautrix-whatsapp-call/worker.sock)" = 660'
 "${COMPOSE[@]}" exec -T mautrix-whatsapp sh -ec 'test -S /run/mautrix-whatsapp-call/worker.sock; test -r /run/mautrix-whatsapp-call/worker.sock; test -w /run/mautrix-whatsapp-call/worker.sock'
 "${COMPOSE[@]}" exec -T mautrix-whatsapp-call-worker mautrix-whatsapp-call-worker healthcheck
+"${COMPOSE[@]}" exec -T mautrix-whatsapp-call-worker mautrix-whatsapp-call-worker tls-self-test
 echo "mautrix-whatsapp-call worker socket is live and accessible to mautrix-whatsapp."

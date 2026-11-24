@@ -44,6 +44,7 @@ services:
       - mautrix-whatsapp-call-worker-socket:/run/mautrix-whatsapp-call
     environment:
       GID: "${MATRIXRTC_SOCKET_GID:-29319}"
+      MATRIXRTC_INCOMING_MEMBERSHIP_FORMAT: "${MATRIXRTC_INCOMING_MEMBERSHIP_FORMAT:-room_state}"
     group_add:
       - "${MATRIXRTC_SOCKET_GID:-29319}"
 

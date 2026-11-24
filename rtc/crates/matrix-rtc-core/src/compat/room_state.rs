@@ -375,7 +375,8 @@ fn parse<'a>(event: &'a StateMemberEvent, now_ms: u64) -> Option<Parsed<'a>> {
         .unwrap_or_default();
     let slot_id = format!(
         "{application_type}#{}",
-        if call_id.is_empty() {
+        if call_id.is_empty() || (application_type == "m.call" && call_id == "ROOM") {
+            // Match the Go gateway's canonical room-wide slot mapping.
             ROOM_CALL_ID
         } else {
             call_id
@@ -763,6 +764,16 @@ mod tests {
                 .unwrap(),
             "!room:example.io"
         );
+    }
+
+    #[test]
+    fn historical_uppercase_room_call_id_uses_canonical_slot() {
+        let translated = translate_values(
+            &[("a", CREATED, join_with(&[("call_id", json!("ROOM"))]))],
+            NOW,
+        );
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].content["slot_id"], "m.call#room");
     }
 
     #[test]

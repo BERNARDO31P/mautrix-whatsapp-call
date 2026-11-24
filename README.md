@@ -76,39 +76,25 @@ cd mautrix-whatsapp-call
 
 ### 2. Clean-machine bootstrap
 
-Run this when WSL2/the dedicated build environment has not been prepared yet:
+Use a supported x64 Windows 10/11 PC with virtualization enabled, Windows PowerShell 5.1 (64-bit), internet access, and sufficient free space (60 GB recommended). Open ordinary Windows PowerShell under your own account. Approve the UAC prompt if Windows system setup is needed. No separate Git installation is required if you extracted the source ZIP instead of cloning.
 
 ```powershell
-powershell.exe `
-    -NoProfile `
-    -ExecutionPolicy Bypass `
-    -File ".\Bootstrap.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Bootstrap.ps1" -BuilderRoot "$HOME\mautrix-whatsapp-call-builder" -Jobs 4
 ```
 
-The bootstrap can enable WSL2, create the default Ubuntu 22.04 build distro, install Linux build packages, and download the pinned Go/Rust/LLVM/WebRTC inputs.
+The bootstrap displays progress in the current console, enables WSL2, installs the runtime when necessary, imports a checksum-verified Ubuntu 22.04 AMD64 root filesystem, and calls the full build. Only WSL system setup requests elevation automatically, in a visible setup window. The original console waits for its exit code, then imports Ubuntu and builds under the original Windows user. An already working build distribution needs no elevation. No distribution is unregistered. Exit code `3010` means Windows requires a restart: restart and rerun the identical command. Exit code `1` indicates failure; read the error above it. `-PrepareOnly` downloads and prepares build inputs without compiling.
 
-A reboot may be required the first time Windows enables WSL2.
+The bootstrap places runtime ZIPs and checksums in `$HOME\mautrix-whatsapp-call-builder\dist`. Rerunning it reuses the dedicated distro and Linux dependency cache.
 
-### 3. Build
-
-If you already have a WSL distribution you want to use:
+### 3. Build on an existing WSL2 distribution
 
 ```powershell
-powershell.exe `
-    -NoProfile `
-    -ExecutionPolicy Bypass `
-    -File ".\Build.ps1" `
-    -DistroName "Ubuntu-22.04"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Build.ps1" -DistroName "Ubuntu-22.04" -OutputRoot "$HOME\mautrix-whatsapp-call-builder\dist" -Jobs 4
 ```
 
-Otherwise the distro created by `Bootstrap.ps1` can be used by running `Bootstrap.ps1` again without `-PrepareOnly`.
+Use `-DistroName "mautrix-whatsapp-call-Ubuntu-22.04"` for the dedicated bootstrap distro. `Build.ps1` does not require Windows elevation once WSL2 is operational. If no distro is specified, it prefers the dedicated distro, then Ubuntu-22.04; it never silently chooses Docker Desktop. Its default output is the repository `dist/` directory unless `-OutputRoot` is provided. Reduce `-Jobs` to 2 or 1 on memory-limited PCs.
 
-The build performs source verification and regression tests before producing:
-
-```text
-dist/mautrix-whatsapp-call-<timestamp>.zip
-dist/mautrix-whatsapp-call-<timestamp>.zip.sha256
-```
+Successful builds run source verification, tests and release-binary TLS verification, then produce the verified Linux AMD64 runtime ZIP and its SHA-256 sidecar. See [build documentation](docs/BUILD.md) for troubleshooting.
 
 ## Quick start: native Linux build
 

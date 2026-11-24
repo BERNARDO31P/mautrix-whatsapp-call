@@ -102,3 +102,17 @@ func TestInlineRTCFormatUsesAuthenticatedStickyMembership(t *testing.T) {
 		t.Fatal("older generation selected")
 	}
 }
+
+func TestIncomingRTCMembershipFormat(t *testing.T) {
+	for _, tc := range []struct{ value, want string }{
+		{"", "room_state"}, {"room_state", "room_state"}, {"msc", "msc"},
+	} {
+		got, err := incomingRTCMembershipFormat(tc.value)
+		if err != nil || got != tc.want {
+			t.Fatalf("format %q: got %q, %v", tc.value, got, err)
+		}
+	}
+	if _, err := incomingRTCMembershipFormat("unsupported"); err == nil {
+		t.Fatal("unsupported incoming format accepted")
+	}
+}

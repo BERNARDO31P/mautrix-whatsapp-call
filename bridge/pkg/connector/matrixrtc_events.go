@@ -1010,6 +1010,9 @@ func (wa *WhatsAppConnector) handleMatrixRTCLegacyMember(ctx context.Context, ev
 	// prompt cancellation path too.
 	if content.Application == "" && evt.Unsigned.PrevContent != nil {
 		_ = json.Unmarshal(evt.Unsigned.PrevContent.VeryRaw, &content)
+		if content.MembershipID == "" && content.DeviceID != "" {
+			content.MembershipID = evt.Sender.String() + ":" + content.DeviceID
+		}
 		wa.rtcMu.Lock()
 		key := rtcIntentKey(evt.RoomID.String(), legacyMatrixRTCSlot(content.Application, content.CallID), evt.Sender.String())
 		delete(wa.rtcIntents, key)
@@ -1021,8 +1024,13 @@ func (wa *WhatsAppConnector) handleMatrixRTCLegacyMember(ctx context.Context, ev
 		wa.rtcMu.Unlock()
 		return
 	}
-	if content.Application != "m.call" || content.MembershipID == "" {
+	if content.Application != "m.call" || content.DeviceID == "" {
 		return
+	}
+	if content.MembershipID == "" {
+		// The legacy SFU identity is user:device. Still require an encrypted
+		// matching notification and the worker's independent roster check.
+		content.MembershipID = evt.Sender.String() + ":" + content.DeviceID
 	}
 	slotID := legacyMatrixRTCSlot(content.Application, content.CallID)
 	if slotID == "" {
@@ -1291,7 +1299,9 @@ func (wa *WhatsAppConnector) handleMatrixRTCInvite(ctx context.Context, evt *eve
 	}
 	membershipFormat := "msc"
 	memberEvent := ""
-	if content.SlotID == "" {
+	// MSC4075 relates the ring to its membership event. Some versions also
+	// include a slot_id: that does not make the ring a new MSC4143 invite.
+	if content.SlotID == "" || ((evt.Type.Type == rtcInviteWire || evt.Type.Type == rtcNotificationStable) && content.RelatesTo.RelType == "m.reference" && content.RelatesTo.EventID != "") {
 		if content.RelatesTo.RelType != "m.reference" {
 			return
 		}
@@ -1304,7 +1314,11 @@ func (wa *WhatsAppConnector) handleMatrixRTCInvite(ctx context.Context, evt *eve
 		if membershipFormat == "" {
 			membershipFormat = "room_state"
 		}
-		content.SlotID = canonicalMatrixRTCSlotID(record.slotID)
+		relatedSlot := canonicalMatrixRTCSlotID(record.slotID)
+		if content.SlotID != "" && content.SlotID != relatedSlot {
+			return
+		}
+		content.SlotID = relatedSlot
 		if content.Intent == "" && content.Application.Intent == "" {
 			content.Intent = record.intent
 		}
@@ -1406,7 +1420,7 @@ func (wa *WhatsAppConnector) handleMatrixRTCInvite(ctx context.Context, evt *eve
 		}
 		callID := evt.ID.String()
 		roomID := evt.RoomID.String()
-		if originalSlot != "" {
+		if originalSlot != "" && memberEvent == "" {
 			// Matrix can deliver the invitation ahead of the membership. A
 			// slot spelling alone never downgrades the admission rules.
 			wait, stop := context.WithTimeout(callCtx, 1500*time.Millisecond)

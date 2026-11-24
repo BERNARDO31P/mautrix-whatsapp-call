@@ -281,6 +281,18 @@ pub struct RoomSubjects {
 pub trait RoomSink: MaybeSend {
     fn on_sticky_events(&self, events: Vec<EventIn>);
     fn on_state_events(&self, event_type: String, events: Vec<EventIn>);
+    /// A host that reads all room subjects together can deliver them as one
+    /// snapshot. The native feeder applies membership only after all subjects
+    /// arrive, rather than briefly interpreting a missing alias as a leave.
+    fn on_room_snapshot(&self, encrypted: bool, state: Vec<(String, Vec<EventIn>)>,
+                        members: Vec<String>, sticky: Vec<EventIn>) {
+        self.on_encryption(encrypted);
+        for (event_type, events) in state {
+            self.on_state_events(event_type, events);
+        }
+        self.on_joined_members(members);
+        self.on_sticky_events(sticky);
+    }
     fn on_joined_members(&self, user_ids: Vec<String>);
     fn on_encryption(&self, encrypted: bool);
     fn on_timeline_events(&self, events: Vec<EventIn>);
