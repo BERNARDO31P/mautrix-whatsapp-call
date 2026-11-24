@@ -45,23 +45,6 @@ func matrixRTCDMPowerLevels(events map[event.Type]int) map[event.Type]int {
 	return matrixRTCDMPowerLevelsForPeer(false, events)
 }
 
-type matrixRTCCallAvailability uint8
-
-const (
-	matrixRTCCallAvailabilityUnknown matrixRTCCallAvailability = iota
-	matrixRTCCallAvailabilityEnabled
-	matrixRTCCallAvailabilityHidden
-	matrixRTCCallAvailabilityDisabled
-)
-
-type matrixRTCCallAvailabilityCacheEntry struct {
-	availability matrixRTCCallAvailability
-	source       string
-	expires      time.Time
-}
-
-var matrixRTCCallAvailabilityCache sync.Map
-
 type matrixRTCCallDeviceClass uint8
 
 const (
@@ -258,21 +241,22 @@ func matrixRTCCallAvailabilityCacheKey(loginID string, jid types.JID) string {
 	return loginID + "\x00" + jid.ToNonAD().String()
 }
 
-func rememberMatrixRTCCallAvailability(loginID string, jid types.JID, availability matrixRTCCallAvailability, source string, ttl time.Duration) {
-	if loginID == "" || jid.IsEmpty() || ttl <= 0 {
-		return
+func (wa *WhatsAppClient) matrixRTCCallAvailabilityKeys(ctx context.Context, jid types.JID) []string {
+	loginID := string(wa.UserLogin.ID)
+	if loginID == "" {
+		return nil
 	}
-	matrixRTCCallAvailabilityCache.Store(matrixRTCCallAvailabilityCacheKey(loginID, jid), matrixRTCCallAvailabilityCacheEntry{
-		availability: availability,
-		source:       source,
-		expires:      time.Now().Add(ttl),
-	})
+	candidates := wa.matrixRTCCallCandidateJIDs(ctx, jid)
+	keys := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		keys = append(keys, matrixRTCCallAvailabilityCacheKey(loginID, candidate))
+	}
+	return keys
 }
 
-func (wa *WhatsAppClient) rememberMatrixRTCCallAvailabilityForPeer(ctx context.Context, jid types.JID, availability matrixRTCCallAvailability, source string, ttl time.Duration) {
-	for _, candidate := range wa.matrixRTCCallCandidateJIDs(ctx, jid) {
-		rememberMatrixRTCCallAvailability(string(wa.UserLogin.ID), candidate, availability, source, ttl)
-	}
+func (wa *WhatsAppClient) rememberMatrixRTCCallAvailabilityForPeer(ctx context.Context, jid types.JID, availability matrixRTCCallAvailability, source string, ttl time.Duration) matrixRTCCallAvailabilityCacheEntry {
+	now := time.Now()
+	return matrixRTCCallAvailabilityCache.remember(wa.matrixRTCCallAvailabilityKeys(ctx, jid), matrixRTCCallAvailabilityCacheEntry{availability: availability, source: source, expires: now.Add(ttl)}, now)
 }
 
 func matrixRTCNodeStringValue(value any) (string, bool) {
@@ -559,16 +543,8 @@ func (wa *WhatsAppClient) matrixRTCCallAvailabilityForPeer(ctx context.Context, 
 		return availability, source
 	}
 
-	loginID := string(wa.UserLogin.ID)
-	for _, candidate := range wa.matrixRTCCallCandidateJIDs(ctx, jid) {
-		cacheKey := matrixRTCCallAvailabilityCacheKey(loginID, candidate)
-		if cachedRaw, ok := matrixRTCCallAvailabilityCache.Load(cacheKey); ok {
-			cached := cachedRaw.(matrixRTCCallAvailabilityCacheEntry)
-			if time.Now().Before(cached.expires) {
-				return cached.availability, cached.source
-			}
-			matrixRTCCallAvailabilityCache.Delete(cacheKey)
-		}
+	if cached, ok := matrixRTCCallAvailabilityCache.get(wa.matrixRTCCallAvailabilityKeys(ctx, jid), time.Now()); ok {
+		return cached.availability, cached.source
 	}
 	if wa.Client == nil || !wa.Client.IsConnected() {
 		return matrixRTCCallAvailabilityUnknown, ""
@@ -583,8 +559,8 @@ func (wa *WhatsAppClient) matrixRTCCallAvailabilityForPeer(ctx context.Context, 
 		deviceClass, deviceSource = matrixRTCCallDeviceClassHosted, "jid:hosted"
 	}
 	if deviceClass == matrixRTCCallDeviceClassUnavailable {
-		wa.rememberMatrixRTCCallAvailabilityForPeer(ctx, jid, matrixRTCCallAvailabilityDisabled, deviceSource, 30*time.Minute)
-		return matrixRTCCallAvailabilityDisabled, deviceSource
+		cached := wa.rememberMatrixRTCCallAvailabilityForPeer(ctx, jid, matrixRTCCallAvailabilityDisabled, deviceSource, 30*time.Minute)
+		return cached.availability, cached.source
 	}
 
 	featureAvailability, featureSource := wa.queryWhatsAppVoIPFeature(ctx, jid)
@@ -604,7 +580,8 @@ func (wa *WhatsAppClient) matrixRTCCallAvailabilityForPeer(ctx context.Context, 
 	if availability == matrixRTCCallAvailabilityUnknown {
 		ttl = time.Hour
 	}
-	wa.rememberMatrixRTCCallAvailabilityForPeer(ctx, jid, availability, source, ttl)
+	cached := wa.rememberMatrixRTCCallAvailabilityForPeer(ctx, jid, availability, source, ttl)
+	availability, source = cached.availability, cached.source
 	if availability != matrixRTCCallAvailabilityUnknown {
 		wa.UserLogin.Log.Debug().Stringer("peer", jid).Str("source", source).
 			Msg("WhatsApp MatrixRTC call availability refreshed")
@@ -624,11 +601,8 @@ func (wa *WhatsAppClient) rtcCachedRestriction(jid types.JID) bool {
 		return true
 	}
 	key := matrixRTCCallAvailabilityCacheKey(string(wa.UserLogin.ID), jid.ToNonAD())
-	if value, ok := matrixRTCCallAvailabilityCache.Load(key); ok {
-		entry := value.(matrixRTCCallAvailabilityCacheEntry)
-		if time.Now().Before(entry.expires) {
-			return entry.availability == matrixRTCCallAvailabilityDisabled || entry.availability == matrixRTCCallAvailabilityHidden
-		}
+	if entry, ok := matrixRTCCallAvailabilityCache.get([]string{key}, time.Now()); ok {
+		return entry.availability == matrixRTCCallAvailabilityDisabled || entry.availability == matrixRTCCallAvailabilityHidden
 	}
 	if wa.Client != nil && wa.Client.IsConnected() {
 		if _, loaded := rtcProbes.LoadOrStore(key, true); !loaded {

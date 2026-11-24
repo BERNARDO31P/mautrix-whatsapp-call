@@ -291,15 +291,14 @@ impl LiveKitCall {
         // what the mode needs and seeds room state before membership) and the
         // to-device key subscription; the library runs both feeds.
         let client = RtcClient::new(Arc::new(SdkMatrixBackend::new(client.clone())));
-        let room = client
-            .room(
-                room_id.clone(),
-                RoomOptions {
-                    format: options.format,
-                },
-            )
-            .await?;
-        bounded(deadline,room.seeded()).await?;
+        let room = bounded(deadline, client.room(
+            room_id.clone(),
+            RoomOptions { format: options.format },
+        )).await??;
+        if let Err(error) = bounded(deadline, room.seeded()).await {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), room.close()).await;
+            return Err(error);
+        }
 
         // The join picks the `member.id` this mode joins with (a fresh one per
         // join, except in the pre-sticky generation; see
@@ -331,7 +330,7 @@ impl LiveKitCall {
             Ok(Ok(call))=>Arc::new(call),
             failure=>{
                 let err=match failure{Err(e)=>e,Ok(Err(e))=>e.into(),_=>unreachable!()};
-                room.close().await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), room.close()).await;
                 return Err(err);
             }
         };
@@ -357,7 +356,10 @@ impl LiveKitCall {
         )).await;
         let attached=match attached {
             Ok(result)=>result,
-            Err(timeout)=>{let _=call.leave(Default::default()).await;return Err(timeout);}
+            Err(timeout)=>{
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), room.close()).await;
+                return Err(timeout);
+            }
         };
         let attached = match attached {
             Ok(LiveKitAttachment {
@@ -385,9 +387,7 @@ impl LiveKitCall {
                 );
                 // We are signalled as joined but have no media path; leave so
                 // peers don't wait on the dead man's switch to notice.
-                if let Err(leave_error) = call.leave(Default::default()).await {
-                    log::warn!("leave after failed media attach also failed: {leave_error}");
-                }
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), room.close()).await;
                 return Err(error);
             }
         };
@@ -401,13 +401,22 @@ impl LiveKitCall {
         // focus, which the attach no longer does (034 R24); a focus given up
         // has ended the call, and its leave is already issued.
         let mut status = call.subscribe_status();
-        let session = tokio::select! {
-            session = connection.wait_connected() => session,
-            _ = status.wait_for(|status| matches!(status, CallStatus::Ended { .. })) => {
-                return Err(LiveKitCallError::Signalling(format!(
-                    "our own focus was given up: {:?}",
-                    call.status(),
-                )));
+        let connected = bounded(deadline, async {
+            tokio::select! {
+                session = connection.wait_connected() => Ok(session),
+                _ = status.wait_for(|status| matches!(status, CallStatus::Ended { .. })) => {
+                    Err(LiveKitCallError::Signalling(format!(
+                        "our own focus was given up: {:?}", call.status(),
+                    )))
+                }
+            }
+        }).await;
+        let session = match connected {
+            Ok(Ok(session)) => session,
+            failure => {
+                let error = match failure { Err(error) | Ok(Err(error)) => error, _ => unreachable!() };
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), room.close()).await;
+                return Err(error);
             }
         };
 

@@ -1,0 +1,7 @@
+**
+!Dockerfile
+!mautrix-whatsapp-call-worker
+!mautrix-whatsapp-call-provision
+!session_files.py
+!provision-ghost.py
+!auto-provision-whatsapp-ghosts.py

@@ -40,7 +40,7 @@ def main() -> None:
     parser.add_argument("--apply", action="store_true", help="backup and update the file")
     args = parser.parse_args()
 
-    if not args.config.is_file():
+    if not args.config.is_file() or args.config.is_symlink():
         raise SystemExit(f"config not found: {args.config}")
     if not args.double_puppet_secret_file.is_file():
         raise SystemExit(f"double-puppet secret file not found: {args.double_puppet_secret_file}")
@@ -64,7 +64,7 @@ def main() -> None:
         print("Dry-run only. Add --apply to create a backup and update the file.")
         return
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup = args.config.with_name(args.config.name + ".backup.matrixrtc." + stamp)
     backup_file(args.config, backup)
     atomic_write(args.config, updated.encode(), args.config.stat(), protected_mode(args.config.stat().st_mode))

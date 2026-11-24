@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -115,5 +116,49 @@ func TestGroupAndMediaStateRoundTrip(t *testing.T) {
 	}
 	if !got.Group || got.GroupJID != "123@g.us" || got.State != 11 || !got.Muted || got.Orientation != 2 {
 		t.Fatalf("roundtrip = %#v", got)
+	}
+}
+
+// Simulate a body write that failed after the length and part of the body.
+type brokenFrameWriter struct {
+	calls  int
+	closed bool
+}
+
+func (w *brokenFrameWriter) Write(p []byte) (int, error) {
+	w.calls++
+	if w.calls == 1 {
+		return len(p), nil
+	}
+	return 1, io.ErrUnexpectedEOF
+}
+func (w *brokenFrameWriter) Close() error { w.closed = true; return nil }
+func TestPartialWritePoisonsPeer(t *testing.T) {
+	w := &brokenFrameWriter{}
+	peer := NewPeer(bytes.NewReader(nil), w)
+	if err := peer.Send(Message{Type: "answer"}); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatal(err)
+	}
+	if !w.closed {
+		t.Fatal("failed stream was not closed")
+	}
+	if err := peer.Send(Message{Type: "hangup"}); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatal(err)
+	}
+	if w.calls != 2 {
+		t.Fatalf("poisoned stream reused: %d writes", w.calls)
+	}
+}
+func TestRejectRustIncompatibleIdentifiers(t *testing.T) {
+	for _, m := range []Message{
+		{Type: strings.Repeat("a", 41)},
+		{Type: "incoming", RoomID: strings.Repeat("a", 513)},
+		{Type: "incoming", SlotID: strings.Repeat("a", 257)},
+		{Type: "incoming", MembershipFormat: "unknown"},
+		{Type: "incoming", ExpectedUserMXID: strings.Repeat("a", 513)},
+	} {
+		if err := Write(io.Discard, m); err == nil {
+			t.Fatalf("accepted invalid frame: %s", m.Type)
+		}
 	}
 }

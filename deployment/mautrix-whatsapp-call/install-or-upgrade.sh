@@ -13,23 +13,82 @@ fi
 [[ -f "$MATRIX_ROOT/docker-compose.yml" ]] || { echo "Missing $MATRIX_ROOT/docker-compose.yml" >&2; exit 2; }
 [[ -f "$MATRIX_ROOT/mautrix-whatsapp/config.yaml" ]] || { echo "Missing mautrix-whatsapp config.yaml" >&2; exit 2; }
 [[ -f "$RTC_ROOT/compose.yml" ]] || { echo "Missing mautrix-whatsapp-call Compose overlay" >&2; exit 2; }
+# Prevent concurrent mutations by two installers. The lock lives outside the
+# rsync-managed deployment tree and survives atomic replacements within it.
+exec 8>"$MATRIX_ROOT/.mautrix-whatsapp-call-install.lock"
+flock -n 8 || { echo "Another call installer is running" >&2; exit 2; }
+# Confirm the identity domain before writing any registrations/configuration.
+python3 - "$MATRIX_ROOT/synapse/homeserver.yaml" "$SERVER" <<'PYDOMAIN'
+import sys,yaml
+with open(sys.argv[1]) as stream:
+    config=yaml.safe_load(stream)
+if config.get("server_name") != sys.argv[2]:
+    raise SystemExit("MATRIXRTC_SERVER_NAME must equal the existing Synapse server_name")
+PYDOMAIN
 
 normalize_deployment_permissions() {
-    # Never inherit Windows/DrvFS 0777 modes into the live Linux deployment.
-    find "$RTC_ROOT" -xdev \( -path "$RTC_ROOT/generated" -o -path "$RTC_ROOT/worker-state" \) -prune -o -type d -exec chmod 0755 {} +
-    find "$RTC_ROOT" -xdev \( -path "$RTC_ROOT/generated" -o -path "$RTC_ROOT/worker-state" \) -prune -o -type f -exec chmod 0644 {} +
-    find "$RTC_ROOT" -xdev \( -path "$RTC_ROOT/generated" -o -path "$RTC_ROOT/worker-state" \) -prune -o -type f \( -name "*.sh" -o -name "*.py" \) -exec chmod 0755 {} +
-    chmod 0755 "$RTC_ROOT/bridge/mautrix-whatsapp-call-bridge" "$RTC_ROOT/worker/mautrix-whatsapp-call-worker" "$RTC_ROOT/worker/mautrix-whatsapp-call-provision" 2>/dev/null || true
+    # Normalize only shipped public files. Unknown local files may contain
+    # credentials or private backups and must never be made world-readable.
+    local rel mode
+    [[ ! -L "$RTC_ROOT" ]] || return 1
+    for rel in bridge worker generated worker-state; do
+        if [[ -L "$RTC_ROOT/$rel" ]]; then
+            echo "Refusing symbolic link: $rel" >&2; return 1
+        fi
+    done
+    for rel in \
+        "INSTALLATION.md" \
+        "OPERATIONS.md" \
+        "README.md" \
+        "bridge/Dockerfile" \
+        "bridge/.dockerignore" \
+        "compose.yml" \
+        "config_files.py" \
+        "configure-bridge.py" \
+        "install-or-upgrade.sh" \
+        "merge-synapse.py" \
+        "migrate-rooms.sh" \
+        "nginx-443-locations.conf" \
+        "preflight.sh" \
+        "prepare.sh" \
+        "provision-ghost.sh" \
+        "reconcile-credentials.py" \
+        "render-hostname.py" \
+        "resolve-appservice.py" \
+        "server-cleanup.sh" \
+        "synapse-additions.yaml" \
+        "sync-direct-chats.sh" \
+        "verify-worker.sh" \
+        "verify.sh" \
+        "worker/Dockerfile" \
+        "worker/.dockerignore" \
+        "worker/auto-provision-whatsapp-ghosts.py" \
+        "worker/provision-ghost.py" \
+        "worker/session_files.py" \
+        "bridge/mautrix-whatsapp-call-bridge" \
+        "worker/mautrix-whatsapp-call-worker" \
+        "worker/mautrix-whatsapp-call-provision"; do
+        if [[ -L "$RTC_ROOT/$rel" ]]; then
+            echo "Refusing symbolic link: $rel" >&2; return 1
+        fi
+        [[ -f "$RTC_ROOT/$rel" ]] || continue
+        case "$rel" in
+            *.py|*.sh|*/mautrix-whatsapp-call-bridge|*/mautrix-whatsapp-call-worker|*/mautrix-whatsapp-call-provision) mode=0755 ;;
+            *) mode=0644 ;;
+        esac
+        chmod "$mode" "$RTC_ROOT/$rel"
+    done
+    chmod 0755 "$RTC_ROOT" "$RTC_ROOT/bridge" "$RTC_ROOT/worker"
 
     if [[ -d "$RTC_ROOT/generated" ]]; then
         chmod 0700 "$RTC_ROOT/generated"
-        find "$RTC_ROOT/generated" -type d -exec chmod 0700 {} +
-        find "$RTC_ROOT/generated" -type f -exec chmod 0600 {} +
+        find "$RTC_ROOT/generated" -xdev -type d -exec chmod 0700 {} +
+        find "$RTC_ROOT/generated" -xdev -type f -exec chmod 0600 {} +
     fi
     if [[ -d "$RTC_ROOT/worker-state" ]]; then
         chmod 0700 "$RTC_ROOT/worker-state"
-        find "$RTC_ROOT/worker-state" -type d -exec chmod 0700 {} +
-        find "$RTC_ROOT/worker-state" -type f -exec chmod 0600 {} +
+        find "$RTC_ROOT/worker-state" -xdev -type d -exec chmod 0700 {} +
+        find "$RTC_ROOT/worker-state" -xdev -type f -exec chmod 0600 {} +
     fi
 }
 normalize_deployment_permissions
@@ -142,14 +201,21 @@ restore_worker() {
 restore_calls_on_error() {
     local rc=$?
     if (( rc && WORKER_PAUSED && !INSTALL_COMPLETE )); then
-        if ! restore_worker; then echo "Worker restore failed after installer error" >&2; exit 1; fi
+        echo "Installation incomplete; stopping worker and provisioner. Saved .env is unchanged." >&2
+        MATRIXRTC_ENABLE_CALLS=0 compose stop mautrix-whatsapp-call-worker mautrix-whatsapp-call-provisioner || echo "CRITICAL: stop the call worker and provisioner manually" >&2
     fi
     exit "$rc"
 }
 trap restore_calls_on_error EXIT
 
+# Stop calls and the background scanner before modifying live files. A failed
+# installation must not automatically re-enable calls on a partial stack.
+# Stop (rather than create) existing containers: on a fresh install they may not exist yet.
+WORKER_PAUSED=1
+MATRIXRTC_ENABLE_CALLS=0 compose stop mautrix-whatsapp-call-worker mautrix-whatsapp-call-provisioner
+
 # Re-rendering is harmless after placeholders are already resolved.
-python3 "$RTC_ROOT/render-hostname.py" --server-name "$SERVER" --root "$RTC_ROOT" >/dev/null || true
+python3 "$RTC_ROOT/render-hostname.py" --server-name "$SERVER" --root "$RTC_ROOT" >/dev/null
 
 # Generate or preserve all secrets. Existing generated files are never rotated.
 bash "$RTC_ROOT/prepare.sh"
@@ -180,9 +246,8 @@ docker compose \
 # Keep calls fail-closed while Synapse loads the new appservice identity and
 # existing portal metadata/ghost identities are migrated. This environment
 # override does not edit .env, so the administrator's configured setting is kept.
-WORKER_PAUSED=1
 MATRIXRTC_ENABLE_CALLS=0 compose up -d --no-deps --force-recreate mautrix-whatsapp-call-worker
-MATRIXRTC_ENABLE_CALLS=0 compose up -d --no-deps livekit
+MATRIXRTC_ENABLE_CALLS=0 compose up -d --no-deps --force-recreate livekit
 
 MATRIXRTC_ENABLE_CALLS=0 docker compose \
     -f docker-compose.yml \
@@ -190,17 +255,17 @@ MATRIXRTC_ENABLE_CALLS=0 docker compose \
     up -d --no-deps --force-recreate synapse
 
 for _ in $(seq 1 60); do
-    if curl -fsS http://127.0.0.1:8008/_matrix/client/versions >/dev/null 2>&1; then
+    if curl --connect-timeout 5 --max-time 10 -fsS http://127.0.0.1:8008/_matrix/client/versions >/dev/null 2>&1; then
         break
     fi
     sleep 1
 done
-curl -fsS http://127.0.0.1:8008/_matrix/client/versions >/dev/null
+curl --connect-timeout 5 --max-time 10 -fsS http://127.0.0.1:8008/_matrix/client/versions >/dev/null
 
 MATRIXRTC_ENABLE_CALLS=0 docker compose \
     -f docker-compose.yml \
     -f mautrix-whatsapp-call/compose.yml \
-    up -d --no-deps lk-jwt-service
+    up -d --no-deps --force-recreate lk-jwt-service
 
 MATRIXRTC_ENABLE_CALLS=0 docker compose \
     -f docker-compose.yml \
@@ -238,12 +303,18 @@ docker compose \
 docker compose \
     -f docker-compose.yml \
     -f mautrix-whatsapp-call/compose.yml \
-    up -d --no-deps mautrix-whatsapp-call-provisioner
+    up -d --no-deps --force-recreate mautrix-whatsapp-call-provisioner
 
 # Restore the administrator's previous call-enable setting. If it was enabled,
 # recreate only the worker so it receives RTC_WORKER_ENABLE_CALLS=1 again.
 restore_worker
 
+for ((attempt=0; attempt<60; attempt++)); do
+    if bash "$RTC_ROOT/verify-worker.sh" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
 bash "$RTC_ROOT/verify-worker.sh"
 verify_runtime_wiring "$RESTORE_CALLS"
 

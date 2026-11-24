@@ -10,6 +10,10 @@ The repository contains the source required to build the modified mautrix-whatsa
 
 For upgrades, backup/restore, secret recovery, troubleshooting and the live test checklist, see the [operations guide](deployment/mautrix-whatsapp-call/OPERATIONS.md). Both guides are included in future runtime packages. Maintainers publishing builds should also see [Releasing](docs/RELEASING.md).
 
+## Prebuilt releases
+
+Published runtime packages and their SHA-256 sidecars are available on the [GitHub Releases page](https://github.com/BERNARDO31P/mautrix-whatsapp-call/releases). Download matching files from a trusted release, verify the checksum and follow the installation guide. A source archive is not an installable runtime package. Audit candidates must pass the full build and live acceptance gate before publication.
+
 ## What it provides
 
 - outgoing and incoming WhatsApp audio/video calls from MatrixRTC-capable Matrix clients;
@@ -46,30 +50,6 @@ If the registration is elsewhere, set `MATRIXRTC_WHATSAPP_REGISTRATION_PATH` in 
 
 The build target is Linux AMD64. Windows builds use WSL2.
 
-## Prebuilt release download
-
-Most users do **not** need Go, Rust, LLVM/Clang or WebRTC build tooling. Download the prebuilt Linux AMD64 runtime ZIP and its checksum from GitHub Releases:
-
-```text
-https://github.com/BERNARDO31P/mautrix-whatsapp-call/releases/latest
-```
-
-Release assets use the build output name:
-
-```text
-mautrix-whatsapp-call-<timestamp>.zip
-mautrix-whatsapp-call-<timestamp>.zip.sha256
-```
-
-For the initial `v0.1.0` release, the direct asset path is:
-
-```text
-https://github.com/BERNARDO31P/mautrix-whatsapp-call/releases/download/v0.1.0/mautrix-whatsapp-call-20261123-233131.zip
-https://github.com/BERNARDO31P/mautrix-whatsapp-call/releases/download/v0.1.0/mautrix-whatsapp-call-20261123-233131.zip.sha256
-```
-
-See [docs/DEPLOY.md](docs/DEPLOY.md) for verification and installation commands.
-
 ## Repository layout
 
 ```text
@@ -90,7 +70,7 @@ Unrelated upstream mobile/web/demo artifacts, downloaded toolchains, dependency 
 ### 1. Clone
 
 ```powershell
-git clone https://github.com/YOUR_GITHUB_USER/mautrix-whatsapp-call.git
+git clone https://github.com/BERNARDO31P/mautrix-whatsapp-call.git
 cd mautrix-whatsapp-call
 ```
 
@@ -135,7 +115,7 @@ dist/mautrix-whatsapp-call-<timestamp>.zip.sha256
 On a supported Debian/Ubuntu-style Linux AMD64 build host:
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USER/mautrix-whatsapp-call.git
+git clone https://github.com/BERNARDO31P/mautrix-whatsapp-call.git
 cd mautrix-whatsapp-call
 bash build/build.sh
 ```

@@ -77,7 +77,10 @@ type Message struct {
 }
 
 func validBody(m Message) bool {
-	if len(m.CallID) > 256 || len(m.LoginID) > 256 || len(m.ExpectedDevice) > 255 || len(m.MemberEvent) > 512 || len(m.Reason) > 4096 {
+	if len(m.Type) > 40 || len(m.RoomID) > 512 || len(m.SlotID) > 256 || len(m.GhostMXID) > 512 || len(m.ExpectedUserMXID) > 512 || len(m.Peer) > 512 || len(m.GroupJID) > 512 || len(m.CallID) > 256 || len(m.LoginID) > 256 || len(m.ExpectedDevice) > 255 || len(m.MemberEvent) > 512 || len(m.Reason) > 4096 {
+		return false
+	}
+	if m.MembershipFormat != "" && m.MembershipFormat != "msc" && m.MembershipFormat != "room_state" {
 		return false
 	}
 	if m.Type == "whatsapp_audio_mute" && !m.Muted || m.Type == "whatsapp_audio_unmute" && m.Muted {
@@ -118,7 +121,7 @@ func writeAll(w io.Writer, data []byte) error {
 		if err != nil {
 			return err
 		}
-		if n < 1 {
+		if n < 1 || n > len(data) {
 			return io.ErrShortWrite
 		}
 		data = data[n:]
@@ -205,9 +208,10 @@ func Read(r io.Reader) (Message, error) {
 }
 
 type Peer struct {
-	r       io.Reader
-	w       io.Writer
-	writeMu sync.Mutex
+	r        io.Reader
+	w        io.Writer
+	writeMu  sync.Mutex
+	writeErr error
 }
 
 func NewPeer(r io.Reader, w io.Writer) *Peer { return &Peer{r: r, w: w} }
@@ -215,12 +219,24 @@ func (p *Peer) Read() (Message, error)       { return Read(p.r) }
 func (p *Peer) Send(msg Message) error {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
+	if p.writeErr != nil {
+		return p.writeErr
+	}
 	// A stalled worker must never block the WhatsApp RTP loop forever.
 	if c, ok := p.w.(interface{ SetWriteDeadline(time.Time) error }); ok {
 		_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		defer c.SetWriteDeadline(time.Time{})
 	}
-	return Write(p.w, msg)
+	if err := Write(p.w, msg); err != nil {
+		// A failed write may have sent a partial frame. Never reuse this
+		// stream, and wake the reader if it shares the connection.
+		p.writeErr = err
+		if closer, ok := p.w.(io.Closer); ok {
+			_ = closer.Close()
+		}
+		return err
+	}
+	return nil
 }
 
 func EncodePCM(samples []float32) ([]byte, error) {

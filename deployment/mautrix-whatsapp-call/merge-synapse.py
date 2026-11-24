@@ -43,6 +43,8 @@ def merge(original: str, extra: str) -> tuple[str, list[str]]:
                 for wanted in value:
                     matches = [item for item in items if isinstance(item, dict) and item.get("type")==wanted["type"]]
                     if matches:
+                        if len(matches) != 1 or any(k in matches[0] and matches[0][k] != v for k, v in wanted.items()):
+                            raise ValueError("conflicting existing MatrixRTC transport: " + wanted["type"])
                         matches[0].update(wanted)
                     else:
                         items.append(wanted)
@@ -58,6 +60,8 @@ def merge(original: str, extra: str) -> tuple[str, list[str]]:
 
 
 def install_registration(source: Path, destination: Path, stamp: str, owner_stat: os.stat_result) -> bool:
+    if source.is_symlink() or destination.is_symlink():
+        raise ValueError("refusing symlink registration")
     content = source.read_bytes()
     st = destination.stat() if destination.exists() else owner_stat
     mode = protected_mode(st.st_mode) & protected_mode(owner_stat.st_mode)
@@ -76,7 +80,7 @@ def main() -> None:
     parser.add_argument("--apply", action="store_true", help="Backup/write config and registrations; no restart")
     options = parser.parse_args()
 
-    if not HOMESERVER.exists() or not ADDITIONS.is_file():
+    if not HOMESERVER.is_file() or HOMESERVER.is_symlink() or not ADDITIONS.is_file():
         raise SystemExit("Missing Synapse config or MatrixRTC additions")
     for source, _, _ in REGISTRATIONS:
         if not source.is_file():
@@ -90,17 +94,18 @@ def main() -> None:
         print("Dry-run only. Add --apply to write changes and registrations.")
         return
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     owner_stat = HOMESERVER.stat()
+    # Install registrations first; a partial failure must not make Synapse
+    # reference registration files that have never been written.
+    for source, destination, _ in REGISTRATIONS:
+        changed = install_registration(source, destination, stamp, owner_stat)
+        print(("Installed: " if changed else "Registration already current: ") + str(destination))
     if updated != original:
         backup = HOMESERVER.with_name("homeserver.yaml.backup." + stamp)
         backup_file(HOMESERVER, backup)
         atomic_write(HOMESERVER, updated.encode(), owner_stat, stat.S_IMODE(owner_stat.st_mode))
         print("Backup:", backup)
-
-    for source, destination, _ in REGISTRATIONS:
-        changed = install_registration(source, destination, stamp, owner_stat)
-        print(("Installed: " if changed else "Registration already current: ") + str(destination))
 
     print("Synapse files updated. Validate before restarting; no services were restarted.")
 

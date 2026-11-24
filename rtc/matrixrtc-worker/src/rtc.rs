@@ -20,6 +20,10 @@ struct AbortOnDrop(HashMap<String,tokio::task::JoinHandle<()>>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) { for task in self.0.values() { task.abort(); } }
 }
+struct MediaGate(Arc<AtomicBool>);
+impl Drop for MediaGate {
+    fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+}
 struct Ghost { client: Client, _sync: SyncService }
 pub struct Accounts {
     root: PathBuf,
@@ -187,6 +191,12 @@ impl Accounts {
     async fn get(&self, ghost_mxid: &str) -> io::Result<Arc<Ghost>> {
         let cell=self.clients.lock().await.entry(ghost_mxid.to_owned()).or_default().clone();
         let ghost=cell.get_or_try_init(|| async {
+            let folder = identity_folder(&self.root, ghost_mxid);
+            let crypto = folder.join("crypto").join("matrix-sdk-crypto.sqlite3");
+            let meta = tokio::fs::symlink_metadata(&crypto).await?;
+            if !meta.is_file() || meta.len() == 0 {
+                return Err(error("restore the prepared ghost crypto store before calling"));
+            }
             let client=load_identity_client(&self.root,ghost_mxid).await?;
             require_prepared_identity(&client).await?;
             let sync=SyncService::builder(client.clone()).build().await.map_err(io::Error::other)?;
@@ -449,8 +459,8 @@ async fn run_incoming(incoming: &Message, reader: &mut protocol::FrameReader<Rea
     if replay.contains(&incoming.login_id, &incoming.call_id)? {
         return Err(error("duplicate or replayed call"));
     }
-    if owned { create_slot(&room, incoming, &path).await?; }
     let result=async {
+    if owned { create_slot(&room, incoming, &path).await?; }
     // Creating the slot does not ring the Matrix user. Commit replay protection
     // only once setup succeeded, immediately before joining and notifying.
     if !replay.register(&incoming.login_id, &incoming.call_id)? {
@@ -478,7 +488,7 @@ async fn run_incoming(incoming: &Message, reader: &mut protocol::FrameReader<Rea
     if result.is_ok() { leave_result.map_err(io::Error::other)?; }
     result
     }.await;
-    if owned { release_slot(&room,incoming,&path).await?; }
+    if owned && tokio::fs::try_exists(&path).await? { release_slot(&room,incoming,&path).await?; }
     result
 }
 
@@ -632,6 +642,7 @@ async fn connected_session(incoming: &Message, reader: &mut protocol::FrameReade
     let mut last_sample = 0f32;
     let mut remote_tasks = AbortOnDrop(HashMap::new());
     let media_active = Arc::new(AtomicBool::new(false));
+    let _media_gate = MediaGate(media_active.clone());
     let video_keyframe_generation = Arc::new(AtomicU64::new(0));
 
     let audio_track = call.publish(PublishOptions::microphone()).await.map_err(io::Error::other)?;
@@ -669,6 +680,7 @@ async fn connected_session(incoming: &Message, reader: &mut protocol::FrameReade
         // through a transient broadcast which may predate subscription.
         let encrypted_peer = peer.as_ref().is_some_and(|(_, identity)| call.imported_key_for(identity));
         if !answered && encrypted_peer && connected && call.member_count().await == 2 {
+            validate_room(incoming, room).await?;
             let client = room.client();
             admission.check_other_members(incoming, client.device_id().map(|d| (own_member_id.as_str(), d.as_str())),
                 pinned.as_ref().map(|(id, device, _)| (id.as_str(), device.as_str())))?;
@@ -686,6 +698,9 @@ async fn connected_session(incoming: &Message, reader: &mut protocol::FrameReade
                 let participant=parts.iter().find(|p| &p.member_id==id).ok_or_else(||error("RTC peer left"))?;
                 for (key,kind) in [("audio",MediaStreamKind::Microphone),("video",MediaStreamKind::Camera)] {
                     let state=participant.streams.iter().find(|s|s.kind==kind).map(|s|s.muted);
+                    if state != Some(false) {
+                        if let Some(task) = remote_tasks.0.remove(key) { task.abort(); let _ = task.await; }
+                    }
                     if states.get(key)!=Some(&state) {
                         let previous=states.insert(key.to_owned(),state);
                         let control=match (key,previous,state) {
@@ -699,9 +714,7 @@ async fn connected_session(incoming: &Message, reader: &mut protocol::FrameReade
                         };
                         if let Some(ctrl)=control {send(writer,&Message::new(ctrl,&incoming.call_id)).await?;}
                     }
-                    if state!=Some(false) {
-                        if let Some(task)=remote_tasks.0.remove(key){task.abort();}
-                    } else if !remote_tasks.0.contains_key(key) && pending_tracks.is_empty() && call.remote_track(id,kind).is_some() {
+                    if state == Some(false) && !remote_tasks.0.contains_key(key) && pending_tracks.is_empty() && call.remote_track(id,kind).is_some() {
                         pending_tracks.push_back(CallEvent::StreamStarted{member_id:id.clone(),kind});
                     }
                 }
@@ -744,7 +757,7 @@ async fn connected_session(incoming: &Message, reader: &mut protocol::FrameReade
                     return Err(error("authorized participant's MatrixRTC media key was discarded"));
                 }
                 (true,Ok(CallEvent::StreamStarted { member_id, kind: MediaStreamKind::Microphone }))
-                    if peer.as_ref().is_some_and(|(id, identity)| id == &member_id && call.imported_key_for(identity)) => {
+                    if states.get("audio") == Some(&Some(false)) && !remote_tasks.0.contains_key("audio") && peer.as_ref().is_some_and(|(id, identity)| id == &member_id && call.imported_key_for(identity)) => {
                     let Some(mut frames) = call
                         .remote_track(&member_id, MediaStreamKind::Microphone)
                         .and_then(|track| track.audio_frames())
@@ -783,7 +796,7 @@ async fn connected_session(incoming: &Message, reader: &mut protocol::FrameReade
                     }));
                 }
                 (true,Ok(CallEvent::StreamStarted { member_id, kind: MediaStreamKind::Camera }))
-                    if peer.as_ref().is_some_and(|(id, identity)| id == &member_id && call.imported_key_for(identity)) => {
+                    if states.get("video") == Some(&Some(false)) && !remote_tasks.0.contains_key("video") && peer.as_ref().is_some_and(|(id, identity)| id == &member_id && call.imported_key_for(identity)) => {
                     video::verify_ffmpeg().await?;
                     let Some(frames) = call
                         .remote_track(&member_id, MediaStreamKind::Camera)

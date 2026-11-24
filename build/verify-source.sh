@@ -60,14 +60,14 @@ for raw in tracked:
     parts = Path(rel).parts
     name = Path(rel).name
     forbidden_parts = {"dist", "target", ".cache", "generated", "worker-state", "__pycache__", "node_modules"}
-    forbidden_suffixes = (".zip", ".tar", ".tar.gz", ".tgz", ".xz", ".7z", ".o", ".obj", ".a", ".so", ".dylib", ".dll", ".exe")
-    if any(part in forbidden_parts for part in parts) or name == ".env" or rel.endswith(forbidden_suffixes):
+    forbidden_suffixes = (".zip", ".tar", ".tar.gz", ".tgz", ".xz", ".7z", ".o", ".obj", ".a", ".so", ".dylib", ".dll", ".exe", ".pem", ".key", ".p12", ".pfx", ".db", ".sqlite", ".sqlite3")
+    if any(part in forbidden_parts for part in parts) or name == ".env" or name.startswith(".env.") and name != ".env.example" or rel.endswith(forbidden_suffixes) or (root / rel).is_symlink():
         raise SystemExit(f"Forbidden generated/runtime artifact is tracked: {rel}")
 PYHYGIENE
 fi
 
 while IFS= read -r -d '' script; do bash -n "$script"; done < <(find "$ROOT/build" "$ROOT/bootstrap" "$ROOT/deployment" "$ROOT/tests" -type f -name '*.sh' -print0)
-python3 - "$ROOT/deployment/mautrix-whatsapp-call" "$ROOT/tests" <<'PYCODE'
+python3 - "$ROOT/deployment/mautrix-whatsapp-call" "$ROOT/tests" "$ROOT/build" <<'PYCODE'
 from pathlib import Path
 import sys
 for base in map(Path, sys.argv[1:]):

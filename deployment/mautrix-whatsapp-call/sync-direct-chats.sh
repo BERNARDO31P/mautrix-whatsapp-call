@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+curl() { command curl --connect-timeout 5 --max-time 30 "$@"; }
+
 candidate_from_room_json() {
     local members_json="$1"
     local hints_json="$2"
@@ -17,7 +19,7 @@ candidate_from_room_json() {
         | ($members.joined | keys) as $joined
         | [$joined[] as $u | select(($service | index($u)) == null) | $u] as $humanMembers
         | [$humanMembers[] as $u | select(is_ghost($u)) | $u] as $ghosts
-        | if (($humanMembers | index($human)) != null and ($humanMembers|length) == 2 and ($ghosts|length) == 1)
+        | if (($humanMembers | index($human)) != null and ($humanMembers|length) == 2 and ($ghosts|length) == 1 and (is_ghost($human) | not))
           then $ghosts[0]
           else empty
           end
@@ -102,6 +104,7 @@ fi
 
 USER_MXID="$1"
 HS="${2:-https://${USER_MXID#*:}}"
+[[ "$HS" == https://* ]] || { echo "Migration requires an HTTPS homeserver URL" >&2; exit 2; }
 
 [[ "$USER_MXID" == @*:* ]] || { echo "Human Matrix ID must be a full MXID" >&2; exit 2; }
 command -v curl >/dev/null
@@ -115,15 +118,19 @@ METADATA_HELPER="${MATRIXRTC_WHATSAPP_METADATA_HELPER:-$ROOT/mautrix-whatsapp-ca
 [[ -f "$METADATA_HELPER" ]] || { echo "WhatsApp metadata helper not found: $METADATA_HELPER" >&2; exit 2; }
 SERVER="${USER_MXID#*:}"
 META_JSON="$(python3 "$METADATA_HELPER" --registration "$REGISTRATION" --config "$CONFIG" --server "$SERVER")"
+BOT_MXID="@$(jq -r .bot_localpart <<<"$META_JSON"):$SERVER"
 GHOST_REGEXES_JSON="$(jq -c '.ghost_regexes // []' <<<"$META_JSON")"
 [[ "$GHOST_REGEXES_JSON" != "[]" ]] || { echo "No usable WhatsApp ghost namespace patterns found" >&2; exit 2; }
 
 read -rsp "Matrix access token for $USER_MXID: " TOKEN
 echo
-trap 'unset TOKEN' EXIT
-[[ -n "$TOKEN" ]] || { echo "Access token is empty" >&2; exit 2; }
-
-AUTH=( -H "Authorization: Bearer $TOKEN" )
+[[ -n "$TOKEN" && "$TOKEN" != *$'\r'* && "$TOKEN" != *$'\n'* ]] || { echo "Invalid access token" >&2; exit 2; }
+umask 077
+PRIVATE_DIR="$(mktemp -d)"
+trap 'rm -rf -- "$PRIVATE_DIR"' EXIT
+printf "Authorization: Bearer %s\n" "$TOKEN" > "$PRIVATE_DIR/auth.header"
+unset TOKEN META_JSON
+AUTH=(-H "@$PRIVATE_DIR/auth.header")
 USER_ESC="$(jq -rn --arg v "$USER_MXID" '$v|@uri')"
 
 WHOAMI="$(curl -fsS "${AUTH[@]}" "$HS/_matrix/client/v3/account/whoami")"
@@ -163,6 +170,13 @@ while IFS= read -r ROOM; do
         HINT_BODY='{"service_members":[]}'
     fi
 
+    jq -e --arg bot "$BOT_MXID" '.joined | has($bot)' <<<"$MEMBERS" >/dev/null || continue
+    jq -e --arg bot "$BOT_MXID" '(.service_members // []) | index($bot) != null' <<<"$HINT_BODY" >/dev/null || continue
+    STATE="$(curl -fsS "${AUTH[@]}" "$HS/_matrix/client/v3/rooms/$ROOM_ESC/state" 2>/dev/null)" || continue
+    jq -e --arg bot "$BOT_MXID" '
+      any(.[]; .type=="m.room.encryption" and .content.algorithm=="m.megolm.v1.aes-sha2")
+      and ([.[] | select((.type=="m.bridge" or .type=="uk.half-shot.bridge") and .sender==$bot and .content.bridgebot==$bot and .content.protocol.id=="whatsapp") | .content | if ((.["com.beeper.room_type.v2"] // .["com.beeper.room_type"])=="dm" and (.channel.id|test("@(s\\.whatsapp\\.net|lid|hosted|hosted\\.lid|bot)$"))) then "dm" else "other" end] | unique)==["dm"]
+    ' <<<"$STATE" >/dev/null || continue
     CANDIDATE="$(candidate_from_room_json "$MEMBERS" "$HINT_BODY" "$USER_MXID" "$GHOST_REGEXES_JSON" 2>/dev/null || true)"
     [[ -n "$CANDIDATE" ]] || continue
 

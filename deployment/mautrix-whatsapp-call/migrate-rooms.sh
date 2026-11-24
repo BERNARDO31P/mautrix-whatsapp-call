@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+curl() { command curl --connect-timeout 5 --max-time 30 "$@"; }
+
 RTC_EVENT_TYPES=(
     "m.rtc.slot"
     "org.matrix.msc4143.rtc.slot"
@@ -362,6 +364,7 @@ DP_AUTH=(-H "@$PRIVATE_DIR/dp.header")
 BOT_MXID="@${BOT_LOCALPART}:${SERVER}"
 BOT_ESC="$(jq -rn --arg v "$BOT_MXID" '$v|@uri')"
 HS="${MATRIXRTC_PUBLIC_HOMESERVER:-https://$SERVER}"
+[[ "$HS" == https://* ]] || { echo "Migration requires an HTTPS homeserver URL" >&2; exit 2; }
 AUTH=(-H "@$PRIVATE_DIR/wa.header")
 AS_QUERY="user_id=$BOT_ESC"
 MAP_FILE="$PRIVATE_DIR/direct.tsv"

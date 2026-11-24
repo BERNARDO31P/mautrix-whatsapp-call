@@ -40,7 +40,7 @@ Write-Host $Release.FullName
 if ($Actual -ne $Expected) { throw "Runtime checksum mismatch" }
 ```
 
-In Linux/WSL, `bash build/verify-package.sh /path/to/runtime.zip` checks the internal manifest and required executable layout. Test that exact verified artifact on a compatible deployment and record the results using the [acceptance checklist](../deployment/mautrix-whatsapp-call/OPERATIONS.md#5-live-acceptance-checklist-for-every-deployment-or-dependency-update).
+In Linux/WSL, `bash build/verify-package.sh /path/to/runtime.zip` checks the exact allowed file inventory, complete internal manifest, matching binary copies, AMD64 ELF headers, executable modes and ZIP paths. The runtime packager never copies generated state or unknown local files into the archive. The source packager requires a clean committed tree. Checksums detect corruption; they do not authenticate an untrusted release publisher. Test that exact verified artifact on a compatible deployment and record the results using the [acceptance checklist](../deployment/mautrix-whatsapp-call/OPERATIONS.md#5-live-acceptance-checklist-for-every-deployment-or-dependency-update).
 
 Publish the two runtime assets together using the GitHub release UI or GitHub CLI. For example, after committing the intended source revision and authenticating `gh`, use a **new** release tag (substitute the real version and tested source commit):
 

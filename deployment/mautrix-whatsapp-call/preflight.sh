@@ -16,23 +16,25 @@ for path in \
 done
 mode="$(stat -c '%a' "$ROOT/generated/matrixrtc_store_passphrase")"
 [[ "$mode" == "600" ]] || fail "matrixrtc_store_passphrase must be mode 600, got $mode"
-python3 - "$BRIDGE_CONFIG" <<'PY'
+python3 - "$BRIDGE_CONFIG" "$ROOT" <<'PY'
 from pathlib import Path
-import re, sys
-text = Path(sys.argv[1]).read_text()
+import sys
+sys.path.insert(0, sys.argv[2])
+from config_files import load
+network = load(Path(sys.argv[1]).read_text())["network"]
 checks = {
-    "experimental_whatsapp_voip": r"(?m)^\s{4}experimental_whatsapp_voip\s*:\s*true\s*(?:#.*)?$",
-    "rtc_gateway_socket": r'''(?m)^\s{4}rtc_gateway_socket\s*:\s*["']?/run/mautrix-whatsapp-call/worker\.sock["']?\s*(?:#.*)?$''',
+    "experimental_whatsapp_voip": True,
+    "rtc_gateway_socket": "/run/mautrix-whatsapp-call/worker.sock",
 }
-for name, pattern in checks.items():
-    if not re.search(pattern, text):
+for name, expected in checks.items():
+    if network.get(name) != expected:
         raise SystemExit(f"bridge config does not enable expected network.{name}")
 print("Bridge RTC gateway config: PASS")
 PY
-python3 - <<PY
-import yaml
+python3 - "$ROOT/compose.yml" <<'PY'
+import sys, yaml
 from pathlib import Path
-yaml.safe_load(Path("$ROOT/compose.yml").read_text())
+yaml.safe_load(Path(sys.argv[1]).read_text())
 print("Compose overlay YAML parse: PASS")
 PY
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then

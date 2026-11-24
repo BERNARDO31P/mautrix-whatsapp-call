@@ -15,6 +15,10 @@ from pathlib import Path
 import urllib.request
 import urllib.error
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
 p = argparse.ArgumentParser()
 p.add_argument("--homeserver", required=True)
 p.add_argument("--ghost-mxid", required=True)
@@ -45,7 +49,7 @@ def login():
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=15) as response:
             session = json.load(response)
     except urllib.error.HTTPError as exc:
         p.error("Matrix appservice login failed with HTTP " + str(exc.code))

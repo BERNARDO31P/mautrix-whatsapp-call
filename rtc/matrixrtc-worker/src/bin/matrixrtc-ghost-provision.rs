@@ -106,7 +106,7 @@ async fn wait_for_cross_signed_device(client: &Client) -> io::Result<()> {
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let homeserver = required("MATRIX_HOMESERVER")?;
-    if !homeserver.starts_with("https://") && env::var("RTC_ALLOW_INSECURE_HOMESERVER").as_deref() != Ok("1") {
+    if !(homeserver.starts_with("https://") || (homeserver.starts_with("http://") && env::var("RTC_ALLOW_INSECURE_HOMESERVER").as_deref() == Ok("1"))) {
         return Err(error("MATRIX_HOMESERVER must use HTTPS"));
     }
     let state_root = PathBuf::from(required("RTC_WORKER_STATE_DIR")?);
@@ -131,16 +131,14 @@ async fn main() -> io::Result<()> {
         return Err(error("stored Matrix session belongs to a different ghost"));
     }
 
-    let mut builder = Client::builder()
+    let builder = Client::builder()
         .homeserver_url(&homeserver)
         .sqlite_store(folder.join("crypto"), Some(&passphrase))
         .with_encryption_settings(EncryptionSettings {
             auto_enable_cross_signing: true,
             ..Default::default()
         });
-    if env::var("RTC_ALLOW_INSECURE_HOMESERVER").as_deref() == Ok("1") {
-        builder = builder.disable_ssl_verification();
-    }
+    // Allow explicitly configured internal HTTP, never bypass HTTPS certificate validation.
     let client = builder.build().await.map_err(io::Error::other)?;
     client.restore_session(session).await.map_err(io::Error::other)?;
     client.encryption().wait_for_e2ee_initialization_tasks().await;

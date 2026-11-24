@@ -276,13 +276,20 @@ mod rtc {
         orientation: u8,
     }
 
+    // Dropping a JoinHandle detaches its task. Encoder cancellation must
+    // instead stop its stdout reader so it cannot emit stale video frames.
+    struct EncoderOutput(JoinHandle<io::Result<()>>);
+    impl Drop for EncoderOutput {
+        fn drop(&mut self) { self.0.abort(); }
+    }
+
     struct EncoderProcess {
         width: u32,
         height: u32,
         stdin: ChildStdin,
         child: Child,
         metadata: mpsc::Sender<FrameMetadata>,
-        output_task: JoinHandle<io::Result<()>>,
+        output_task: EncoderOutput,
     }
 
     impl EncoderProcess {
@@ -363,7 +370,7 @@ mod rtc {
                 }
                 Ok(())
             });
-            Ok(Self { width, height, stdin, child, metadata, output_task })
+            Ok(Self { width, height, stdin, child, metadata, output_task: EncoderOutput(output_task) })
         }
 
         async fn write_frame(&mut self, frame: &VideoFrame, duration_us: u64) -> io::Result<()> {
@@ -391,7 +398,7 @@ mod rtc {
                     (self.child.wait().await?, true)
                 }
             };
-            let output_result = self.output_task.await.map_err(io::Error::other)?;
+            let output_result = (&mut self.output_task.0).await.map_err(io::Error::other)?;
             output_result?;
             if !status.success() && !forced_shutdown {
                 return Err(io::Error::other(format!("H.264 encoder exited with {status}")));
@@ -523,7 +530,7 @@ mod rtc {
         async fn encoder_releases_stdin_on_size_change_and_keyframe_restart() {
             let (worker,_peer)=tokio::net::UnixStream::pair().unwrap();
             let (_,writer)=tokio::io::split(worker);
-            let writer=Arc::new(tokio::sync::Mutex::new(writer));
+            let writer=Writer::new(writer);
             for size in [16u32,32,32] {
                 let mut process=EncoderProcess::spawn(size,size,writer.clone(),"test".into(),Arc::new(AtomicBool::new(true))).unwrap();
                 let n=(size*size) as usize;

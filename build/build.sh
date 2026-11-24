@@ -22,13 +22,10 @@ mkdir -p "$BIN" "$LOG"
 
 "$REPO_ROOT/bootstrap/prepare-build-inputs.sh" "$CACHE"
 source "$CACHE/inputs.env"
-
 "$SCRIPT_DIR/verify-source.sh"
 
-# Keep the checked-out repository immutable. Some Go module operations may
-# update go.sum when resolving a pinned dependency graph, which would make a
-# second build fail the source-tree hash check. Do all Go module/test/build
-# work in an ephemeral copy instead.
+# Keep Go dependency/test/build operations outside the checkout, preserving
+# the public repository's immutable-source build fix.
 GO_SOURCE="$WORK/go-source"
 rm -rf "$GO_SOURCE"
 mkdir -p "$GO_SOURCE"
@@ -105,6 +102,10 @@ export PKG_CONFIG_PATH="$PKG_CONFIG_LOCAL:/usr/lib/x86_64-linux-gnu/pkgconfig:/u
 
 if [[ "$SKIP_TESTS" != "1" ]]; then
     python3 -B "$REPO_ROOT/tests/test_project.py"
+    DEPLOY="$REPO_ROOT/deployment/mautrix-whatsapp-call"
+    python3 -B "$DEPLOY/resolve-appservice.py" --self-test
+    python3 -B "$DEPLOY/worker/auto-provision-whatsapp-ghosts.py" --self-test
+    bash "$DEPLOY/sync-direct-chats.sh" --self-test
     for test in "$REPO_ROOT"/tests/shell/*.sh; do bash "$test"; done
     (
         cd "$BRIDGE_SRC"
@@ -149,7 +150,7 @@ ZIP_WORK="$PACKAGE_WORK/$PACKAGE_NAME.zip"
 SHA_WORK="$PACKAGE_WORK/$PACKAGE_NAME.zip.sha256"
 rm -rf "$PACKAGE_WORK"
 mkdir -p "$RELEASE/bin" "$RELEASE/deployment" "$DIST"
-cp -a "$REPO_ROOT/deployment/mautrix-whatsapp-call" "$RELEASE/deployment/mautrix-whatsapp-call"
+python3 -B "$SCRIPT_DIR/runtime-layout.py" stage "$REPO_ROOT" "$RELEASE"
 cp "$BIN"/* "$RELEASE/bin/"
 cp "$BIN/mautrix-whatsapp-call-worker" "$RELEASE/deployment/mautrix-whatsapp-call/worker/"
 cp "$BIN/mautrix-whatsapp-call-provision" "$RELEASE/deployment/mautrix-whatsapp-call/worker/"

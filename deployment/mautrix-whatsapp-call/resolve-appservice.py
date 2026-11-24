@@ -1,133 +1,55 @@
 #!/usr/bin/env python3
 import argparse
-import ast
 import json
 import re
 from pathlib import Path
 
 
-def scalar_value(raw: str) -> str:
-    value = raw.strip()
-    if not value:
-        return ""
-    if value[0:1] in {"\"", "'"} and value[-1:] == value[0:1]:
-        try:
-            parsed = ast.literal_eval(value)
-            if isinstance(parsed, str):
-                return parsed
-        except (SyntaxError, ValueError):
-            pass
-        if value[0] == "'":
-            return value[1:-1].replace("''", "'")
-        return value[1:-1].replace("\\\"", "\"").replace("\\\\", "\\")
-    return value.split(" #", 1)[0].strip()
-
-
-def top_level_scalar(path: Path, key: str) -> str | None:
-    pattern = re.compile(rf"^{re.escape(key)}:\s*(.*?)\s*$")
-    for line in path.read_text(encoding="utf-8").splitlines():
-        match = pattern.match(line)
-        if match:
-            return scalar_value(match.group(1))
-    return None
-
-
-def nested_scalar(path: Path, wanted: tuple[str, ...]) -> str | None:
-    stack: list[tuple[int, str]] = []
-    key_pattern = re.compile(r"^(\s*)([A-Za-z0-9_.-]+):(?:\s*(.*?))?\s*$")
-    for line in path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or stripped.startswith("-"):
-            continue
-        match = key_pattern.match(line)
-        if not match:
-            continue
-        indent = len(match.group(1).replace("\t", "    "))
-        key = match.group(2)
-        raw_value = match.group(3) or ""
-        while stack and indent <= stack[-1][0]:
-            stack.pop()
-        path_keys = tuple(item[1] for item in stack) + (key,)
-        if raw_value.strip():
-            if path_keys == wanted:
-                return scalar_value(raw_value)
-        else:
-            stack.append((indent, key))
-    return None
-
-
-def registration_user_regexes(path: Path) -> list[str]:
-    lines = path.read_text(encoding="utf-8").splitlines()
-    in_namespaces = False
-    in_users = False
-    patterns: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        indent = len(line) - len(line.lstrip(" "))
-        if indent == 0:
-            in_namespaces = stripped == "namespaces:"
-            in_users = False
-            continue
-        if not in_namespaces:
-            continue
-        if stripped and indent <= 2 and stripped.endswith(":") and not stripped.startswith("-"):
-            in_users = stripped == "users:"
-            continue
-        if not in_users:
-            continue
-        match = re.match(r"^\s*(?:-\s*)?regex:\s*(.*?)\s*$", line)
-        if not match:
-            continue
-        value = scalar_value(match.group(1))
-        re.compile(value)
-        patterns.append(value)
-    return patterns
+from config_files import load
 
 
 def template_regex(template: str, server: str) -> str:
     marker = "{{.}}"
     if template.count(marker) != 1:
-        raise ValueError(f"unsupported mautrix-whatsapp username_template: {template!r}")
+        raise ValueError("unsupported mautrix-whatsapp username_template")
     prefix, suffix = template.split(marker, 1)
-    return rf"^@{re.escape(prefix)}.+{re.escape(suffix)}:{re.escape(server)}$"
+    if not (prefix or suffix) or any(c in prefix + suffix for c in "@:\r\n"):
+        raise ValueError("username_template must define a distinct ghost namespace")
+    return rf"^@{re.escape(prefix)}[^:]+{re.escape(suffix)}:{re.escape(server)}$"
 
 
 def resolve(registration: Path, config: Path | None, server: str) -> dict:
-    if not registration.is_file():
-        raise FileNotFoundError(f"WhatsApp appservice registration not found: {registration}")
-
-    as_token = top_level_scalar(registration, "as_token") or ""
-    sender = top_level_scalar(registration, "sender_localpart") or ""
-    patterns = registration_user_regexes(registration)
-
-    bot = None
+    reg = load(registration.read_text(encoding="utf-8"))
+    token, sender = reg.get("as_token"), reg.get("sender_localpart")
+    if not isinstance(token, str) or not token or any(c.isspace() for c in token):
+        raise ValueError("invalid appservice token")
+    entries = reg.get("namespaces", {}).get("users", [])
+    patterns = [entry["regex"] for entry in entries
+                if isinstance(entry, dict) and entry.get("exclusive") is True
+                and isinstance(entry.get("regex"), str)]
+    bot = sender
     template = None
-    if config and config.is_file():
-        bot = nested_scalar(config, ("appservice", "bot", "username"))
-        template = nested_scalar(config, ("appservice", "username_template"))
-
-    bot = bot or sender
-    if not patterns and template:
-        patterns = [template_regex(template, server)]
-
-    if not as_token:
-        raise ValueError(f"could not read as_token from {registration}")
-    if not bot:
-        raise ValueError(f"could not determine mautrix-whatsapp bot username from {config or registration}")
+    if config is not None:
+        cfg = load(config.read_text(encoding="utf-8"))
+        appservice = cfg.get("appservice", {})
+        bot = appservice.get("bot", {}).get("username") or sender
+        template = appservice.get("username_template")
+        if not isinstance(template, str):
+            raise ValueError("appservice.username_template is required")
+    if not isinstance(bot, str) or not bot or any(c in bot for c in "@:\r\n"):
+        raise ValueError("invalid appservice bot username")
+    source = "registration" if patterns else "username_template"
+    if template:
+        scope = template_regex(template, server)
+        patterns = [rf"^(?=(?:{p})){scope[1:]}" for p in patterns] or [scope]
+    else:
+        # Without a config only explicitly exclusive, anchored namespaces are usable.
+        patterns = [p for p in patterns if p.startswith("^@") and p.endswith("$")]
     if not patterns:
-        raise ValueError(
-            f"no usable user namespace regexes in {registration} and no appservice.username_template in {config}"
-        )
-
+        raise ValueError("no usable ghost namespace")
     for pattern in patterns:
         re.compile(pattern)
-
-    return {
-        "as_token": as_token,
-        "bot_localpart": bot,
-        "ghost_regexes": patterns,
-        "source": "registration" if registration_user_regexes(registration) else "username_template",
-    }
+    return {"as_token": token, "bot_localpart": bot, "ghost_regexes": patterns, "source": source}
 
 
 def self_test() -> None:
@@ -170,6 +92,12 @@ def self_test() -> None:
             "      exclusive: true\n",
             encoding="utf-8",
         )
+        # JSON is also valid YAML, including flow-style mappings.
+        reg.write_text(json.dumps({"as_token":"test-token", "sender_localpart":"customwhatsappbot", "namespaces":{"users":[{"exclusive":True,"regex":"^@.*$"}]}}))
+        scoped = resolve(reg, cfg, "example.org")["ghost_regexes"][0]
+        assert re.fullmatch(scoped, "@wa-custom-123:example.org")
+        assert not re.fullmatch(scoped, "@alice:example.org")
+        reg.write_text(json.dumps({"as_token":"quoted-token", "sender_localpart":"whatsappbot", "namespaces":{"users":[{"exclusive":True,"regex":r"^@whatsapp_.+:example\.org$"}]}}))
         result = resolve(reg, None, "example.org")
         assert result["bot_localpart"] == "whatsappbot"
         assert result["source"] == "registration"

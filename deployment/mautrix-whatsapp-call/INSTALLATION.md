@@ -236,7 +236,7 @@ webhook:
     - http://lk-jwt-service:8080/sfu_webhook
 ```
 
-`lk-matrixrtc` is the matching API key identifier used by both services, not the secret. `room.auto_create: false` is intentional; room creation is managed through authenticated JWT service integration. The webhook is internal Docker traffic, not a public endpoint. `use_external_ip` requires working public ICE connectivity and address discovery. The installer regenerates this YAML; editing it directly is not a durable way to customize it. Do not add TURN, Redis, alternate ports or external SFUs without adapting the template, matching Compose and verifying connectivity.
+`lk-matrixrtc` is the matching API key identifier used by both services, not the secret. `room.auto_create: false` is intentional; room creation is managed through authenticated JWT service integration. The configured webhook travels internally over Docker networking; the generic JWT reverse-proxy route may also reach that path publicly, so signature validation remains required. `use_external_ip` requires working public ICE connectivity and address discovery. The installer regenerates this YAML; editing it directly is not a durable way to customize it. Do not add TURN, Redis, alternate ports or external SFUs without adapting the template, matching Compose and verifying connectivity.
 
 ### Element JWT service configuration
 
@@ -253,7 +253,7 @@ LIVEKIT_AS_REGISTRATION_FILE: "/run/secrets/matrixrtc-registration.yaml"
 LIVEKIT_CS_API_URL_OVERRIDES: "matrix.example.com=http://synapse:8008"
 ```
 
-The LiveKit secret and JWT registration are mounted read-only. The override connects the local Matrix homeserver identity to the internal Synapse URL. The JWT service authenticates Matrix requests and issues scoped LiveKit access; clients never receive the LiveKit API secret. Do not broaden full-access homeservers or expose unauthenticated room creation as a workaround.
+The LiveKit secret and JWT registration are mounted read-only. The override connects the local Matrix homeserver identity to the internal Synapse URL. The JWT service authenticates Matrix requests and issues scoped LiveKit access; clients never receive the LiveKit API secret. Do not broaden full-access homeservers or expose unauthenticated room creation as a workaround. In the pinned [JWT service v0.9.0](https://github.com/element-hq/lk-jwt-service/blob/v0.9.0/README.md), the proxied application-service endpoints check joined room membership; the standalone compatibility endpoints additionally depend on restricting full access to this exact homeserver. The full-access setting is not a general federation access control. The image does not include the later documented remote-publisher allowlist. Keep the supplied `room.auto_create: false` and confirm that a valid token for a non-member cannot obtain room access.
 
 ## 7. Synapse and mautrix-whatsapp configuration
 
@@ -421,7 +421,9 @@ bash mautrix-whatsapp-call/install-or-upgrade.sh
 bash mautrix-whatsapp-call/verify-worker.sh
 ```
 
-The installer normalizes filesystem permissions, reconciles credentials, merges configs/registrations, validates Compose, builds the local images, temporarily pauses calling, starts LiveKit/JWT, restarts Synapse and the bridge, migrates existing eligible rooms and provisions ghost identities. It starts the background provisioner for future eligible portals and restores the call-enable setting from `.env` on success. On an error after pausing the worker it attempts to restore the original setting; this is not an atomic rollback of configuration or room changes. Investigate nonzero exit status even if the worker starts.
+The installer normalizes filesystem permissions, reconciles credentials, merges configs/registrations, validates Compose, builds the local images, temporarily pauses calling, starts LiveKit/JWT, restarts Synapse and the bridge, migrates existing eligible rooms and provisions ghost identities. It starts the background provisioner for future eligible portals and restores the call-enable setting from `.env` on success. On an error after pausing the worker it attempts to stop both the worker and the provisioner, leaving the saved `.env` unchanged. This is not an atomic rollback of configuration or room changes. Investigate nonzero exit status and confirm both services are stopped before retrying. The installer rejects a conflicting existing MatrixRTC transport rather than replacing another SFU silently.
+
+Room migration uses the HTTPS homeserver URL and requires the actual mautrix-whatsapp configuration, including its ghost username template. Provisioning checks the registered namespace, functional bot, local encrypted DM membership and bridge-published portal metadata before creating a new ghost device; an existing valid prepared device remains reusable. Custom or older rooms missing that metadata may require bridge-side repair rather than forced provisioning. A conflicting MatrixRTC transport must be reconciled manually.
 
 There is no need to run `docker compose up` for the new services before generating their config, manually create LiveKit rooms, manually generate a JWT, or use the WhatsApp registration in the main worker. The provisioner has the required read-only registration access; the worker has persistent identity state and the store passphrase instead.
 

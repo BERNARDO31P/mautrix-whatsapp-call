@@ -64,7 +64,7 @@ Prefer tested prebuilt Linux AMD64 runtime assets from <https://github.com/BERNA
 
 - Read release notes and confirm compatibility with your Synapse, bridge database schema, clients and pinned base images. Avoid updates while a call is active.
 - If you customize the reverse proxy, firewall or deployment templates, review the new versions and reapply supported changes. The installer regenerates configuration and rsync replaces project-owned files; it does not rewrite the host nginx vhost or firewall.
-- The installer temporarily disables calls, updates runtime wiring and room metadata, provisions eligible ghosts, restores the configured worker flag and verifies the socket. An error may leave partially updated configuration; inspect the failure and do not treat a restored worker as a successful upgrade.
+- The installer temporarily disables calls, updates runtime wiring and room metadata, provisions eligible ghosts, restores the configured worker flag and verifies the socket. An error may leave partially updated configuration; the installer attempts to stop the call worker and background provisioner. Inspect the failure and confirm both are stopped; do not re-enable calls until the configuration and migration are repaired.
 - Recheck public JWT/SFU/transport endpoints, worker health, media and normal messages. Force-stop/reopen Matrix clients after room changes.
 
 For updating unrelated registry-backed services:
@@ -105,6 +105,8 @@ This example assumes an existing call overlay and `.env`. Restart services even 
 ### Roll back the extension release
 
 If a new release fails, first preserve diagnostics (redacted), disable calls and keep the failed release and all state for inspection. For a compatible binary/config rollback, verify the previous runtime ZIP, rsync its deployment directory excluding `generated/` and `worker-state/`, then rerun the installer with calls disabled and verify messages/calls. Enable only after checks pass.
+
+If an install fails after stopping the call services, the saved `.env` may still request enabled calls. The fail-closed trap stops the worker and provisioner but cannot roll back all other mutations. Do not run a blanket Compose restart/up before inspecting and repairing the failure. Verify the two services are stopped; if the administrator intends to keep calls disabled, explicitly set `MATRIXRTC_ENABLE_CALLS=0` before restarting anything.
 
 Do not assume every older binary can read newer persistent stores or bridge schemas. If there were incompatible migrations, restore a coordinated pre-upgrade backup of database, configuration, registrations, call state and matching runtime under maintenance instead. Restoring a database snapshot can discard messages/events after the snapshot; assess that impact first. The installer does not automatically undo Matrix room state or database migrations. Do not restore random subsets of credentials. If reverting entirely to the original upstream bridge, restore compatible original configuration and Compose setup, and review the MatrixRTC registrations, client discovery and room-state changes before removing services. Keep the backup; no blanket `docker compose down -v` or `docker system prune --volumes`.
 

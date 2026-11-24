@@ -46,7 +46,7 @@ def load_yaml(path: Path, label: str) -> dict:
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError) as exc:
-        raise RuntimeError(f"failed to parse {label} {path}: {exc}") from exc
+        raise RuntimeError(f"failed to parse {label} {path}") from None
     if not isinstance(data, dict):
         raise RuntimeError(f"{label} root must be a mapping: {path}")
     return data
@@ -86,7 +86,9 @@ def username_template_pattern(template: str, server_name: str) -> re.Pattern[str
     if template.count(marker) != 1:
         raise RuntimeError(f"unsupported mautrix-whatsapp username_template: {template!r}")
     prefix, suffix = template.split(marker, 1)
-    expression = "^@" + re.escape(prefix) + ".+" + re.escape(suffix) + ":" + re.escape(server_name) + "$"
+    if not (prefix or suffix) or any(c in prefix + suffix for c in "@:\r\n"):
+        raise RuntimeError("username_template must define a distinct ghost namespace")
+    expression = "^@" + re.escape(prefix) + "[^:]+" + re.escape(suffix) + ":" + re.escape(server_name) + "$"
     return re.compile(expression)
 
 
@@ -107,23 +109,19 @@ def registration_user_regexes() -> list[re.Pattern[str]]:
                     patterns.append(re.compile(value))
                 except re.error as exc:
                     raise RuntimeError(f"invalid user namespace regex in {REGISTRATION}: {value}: {exc}") from exc
-    if patterns:
-        return patterns
-
-    # Some existing mautrix registrations omit or encode namespaces in a form
-    # that is not useful to the sidecar. Fall back to the bridge's own
-    # username_template, which is the authoritative source used to generate
-    # ghost MXIDs. No broad/default regex is guessed.
-    appservice = config_appservice()
-    template = appservice.get("username_template")
+    template = config_appservice().get("username_template")
     if not isinstance(template, str) or not template:
-        raise RuntimeError(
-            f"no usable user namespace regexes in {REGISTRATION} and no appservice.username_template in {CONFIG}"
-        )
-    return [username_template_pattern(template, SERVER)]
+        raise RuntimeError("appservice.username_template is required")
+    scope = username_template_pattern(template, SERVER).pattern
+    return [re.compile(rf"^(?=(?:{p.pattern})){scope[1:]}") for p in patterns] or [re.compile(scope)]
 
 def is_bridge_user(user_id: str, patterns: list[re.Pattern[str]]) -> bool:
-    return any(pattern.fullmatch(user_id) or pattern.match(user_id) for pattern in patterns)
+    return any(pattern.fullmatch(user_id)  for pattern in patterns)
+
+
+class NoRedirect(request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def api(path: str, token: str, as_user: str | None = None, body: dict | None = None) -> tuple[int, dict]:
@@ -139,7 +137,7 @@ def api(path: str, token: str, as_user: str | None = None, body: dict | None = N
         method="POST" if body is not None else "GET",
     )
     try:
-        with request.urlopen(req, timeout=20) as response:
+        with request.build_opener(NoRedirect()).open(req, timeout=20) as response:
             payload = response.read()
             return response.status, json.loads(payload or b"{}")
     except error.HTTPError as exc:
@@ -162,7 +160,7 @@ def eligible_ghost_from_state(
     if encryption.get("algorithm") != "m.megolm.v1.aes-sha2":
         return None
     service = set(hints.get("service_members") or [])
-    if bot_mxid not in service:
+    if bot_mxid not in service or bot_mxid not in (members.get("joined") or {}):
         return None
     humans = [user for user in (members.get("joined") or {}) if user not in service]
     room_ghosts = [user for user in humans if is_bridge_user(user, ghost_patterns)]
@@ -174,6 +172,28 @@ def eligible_ghost_from_state(
         return None
     return room_ghosts[0]
 
+
+
+def is_whatsapp_dm_portal(state, bot, patterns):
+    if not isinstance(state, list):
+        return False
+    kinds = set()
+    for event in state:
+        if not isinstance(event, dict) or event.get("type") not in ("m.bridge", "uk.half-shot.bridge"):
+            continue
+        content = event.get("content") or {}
+        sender = event.get("sender", "")
+        if content.get("bridgebot") != bot or (content.get("protocol") or {}).get("id") != "whatsapp":
+            continue
+        if sender != bot and not is_bridge_user(sender, patterns):
+            continue
+        jid = (content.get("channel") or {}).get("id", "")
+        kind = content.get("com.beeper.room_type.v2", content.get("com.beeper.room_type"))
+        if isinstance(jid, str) and kind == "dm" and re.search(r"@(s\.whatsapp\.net|lid|hosted|hosted\.lid|bot)$", jid):
+            kinds.add("dm")
+        else:
+            kinds.add("other")
+    return kinds == {"dm"}
 
 def run_self_test() -> None:
     bot = "@whatsappbot:example.org"
@@ -194,6 +214,11 @@ def run_self_test() -> None:
     assert eligible_ghost_from_state(custom_members, hints, encryption, bot, custom_patterns, "example.org") == custom
     remote_human = {"joined": {bot: {}, ghost: {}, "@alice:remote.example": {}}}
     assert eligible_ghost_from_state(remote_human, hints, encryption, bot, patterns, "example.org") is None
+    portal = {"type":"m.bridge", "sender":bot, "content":{"bridgebot":bot,"protocol":{"id":"whatsapp"},"channel":{"id":"123@s.whatsapp.net"},"com.beeper.room_type":"dm"}}
+    assert is_whatsapp_dm_portal([portal], bot, patterns)
+    assert not is_whatsapp_dm_portal([], bot, patterns)
+    portal["content"]["channel"]["id"] = "123@g.us"
+    assert not is_whatsapp_dm_portal([portal], bot, patterns)
     assert CACHE_TTL >= 300
     assert NEGATIVE_CACHE_TTL >= 5
     assert username_template_pattern("whatsapp_{{.}}", "example.org").fullmatch("@whatsapp_lid-123:example.org")
@@ -252,9 +277,11 @@ def eligible_ghosts(token: str, bot_mxid: str, ghost_patterns: list[re.Pattern[s
             ghost = cached.get("ghost", "")
             ttl = CACHE_TTL if ghost else NEGATIVE_CACHE_TTL
             if now - int(cached.get("checked_at", 0)) < ttl:
-                if ghost:
+                if not ghost:
+                    continue
+                if is_bridge_user(ghost, ghost_patterns) and ghost_is_ready(ghost):
                     ghosts.add(ghost)
-                continue
+                    continue
 
         room = parse.quote(room_id, safe="")
         status, members = api(f"/_matrix/client/v3/rooms/{room}/joined_members", token, bot_mxid)
@@ -276,6 +303,12 @@ def eligible_ghosts(token: str, bot_mxid: str, ghost_patterns: list[re.Pattern[s
             cache[room_id] = {"checked_at": now, "ghost": ""}
             continue
         ghost = eligible_ghost_from_state(members, hints, encryption, bot_mxid, ghost_patterns, SERVER)
+        if ghost:
+            status, state = api(f"/_matrix/client/v3/rooms/{room}/state", token, bot_mxid)
+            if status != 200:
+                continue
+            if not is_whatsapp_dm_portal(state, bot_mxid, ghost_patterns):
+                ghost = None
         cache[room_id] = {"checked_at": now, "ghost": ghost or ""}
         if ghost:
             ghosts.add(ghost)

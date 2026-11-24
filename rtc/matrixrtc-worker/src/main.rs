@@ -9,9 +9,35 @@ mod rtc;
 use protocol::Message;
 use replay::ReplayGuard;
 use std::{io, os::unix::fs::FileTypeExt, path::{Path, PathBuf}, sync::Arc};
-use tokio::{io::{ReadHalf, WriteHalf}, net::{UnixListener, UnixStream}, sync::Mutex};
+use tokio::{io::{AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf}, net::{UnixListener, UnixStream}, sync::{mpsc, oneshot}};
 
-type Writer = Arc<Mutex<WriteHalf<UnixStream>>>;
+// A media producer may be aborted during mute/unpublish or call teardown.
+// It must never own the future that writes a partial wire frame. A single
+// bounded writer task completes the frame independently of its producer.
+#[derive(Clone)]
+struct Writer {
+    queue: mpsc::Sender<(Message, oneshot::Sender<io::Result<()>>)>,
+}
+
+impl Writer {
+    fn new<W: AsyncWrite + Unpin + Send + 'static>(mut sink: W) -> Self {
+        let (queue, mut receiver) = mpsc::channel::<(Message, oneshot::Sender<io::Result<()>>)>(8);
+        tokio::spawn(async move {
+            while let Some((message, reply)) = receiver.recv().await {
+                // No bytes have been written for this request yet.
+                if reply.is_closed() { continue; }
+                let result = protocol::write(&mut sink, &message).await;
+                let failed = result.is_err();
+                let _ = reply.send(result);
+                // A failed write may already have put a length or partial
+                // body on the wire. No subsequent frame may use this stream.
+                if failed { break; }
+            }
+            let _ = sink.shutdown().await;
+        });
+        Self { queue }
+    }
+}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -177,13 +203,15 @@ async fn bind_worker_socket(path: &Path) -> io::Result<UnixListener> {
 }
 
 async fn send(writer: &Writer, msg: &Message) -> io::Result<()> {
-    let mut writer = writer.lock().await;
-    protocol::write(&mut *writer, msg).await
+    let (reply, completion) = oneshot::channel();
+    writer.queue.send((msg.clone(), reply)).await
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "RTC writer stopped"))?;
+    completion.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "RTC writer stopped"))?
 }
 
 async fn serve(stream: UnixStream, replay: Arc<ReplayGuard>, #[cfg(feature = "rtc")] accounts: Arc<rtc::Accounts>) -> io::Result<()> {
     let (mut reader, writer): (ReadHalf<UnixStream>, WriteHalf<UnixStream>) = tokio::io::split(stream);
-    let writer = Arc::new(Mutex::new(writer));
+    let writer = Writer::new(writer);
     let incoming = tokio::time::timeout(std::time::Duration::from_secs(5), protocol::read(&mut reader))
         .await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no incoming call"))??;
     if incoming.kind=="ping" && incoming.call_id=="health" {return send(&writer,&Message::new("pong","health")).await}
@@ -267,5 +295,48 @@ mod tests {
             job.await.unwrap().unwrap();
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn cancelled_producer_cannot_truncate_a_frame() {
+        let (sink, mut peer) = tokio::io::duplex(64);
+        let writer = Writer::new(sink);
+        let mut first = Message::new("error", "first");
+        first.reason = "x".repeat(1024);
+        let first_copy = first.clone();
+        let producer_writer = writer.clone();
+        let producer = tokio::spawn(async move { send(&producer_writer, &first_copy).await });
+        let size = peer.read_u32().await.unwrap() as usize;
+        // The header has arrived, but the body cannot fit into this pipe.
+        producer.abort();
+        assert!(producer.await.unwrap_err().is_cancelled());
+        let second = Message::new("hangup", "second");
+        let second_copy = second.clone();
+        let next_writer = writer.clone();
+        let next = tokio::spawn(async move { send(&next_writer, &second_copy).await });
+        let mut body = vec![0; size];
+        peer.read_exact(&mut body).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Message>(&body).unwrap(), first);
+        assert_eq!(protocol::read(&mut peer).await.unwrap(), second);
+        next.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_timeout_closes_poisoned_stream() {
+        let (sink, mut peer) = tokio::io::duplex(64);
+        let writer = Writer::new(sink);
+        let mut first = Message::new("error", "first");
+        first.reason = "x".repeat(1024);
+        assert_eq!(send(&writer, &first).await.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(send(&writer, &Message::new("hangup", "second")).await.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        let mut bytes = Vec::new();
+        peer.read_to_end(&mut bytes).await.unwrap();
+        assert!(!bytes.is_empty());
     }
 }

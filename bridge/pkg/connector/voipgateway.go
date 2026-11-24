@@ -58,7 +58,15 @@ func (wa *WhatsAppClient) rtcRoomForPeer(ctx context.Context, peer types.JID) (s
 	if peer.IsEmpty() {
 		return "", "", "", errors.New("missing WhatsApp peer")
 	}
-	candidates := wa.matrixRTCCallCandidateJIDs(ctx, wa.maybeConvertJIDToLID(ctx, peer))
+	// Prefer the canonical LID portal, but retain the original PN even
+	// if a reverse alias lookup is temporarily unavailable.
+	candidates := wa.matrixRTCCallCandidateJIDs(ctx, peer)
+	for i, candidate := range candidates {
+		if candidate.Server == types.HiddenUserServer {
+			candidates[0], candidates[i] = candidates[i], candidates[0]
+			break
+		}
+	}
 	for _, jid := range candidates {
 		portal, err := wa.Main.Bridge.DB.Portal.GetByKey(ctx, wa.makeWAPortalKey(jid))
 		if err != nil {

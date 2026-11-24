@@ -74,6 +74,7 @@ func (wa *WhatsAppClient) registerVoIPCall(call *meowcaller.Call, direction voip
 
 	id := wa.callKey(call.ID())
 	if wa.callManager != nil {
+		wa.callManager.PruneEnded(24 * time.Hour)
 		if _, err := wa.callManager.Start(id, call.Peer().ToNonAD().String(), direction); err != nil {
 			wa.UserLogin.Log.Debug().Err(err).Str("call_id", call.ID()).Msg("Could not track live call")
 		}

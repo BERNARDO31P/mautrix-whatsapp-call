@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INPUT="${1:?usage: verify-package.sh <release-directory-or-zip>}"
 TMP=""
 cleanup() { [[ -z "$TMP" ]] || rm -rf "$TMP"; }
 trap cleanup EXIT
 if [[ -f "$INPUT" ]]; then
     TMP="$(mktemp -d)"
-    unzip -q "$INPUT" -d "$TMP"
+    python3 -B "$SCRIPT_DIR/runtime-layout.py" extract-zip "$INPUT" "$TMP"
     ROOT="$(find "$TMP" -mindepth 1 -maxdepth 1 -type d -print -quit)"
 else
     ROOT="$(cd "$INPUT" && pwd)"
@@ -27,7 +28,7 @@ for rel in \
     SOURCE-VERSIONS.env SHA256SUMS; do
     [[ -f "$ROOT/$rel" ]] || { echo "Missing release file: $rel" >&2; exit 41; }
 done
-(cd "$ROOT" && sha256sum -c SHA256SUMS >/dev/null)
+python3 -B "$SCRIPT_DIR/runtime-layout.py" verify-tree "$ROOT"
 
 bad_mode="$(find "$ROOT" -xdev \( -perm -0020 -o -perm -0002 \) -print -quit)"
 if [[ -n "$bad_mode" ]]; then
@@ -46,7 +47,7 @@ grep -F 'image: "mautrix-whatsapp-call-bridge:local"' "$ROOT/deployment/mautrix-
 grep -F 'image: "mautrix-whatsapp-call-worker:local"' "$ROOT/deployment/mautrix-whatsapp-call/compose.yml" >/dev/null
 grep -F 'RTC_WORKER_ENABLE_CALLS: "${MATRIXRTC_ENABLE_CALLS:-0}"' "$ROOT/deployment/mautrix-whatsapp-call/compose.yml" >/dev/null
 grep -F '${MATRIXRTC_SERVER_NAME:?MATRIXRTC_SERVER_NAME is required}' "$ROOT/deployment/mautrix-whatsapp-call/compose.yml" >/dev/null
-if grep -R -n "matrix\.bernardo\.fm" "$ROOT/deployment"; then
+if grep -RIl --binary-files=without-match "matrix\.bernardo\.fm" "$ROOT/deployment"; then
     echo "Site-specific hostname leaked into release" >&2
     exit 43
 fi

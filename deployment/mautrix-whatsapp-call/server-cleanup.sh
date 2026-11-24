@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-
-# Conservative cleanup for this project's generated release archives and unused
-# Docker images. Persistent generated/ and worker-state/ directories are never touched.
-ROOT="${1:-/root}"
-
-keep_newest_two() {
-    local pattern="$1"
-    mapfile -t files < <(compgen -G "$pattern" | xargs -r ls -1t 2>/dev/null || true)
-    if (( ${#files[@]} > 2 )); then
-        printf '%s\0' "${files[@]:2}" | xargs -0 -r rm -f --
-    fi
-}
-
-keep_newest_two "$ROOT/mautrix-whatsapp-call-*.zip"
-keep_newest_two "$ROOT/mautrix-whatsapp-call-*.zip.sha256"
-
-docker image prune -f >/dev/null 2>&1 || true
-
-echo "mautrix-whatsapp-call cleanup complete; persistent runtime state was not modified."
+# Only remove old, complete project release pairs. No global Docker pruning.
+python3 - "${1:-/root}" <<'PY'
+from pathlib import Path
+import re, sys
+root = Path(sys.argv[1])
+pairs = []
+for path in root.iterdir():
+    if not re.fullmatch(r"mautrix-whatsapp-call-[0-9]{8}-[0-9]{6}\.zip", path.name):
+        continue
+    sidecar = path.with_name(path.name + ".sha256")
+    if path.is_symlink() or sidecar.is_symlink() or not path.is_file() or not sidecar.is_file():
+        continue
+    pairs.append((path, sidecar))
+pairs.sort(key=lambda pair: pair[0].name, reverse=True)
+for path, sidecar in pairs[2:]:
+    path.unlink()
+    sidecar.unlink()
+    print("Removed old release pair:", path.name)
+PY
+echo "mautrix-whatsapp-call cleanup complete; persistent runtime state and Docker images were not modified."
