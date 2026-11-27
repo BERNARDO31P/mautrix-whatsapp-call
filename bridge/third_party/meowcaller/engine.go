@@ -1136,7 +1136,12 @@ func (e *engine) onRelayMatching(callID string, data *waBinary.Node, offerAck bo
 		e.applyVoipSettingsCodec(m, data, callID)
 		e.c.log.Info().Str("call_id", callID).Int("relay_candidates", len(rd.endpoints)).Msg("correlated outgoing relay allocation")
 	}
-	m.relay = rd
+	// Peer-only updates may omit allocation credentials. Preserve a complete
+	// direct allocation rather than replacing it with an incomplete snapshot.
+	if m.group || len(mediaRelayCandidates(rd, m.direction == CallDirectionIncoming, false)) > 0 ||
+		len(mediaRelayCandidates(m.relay, m.direction == CallDirectionIncoming, false)) == 0 {
+		m.relay = rd
+	}
 	if !rd.peerJID.IsEmpty() {
 		peerLID = rd.peerJID.String()
 		if !m.group {
@@ -2303,16 +2308,18 @@ func parseIndexedTokens(node *waBinary.Node, tag string) [][]byte {
 			continue
 		}
 		b := nodeBytes(c)
-		if b == nil {
+		if len(b) == 0 {
 			continue
 		}
 		id := len(tokens)
 		if s := c.AttrGetter().String("id"); s != "" {
-			if n, err := strconv.Atoi(s); err == nil {
-				id = n
+			n, err := strconv.Atoi(s)
+			if err != nil || n < 0 || n >= maxRelayTokens {
+				continue
 			}
+			id = n
 		}
-		if id >= maxRelayTokens {
+		if id < 0 || id >= maxRelayTokens {
 			continue
 		}
 		for len(tokens) <= id {

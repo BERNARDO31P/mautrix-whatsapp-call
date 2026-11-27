@@ -94,7 +94,8 @@ func (e *engine) maybeStartMediaMatching(callID string, expected *engineCall) {
 		e.mu.Unlock()
 		return
 	}
-	if !m.group && m.relay == nil {
+	if !m.group && len(mediaRelayCandidates(m.relay, m.direction == CallDirectionIncoming, false)) == 0 {
+		e.c.log.Debug().Str("call_id", callID).Msg("waiting for usable direct relay allocation")
 		e.mu.Unlock()
 		return
 	}
@@ -149,24 +150,43 @@ func (e *engine) maybeStartMediaMatching(callID string, expected *engineCall) {
 // the channel and the allocate bytes (re-sent by the keepalive).
 //
 // NOT VALIDATED: live-relay only.
+// Check allocation prerequisites before spending a transport attempt.
+func usableRelayEndpoint(rd *relayData, ep *relayEndpoint) bool {
+	if rd == nil || ep == nil || len(rd.relayKeyASCII) == 0 ||
+		uint64(ep.tokenID) >= uint64(len(rd.relayTokens)) || len(rd.relayTokens[ep.tokenID]) == 0 || len(ep.addresses) == 0 {
+		return false
+	}
+	addr := ep.addresses[0]
+	ip := net.ParseIP(addr.ipv4)
+	return addr.port != 0 && ip != nil && ip.To4() != nil && !ip.IsUnspecified() && !ip.IsMulticast()
+}
+
 func mediaRelayCandidates(rd *relayData, inbound, group bool) []*relayEndpoint {
+	if rd == nil {
+		return nil
+	}
 	preferred := getMediaRelayEndpoint(rd, inbound)
 	if preferred == nil {
 		return nil
 	}
-	candidates := []*relayEndpoint{preferred}
-	if !group {
-		// Only retry advertised endpoints with their own allocation token.
-		// An explicit inbound FNA selection must not be replaced by non-FNA.
-		for i := range rd.endpoints {
-			ep := &rd.endpoints[i]
-			if ep == preferred || (inbound && preferred.isFNA && !ep.isFNA) || (!inbound && !preferred.isFNA && ep.isFNA) {
-				continue
-			}
-			candidates = append(candidates, ep)
-			if len(candidates) == 3 {
-				break
-			}
+	if group {
+		// Group subscription updates are bound to the elected relay.
+		return []*relayEndpoint{preferred}
+	}
+	candidates := make([]*relayEndpoint, 0, 3)
+	if usableRelayEndpoint(rd, preferred) {
+		candidates = append(candidates, preferred)
+	}
+	// Keep the elected relay class. An inbound FNA relay cannot be replaced
+	// by a non-FNA endpoint that does not carry the caller's media.
+	for i := range rd.endpoints {
+		ep := &rd.endpoints[i]
+		if ep == preferred || (inbound && preferred.isFNA && !ep.isFNA) || (!inbound && !preferred.isFNA && ep.isFNA) || !usableRelayEndpoint(rd, ep) {
+			continue
+		}
+		candidates = append(candidates, ep)
+		if len(candidates) == 3 {
+			break
 		}
 	}
 	return candidates
@@ -182,7 +202,7 @@ func (e *engine) connectAndAllocate(ctx context.Context, rd *relayData, streamSs
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
-		ch, allocation, err := e.connectAndAllocateEndpoint(ctx, rd, streamSsrcs, ep)
+		ch, allocation, err := e.connectAndAllocateEndpoint(ctx, rd, streamSsrcs, ep, relayAttemptTimeout(len(candidates)))
 		if err == nil {
 			return ch, allocation, nil
 		}
@@ -192,10 +212,10 @@ func (e *engine) connectAndAllocate(ctx context.Context, rd *relayData, streamSs
 	return nil, nil, fmt.Errorf("relay setup exhausted: %w", lastErr)
 }
 
-func (e *engine) connectAndAllocateEndpoint(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, ep *relayEndpoint) (*relay.RelayMediaChannel, []byte, error) {
+func (e *engine) connectAndAllocateEndpoint(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, ep *relayEndpoint, timeout time.Duration) (*relay.RelayMediaChannel, []byte, error) {
 	log := e.c.log
-	if ep == nil || len(ep.addresses) == 0 {
-		return nil, nil, fmt.Errorf("relay has no usable endpoint")
+	if !usableRelayEndpoint(rd, ep) {
+		return nil, nil, fmt.Errorf("relay endpoint or allocation credentials are incomplete")
 	}
 	addr := &net.UDPAddr{IP: net.ParseIP(ep.addresses[0].ipv4), Port: int(ep.addresses[0].port)}
 	log.Info().Str("relay_name", ep.relayName).Str("addr", addr.String()).Msg("connecting media transport to relay")
@@ -204,7 +224,7 @@ func (e *engine) connectAndAllocateEndpoint(ctx context.Context, rd *relayData, 
 		"ipv4": ep.addresses[0].ipv4, "port": ep.addresses[0].port, "token_id": ep.tokenID,
 	})
 
-	connectCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	connectCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	ch, err := awaitRelayConnection(connectCtx, func() (*relay.RelayMediaChannel, error) {
 		return relay.ConnectRelayMediaContext(connectCtx, addr, relay.WithLogger(log))
@@ -305,7 +325,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		}
 		e.mu.Unlock()
 	}()
-	log := e.c.log
+	log := e.c.log.With().Str("call_id", callID).Logger()
 	enc, closeEncoder, err := newLiveAudioEncoder(audioConfig, log)
 	if err != nil {
 		return err
@@ -890,6 +910,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		e.mu.Unlock()
 	}()
 
+	var allocationConfirmed, allocationRejected, consentConfirmed bool
 	var audioReception rtp.RtcpReceptionStatsSet
 	var videoReception rtp.RtcpReceptionStatsSet
 	if groupMode.Load() {
@@ -1098,11 +1119,22 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				if allocateState.matchesResponse(pkt) {
 					// An acknowledgement is not evidence of peer media readiness.
 					e.c.diag.Emit("stun", map[string]any{"event": "allocation_response", "success": mt == stun.MsgAllocateSuccess})
+					if mt == stun.MsgAllocateSuccess && !allocationConfirmed {
+						log.Info().Msg("relay allocation acknowledged")
+						allocationConfirmed = true
+					} else if mt == stun.MsgAllocateError && !allocationRejected {
+						log.Warn().Msg("relay rejected allocation")
+						allocationRejected = true
+					}
 				}
 			case stun.MsgWhatsappPong:
 				tx, ok := stun.StunTransactionID(pkt)
 				if ok && consent.consume([12]byte(tx), time.Now()) {
 					e.c.diag.Emit("stun", map[string]any{"event": "consent_pong_matched"})
+					if !consentConfirmed {
+						log.Info().Msg("relay consent acknowledged")
+						consentConfirmed = true
+					}
 				}
 			case stun.MsgBindingRequest:
 				resp, answered, err := allocateState.SendBindingSuccess(pkt, func(packet []byte) error {

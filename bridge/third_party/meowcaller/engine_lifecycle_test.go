@@ -1101,3 +1101,30 @@ func TestPendingVideoCannotAnnounceEnabledOrientation(t *testing.T) {
 		t.Fatal("ready camera was gated")
 	}
 }
+
+func TestDirectRelayTokensIgnoreInvalidIndices(t *testing.T) {
+	node := &waBinary.Node{Tag: "relay", Content: []waBinary.Node{
+		{Tag: "token", Attrs: waBinary.Attrs{"id": "-1"}, Content: []byte{1}},
+		{Tag: "token", Attrs: waBinary.Attrs{"id": "invalid"}, Content: []byte{2}},
+		{Tag: "token", Attrs: waBinary.Attrs{"id": "64"}, Content: []byte{3}},
+		{Tag: "token", Attrs: waBinary.Attrs{"id": "2"}, Content: []byte{4}},
+	}}
+	tokens := parseIndexedTokens(node, "token")
+	if len(tokens) != 3 || tokens[0] != nil || tokens[1] != nil || len(tokens[2]) != 1 || tokens[2][0] != 4 {
+		t.Fatalf("unexpected token inventory: %v", tokens)
+	}
+}
+
+func TestPeerOnlyRelayUpdatePreservesDirectAllocation(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	m := eng.calls[call.ID()]
+	previous := &relayData{relayKeyASCII: []byte("key"), relayTokens: [][]byte{{1}}, endpoints: []relayEndpoint{
+		{addresses: []relayAddress{{ipv4: "192.0.2.1", port: 3478}}},
+	}}
+	m.relay = previous
+	// No call key: this fixture must not start real media.
+	eng.onRelay(types.BasicCallMeta{CallID: call.ID(), From: peerJID(), CallCreator: creatorJID()}, &waBinary.Node{Tag: "relay"})
+	if m.relay != previous || m.started {
+		t.Fatal("peer-only relay update replaced valid allocation or started media")
+	}
+}

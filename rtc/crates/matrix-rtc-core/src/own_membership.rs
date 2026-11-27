@@ -1146,16 +1146,23 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
 
         log::info!("[{}] Sending leave membership event", room_id);
 
-        self.outbox
-            .send(
-                self.key(SendKind::Membership),
-                SendPolicy::single_attempt(),
-                || self.publish_once(leave_content.clone()),
-            )
-            .await
-            .map_err(SendFailure::into_command_error)?;
+        // Fresh membership keys can be withdrawn before cancelling their
+        // delayed leave. For reused legacy keys, preserve any already-published
+        // delayed leave (including its server-provided delay ID) until the
+        // cancellation outcome is known. A direct empty state write would
+        // overwrite that evidence and make safe reconciliation impossible.
+        if !require_settlement {
+            self.outbox
+                .send(
+                    self.key(SendKind::Membership),
+                    SendPolicy::single_attempt(),
+                    || self.publish_once(leave_content.clone()),
+                )
+                .await
+                .map_err(SendFailure::into_command_error)?;
+        }
 
-        // We are gone from the call; stop refreshing the sticky entry.
+        // Local participation ended; stop refreshing the sticky entry.
         {
             let mut guard = self.last_sticky.lock().unwrap();
             *guard = None;
@@ -1170,11 +1177,19 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             log::debug!("[{}] Canceling delayed leave event: {}", room_id, event_id);
             // For fresh MSC keys the cancellation is only cleanup. For reused
             // legacy keys we must confirm it before another join can proceed.
+            // Retry a transient cancellation failure within a fixed budget for
+            // reused state keys. Cancellation targets one exact delay ID.
+            // A missing ID is still ambiguous and cannot clear ownership.
+            let policy = if require_settlement {
+                SendPolicy::new().deadline(Duration::from_secs(20))
+            } else {
+                SendPolicy::single_attempt()
+            };
             match self
                 .outbox
                 .send(
                     self.key(SendKind::DelayedLeave),
-                    SendPolicy::single_attempt(),
+                    policy,
                     || {
                         self.backend
                             .cancel_delayed_event(room_id.clone(), event_id.clone())
@@ -1222,6 +1237,18 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             return Err(CommandError::ClientRejected(
                 "legacy delayed leave has an unconfirmed earlier operation; state-key ownership retained".to_owned(),
             ));
+        }
+        if require_settlement {
+            // The exact delayed operation is now settled. If this write fails,
+            // the ownership marker remains so reconciliation can withdraw it.
+            self.outbox
+                .send(
+                    self.key(SendKind::Membership),
+                    SendPolicy::single_attempt(),
+                    || self.publish_once(leave_content.clone()),
+                )
+                .await
+                .map_err(SendFailure::into_command_error)?;
         }
         log::info!("[{}] Successfully left session", room_id);
 
@@ -2319,6 +2346,49 @@ mod tests {
             assert_eq!(records.len(), 2);
             assert!(records[0].1.is_some());
             assert!(records[1].1.is_none());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn legacy_leave_retries_transient_exact_id_cancel() {
+            let mock = Arc::new(MockBackend::new());
+            let mut machine = machine(&mock, MembershipTimings::default());
+            let journal = Arc::new(RecordingDelayJournal::default());
+            machine.set_outbox(Outbox::with_legacy_journal(journal.clone()));
+            machine.join(MemberTransports::default(), None).await.unwrap();
+            mock.script(MockMethod::CancelDelayedEvent, [fail(), MockOutcome::Ok]);
+            machine.leave_with_settlement(None, true).await.unwrap();
+            assert_eq!(mock.calls_to(MockMethod::CancelDelayedEvent).len(), 2);
+            assert!(journal.records.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn legacy_leave_missing_delay_keeps_ownership() {
+            let mock = Arc::new(MockBackend::new());
+            let mut machine = machine(&mock, MembershipTimings::default());
+            let journal = Arc::new(RecordingDelayJournal::default());
+            machine.set_outbox(Outbox::with_legacy_journal(journal.clone()));
+            machine.join(MemberTransports::default(), None).await.unwrap();
+            mock.script(MockMethod::CancelDelayedEvent, [fail_with("M_NOT_FOUND", 404)]);
+            assert!(machine.leave_with_settlement(None, true).await.is_err());
+            assert_eq!(journal.records.lock().unwrap().len(), 1);
+            // Do not overwrite a server-published delayed leave with a new
+            // direct leave: the next reconciliation needs its unsigned ID.
+            assert_eq!(mock.calls_to(MockMethod::StickyEvent).len(), 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn legacy_leave_publishes_only_after_cancellation() {
+            let mock = Arc::new(MockBackend::new());
+            let mut machine = machine(&mock, MembershipTimings::default());
+            let journal = Arc::new(RecordingDelayJournal::default());
+            machine.set_outbox(Outbox::with_legacy_journal(journal.clone()));
+            machine.join(MemberTransports::default(), None).await.unwrap();
+            mock.script(MockMethod::CancelDelayedEvent, [MockOutcome::After(Duration::from_secs(2), Box::new(MockOutcome::Ok))]);
+            let start = tokio::time::Instant::now();
+            machine.leave_with_settlement(None, true).await.unwrap();
+            assert!(start.elapsed() >= Duration::from_secs(2));
+            assert_eq!(mock.calls_to(MockMethod::StickyEvent).len(), 2);
+            assert!(journal.records.lock().unwrap().is_empty());
         }
 
         async fn at(seconds: f64, origin: tokio::time::Instant) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync/atomic"
 
 	"github.com/pion/datachannel"
 	"github.com/pion/dtls/v3"
@@ -141,6 +142,60 @@ func (c *RelayMediaChannel) Recv(buf []byte) (int, error) {
 	return n, nil
 }
 
+// Count socket activity during setup without logging packet contents.
+// This distinguishes a silent relay from a received but rejected handshake.
+type countedPacketConn struct {
+	net.PacketConn
+	peer                                *net.UDPAddr
+	sent, received                      atomic.Uint64
+	peerReceived, foreignReceived       atomic.Uint64
+	peerHandshake, peerAlert, peerOther atomic.Uint64
+}
+
+func (c *countedPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	n, err := c.PacketConn.WriteTo(p, addr)
+	if err == nil {
+		c.sent.Add(1)
+	}
+	return n, err
+}
+
+func (c *countedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, addr, err := c.PacketConn.ReadFrom(p)
+	if err == nil {
+		c.received.Add(1)
+		if c.peer != nil {
+			if source, ok := addr.(*net.UDPAddr); ok && source.Port == c.peer.Port && source.IP.Equal(c.peer.IP) && source.Zone == c.peer.Zone {
+				c.peerReceived.Add(1)
+				switch classifyHandshakeDatagram(p[:n]) {
+				case 22:
+					c.peerHandshake.Add(1)
+				case 21:
+					c.peerAlert.Add(1)
+				default:
+					c.peerOther.Add(1)
+				}
+			} else {
+				c.foreignReceived.Add(1)
+			}
+		}
+	}
+	return n, addr, err
+}
+
+// Classify the first DTLS 1.0/1.2 record header, not its payload. This is
+// diagnostic only; Pion remains responsible for protocol validation.
+// Other formats (including encrypted records) are not evidence of a rejection.
+func classifyHandshakeDatagram(p []byte) byte {
+	if len(p) < 13 || p[1] != 0xfe || (p[2] != 0xff && p[2] != 0xfd) {
+		return 0
+	}
+	if int(p[11])<<8|int(p[12]) > len(p)-13 {
+		return 0
+	}
+	return p[0]
+}
+
 // ConnectRelayMedia connects the full media stack (UDP→DTLS→SCTP→DataChannel) to one
 // relay endpoint. Self-signed cert; server-cert verification skipped (media auth is
 // HBH SRTP, not DTLS). No vector — validated only against a live relay.
@@ -169,7 +224,11 @@ func ConnectRelayMediaContext(ctx context.Context, relayAddr *net.UDPAddr, opts 
 	}
 
 	// 1. UDP socket.
-	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	network, bindIP := "udp6", net.IPv6unspecified
+	if relayAddr.IP.To4() != nil {
+		network, bindIP = "udp4", net.IPv4zero
+	}
+	udp, err := net.ListenUDP(network, &net.UDPAddr{IP: bindIP, Port: 0})
 	if err != nil {
 		lg.Debug().Err(err).Msg("relay media connect failed")
 		return nil, &CallTransportError{Op: "connect", Err: fmt.Errorf("bind udp: %w", err)}
@@ -184,7 +243,8 @@ func ConnectRelayMediaContext(ctx context.Context, relayAddr *net.UDPAddr, opts 
 	if err != nil {
 		return fail(fmt.Errorf("dtls self-signed cert: %w", err))
 	}
-	dtlsConn, err := dtls.ClientWithOptions(udp, relayAddr,
+	counted := &countedPacketConn{PacketConn: udp, peer: relayAddr}
+	dtlsConn, err := dtls.ClientWithOptions(counted, relayAddr,
 		dtls.WithCertificates(cert),
 		dtls.WithInsecureSkipVerify(true),
 	)
@@ -193,6 +253,12 @@ func ConnectRelayMediaContext(ctx context.Context, relayAddr *net.UDPAddr, opts 
 	}
 	cleanup = append(cleanup, dtlsConn.Close)
 	if err := dtlsConn.HandshakeContext(ctx); err != nil {
+		lg.Warn().Uint64("udp_sent", counted.sent.Load()).Uint64("udp_received", counted.received.Load()).
+			Uint64("peer_received", counted.peerReceived.Load()).
+			Uint64("foreign_received", counted.foreignReceived.Load()).
+			Uint64("peer_dtls_handshake", counted.peerHandshake.Load()).
+			Uint64("peer_dtls_alert", counted.peerAlert.Load()).
+			Uint64("peer_other", counted.peerOther.Load()).Str("network", network).Msg("relay DTLS handshake failed")
 		return fail(fmt.Errorf("dtls handshake: %w", err))
 	}
 	lg.Debug().Msg("relay dtls handshake complete")

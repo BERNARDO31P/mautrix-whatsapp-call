@@ -1,6 +1,9 @@
 package meowcaller
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // awaitRelayConnection transfers ownership only to an active waiter. A late
 // result is disposed by the producer, even if the underlying dial ignores
@@ -37,4 +40,16 @@ func awaitRelayConnection[T any](ctx context.Context, connect func() (T, error),
 	case <-ctx.Done():
 		return zero, ctx.Err()
 	}
+}
+
+// Direct relay attempts share a 24-second budget. Keep the original maximum
+// for a single candidate (and the authoritative group relay), but leave time
+// for the last direct candidate before the provider's call timeout.
+func relayAttemptTimeout(candidateCount int) time.Duration {
+	const maximum = 12 * time.Second
+	const budget = 24 * time.Second
+	if candidateCount <= 2 {
+		return maximum
+	}
+	return budget / time.Duration(candidateCount)
 }

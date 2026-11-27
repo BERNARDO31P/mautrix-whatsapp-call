@@ -204,12 +204,12 @@ func TestAuthorizedPickupDoesNotWaitForRemoteMute(t *testing.T) {
 }
 
 func TestDirectRelaySetupCandidatesRemainBoundedAndPreserveFNA(t *testing.T) {
-	rd := &relayData{endpoints: []relayEndpoint{
-		{relayName: "first", tokenID: 1},
-		{relayName: "second", tokenID: 0},
-		{relayName: "third", tokenID: 2},
-		{relayName: "fourth", tokenID: 3},
-		{relayName: "fna", isFNA: true, tokenID: 4},
+	endpoint := func(name string, token uint32, fna bool) relayEndpoint {
+		return relayEndpoint{relayName: name, tokenID: token, isFNA: fna,
+			addresses: []relayAddress{{ipv4: "192.0.2.1", port: 3478}}}
+	}
+	rd := &relayData{relayKeyASCII: []byte("key"), relayTokens: [][]byte{{1}, {2}, {3}, {4}, {5}}, endpoints: []relayEndpoint{
+		endpoint("first", 1, false), endpoint("second", 0, false), endpoint("third", 2, false), endpoint("fourth", 3, false), endpoint("fna", 4, true),
 	}}
 	out := mediaRelayCandidates(rd, false, false)
 	if len(out) != 3 || out[0].tokenID != 1 || out[1].tokenID != 0 || out[2].tokenID != 2 {
@@ -222,5 +222,19 @@ func TestDirectRelaySetupCandidatesRemainBoundedAndPreserveFNA(t *testing.T) {
 	group := mediaRelayCandidates(rd, false, true)
 	if len(group) != 1 || group[0] != out[0] {
 		t.Fatal("group relay selection was changed")
+	}
+	// Invalid preferred and subsequent candidates do not exhaust retry budget.
+	rd.endpoints[0].tokenID = 99
+	rd.endpoints[1].addresses[0].port = 0
+	out = mediaRelayCandidates(rd, false, false)
+	if len(out) != 2 || out[0].tokenID != 2 || out[1].tokenID != 3 {
+		t.Fatal("unusable endpoints consumed direct relay attempts")
+	}
+	rd.endpoints[4].tokenID = 99
+	if len(mediaRelayCandidates(rd, true, false)) != 0 {
+		t.Fatal("invalid FNA allocation fell back to unrelated non-FNA relay")
+	}
+	if len(mediaRelayCandidates(nil, false, false)) != 0 {
+		t.Fatal("nil relay produced candidates")
 	}
 }

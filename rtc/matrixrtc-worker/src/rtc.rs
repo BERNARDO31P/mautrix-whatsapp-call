@@ -103,6 +103,7 @@ struct Ghost {
     _sync: SyncService,
     identity: IdentityFence,
     outbox: Outbox,
+    journal: Arc<crate::legacy_leave::Journal>,
     // Held for the lifetime of the cached SDK client and its sync service.
     _ownership: (std::fs::File, std::fs::File),
 }
@@ -398,7 +399,8 @@ impl Accounts {
             }
             let sync=SyncService::builder(client.clone()).build().await.map_err(io::Error::other)?;
             sync.start().await;
-            Ok::<_,io::Error>(Arc::new(Ghost { client, _sync:sync, identity: IdentityFence::new(folder.clone(), identity), outbox: Outbox::with_legacy_journal(Arc::new(crate::legacy_leave::Journal::new(folder.clone())?)), _ownership: ownership }))
+            let journal = Arc::new(crate::legacy_leave::Journal::new(folder.clone())?);
+            Ok::<_,io::Error>(Arc::new(Ghost { client, _sync:sync, identity: IdentityFence::new(folder.clone(), identity), outbox: Outbox::with_legacy_journal(journal.clone()), journal, _ownership: ownership }))
         }).await?;
         ghost.identity.check().await?;
         Ok(ghost.clone())
@@ -494,6 +496,16 @@ async fn synced_room(incoming: &Message, accounts: &Accounts) -> io::Result<(Arc
     require_membership_support(&ghost.client, membership_format(incoming)?).await?;
     let room=wait_room(incoming,&ghost).await?;
     validate_room(incoming,&room).await?;
+    if membership_format(incoming)?.reads_state_membership() {
+        use matrix_rtc_core::{MatrixBackend, CommandError, compat::RoomStateDialect};
+        let backend = SdkMatrixBackend::new(ghost.client.clone());
+        let key = RoomStateDialect::new(backend.own_user_id(), backend.own_device_id(), incoming.room_id.clone(), incoming.slot_id.clone()).state_key();
+        tokio::time::timeout(Duration::from_secs(25), ghost.outbox.reconcile_legacy(&incoming.room_id, &key, || async {
+            ghost.identity.check().await.map_err(|err| CommandError::ClientRejected(err.to_string()))?;
+            ghost.journal.recover_known(&ghost.client, &incoming.room_id, &incoming.slot_id).await
+                .map_err(|err| CommandError::ClientRejected(format!("membership reconciliation failed: {err}")))
+        })).await.map_err(|_| error("membership reconciliation timed out"))?.map_err(io::Error::other)?;
+    }
     Ok((ghost,room))
 }
 
@@ -950,6 +962,9 @@ async fn run_incoming(incoming: &Message, reader: &mut protocol::FrameReader<Rea
     },Some(join_deadline(tokio::time::Instant::now(), answer_deadline)),ghost.outbox.clone()).await.map_err(io::Error::other)?;
     let result = connected_session(incoming, reader, writer, &mut call, &room, &ghost.identity, &admission, accounts, recipients, None, None, None, answer_deadline).await;
     let leave_result = call.leave().await;
+    if let Err(ref err) = leave_result {
+        eprintln!("RTC call cleanup failed: {err}");
+    }
     if result.is_ok() { leave_result.map_err(io::Error::other)?; }
     result
     }.await;
@@ -1108,6 +1123,9 @@ async fn run_outgoing(incoming: &Message, reader: &mut protocol::FrameReader<Rea
     },Some(join_deadline(tokio::time::Instant::now(), answer_deadline)),ghost.outbox.clone()).await.map_err(io::Error::other)?;
     let result = connected_session(incoming, reader, writer, &mut call, &room, &ghost.identity, &admission, accounts, recipients, Some(pin), wa_audio, wa_video, answer_deadline).await;
     let leave_result = call.leave().await;
+    if let Err(ref err) = leave_result {
+        eprintln!("RTC call cleanup failed: {err}");
+    }
     if result.is_ok() { leave_result.map_err(io::Error::other)?; }
     result
 }

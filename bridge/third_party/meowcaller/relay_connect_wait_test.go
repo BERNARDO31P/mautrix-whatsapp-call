@@ -70,3 +70,16 @@ func TestRelayConnectAlreadyCancelled(t *testing.T) {
 		t.Fatalf("called=%v, err=%v", called, err)
 	}
 }
+
+func TestRelayAttemptTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		count int
+		want  time.Duration
+	}{
+		{0, 12 * time.Second}, {1, 12 * time.Second}, {2, 12 * time.Second}, {3, 8 * time.Second},
+	} {
+		if got := relayAttemptTimeout(tc.count); got != tc.want {
+			t.Errorf("%d candidates: got %s, want %s", tc.count, got, tc.want)
+		}
+	}
+}
