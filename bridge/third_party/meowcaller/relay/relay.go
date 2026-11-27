@@ -97,6 +97,12 @@ func (c *RelayMediaChannel) BindLifetime(ctx context.Context) {
 	c.stopLifetime = c.WatchCancellation(ctx)
 }
 
+// Abort interrupts the underlying transport before closing a failed setup.
+func (c *RelayMediaChannel) Abort() error {
+	_ = c.udp.Close()
+	return c.Close()
+}
+
 // Close tears down the media stack in reverse order of construction.
 func (c *RelayMediaChannel) Close() error {
 	if c.stopLifetime != nil {
@@ -215,10 +221,9 @@ func ConnectRelayMediaContext(ctx context.Context, relayAddr *net.UDPAddr, opts 
 	lg.Debug().Str("relay_addr", relayAddr.String()).Msg("connecting relay media stack")
 	// Roll back already-allocated resources if a later step fails.
 	var cleanup []func() error
+	var abortSocket func() error
 	fail := func(err error) (*RelayMediaChannel, error) {
-		for i := len(cleanup) - 1; i >= 0; i-- {
-			_ = cleanup[i]()
-		}
+		abortFailedSetup(abortSocket, cleanup)
 		lg.Debug().Err(err).Msg("relay media connect failed")
 		return nil, &CallTransportError{Op: "connect", Err: err}
 	}
@@ -233,7 +238,7 @@ func ConnectRelayMediaContext(ctx context.Context, relayAddr *net.UDPAddr, opts 
 		lg.Debug().Err(err).Msg("relay media connect failed")
 		return nil, &CallTransportError{Op: "connect", Err: fmt.Errorf("bind udp: %w", err)}
 	}
-	cleanup = append(cleanup, udp.Close)
+	abortSocket = udp.Close
 	stopSetup := watchSetupCancellation(ctx, udp)
 	defer stopSetup()
 	lg.Debug().Str("local_addr", udp.LocalAddr().String()).Msg("relay udp socket bound")

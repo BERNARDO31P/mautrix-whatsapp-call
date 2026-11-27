@@ -2,7 +2,9 @@ package relay
 
 import (
 	"context"
+	"errors"
 	"net"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -85,4 +87,43 @@ func TestSetupAndCallCancellationHaveSeparateLifetimes(t *testing.T) {
 	if stopCall() {
 		t.Fatal("call watcher incorrectly reported disarmed")
 	}
+}
+
+func TestAbortFailedSetupInterruptsIOBeforeProtocolCleanup(t *testing.T) {
+	socket, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	var order []string
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		abortFailedSetup(func() error {
+			order = append(order, "socket")
+			return socket.Close()
+		}, []func() error{
+			func() error { order = append(order, "dtls"); return nil },
+			func() error {
+				_, _, err := socket.ReadFromUDP(make([]byte, 1))
+				if !errors.Is(err, net.ErrClosed) {
+					t.Errorf("read error = %v", err)
+				}
+				order = append(order, "sctp")
+				return errors.New("protocol cleanup failed")
+			},
+		})
+	}()
+	select {
+	case <-done:
+		if !reflect.DeepEqual(order, []string{"socket", "sctp", "dtls"}) {
+			t.Fatalf("cleanup order: %v", order)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("protocol cleanup blocked on socket")
+	}
+}
+
+func TestAbortFailedSetupBeforeSocketExists(t *testing.T) {
+	abortFailedSetup(nil, nil)
 }

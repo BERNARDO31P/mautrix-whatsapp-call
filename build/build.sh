@@ -188,7 +188,7 @@ if [[ "$SKIP_TESTS" == "0" ]]; then
         cd "$MEOW_SRC"
         MAUTRIX_WHATSAPP_CALL_EXPECT_OPUS_VERSION="$OPUS_VERSION" go test -p "$JOBS" -mod=readonly -tags liveopus -count=1 -v ./liveopus 2>&1 | tee "$LOG/meowcaller.log"
         grep -q "^--- PASS: TestRoundTripNegotiatedFrameLengths " "$LOG/meowcaller.log" || { echo "Native Opus regression did not execute" >&2; exit 26; }
-        go test -p "$JOBS" -mod=readonly -tags liveopus -count=1 ./rtp ./mlow ./signaling . 2>&1 | tee -a "$LOG/meowcaller.log"
+        go test -p "$JOBS" -mod=readonly -tags liveopus -count=1 ./rtp ./mlow ./signaling ./relay ./stun . 2>&1 | tee -a "$LOG/meowcaller.log"
     )
     (
         cd "$RTC_SRC"

@@ -238,3 +238,32 @@ func TestDirectRelaySetupCandidatesRemainBoundedAndPreserveFNA(t *testing.T) {
 		t.Fatal("nil relay produced candidates")
 	}
 }
+
+func TestDirectRelayCandidatesSkipDuplicateAllocations(t *testing.T) {
+	endpoint := func(name, ip string, port uint16, token uint32, fna bool) relayEndpoint {
+		return relayEndpoint{relayName: name, tokenID: token, isFNA: fna,
+			addresses: []relayAddress{{ipv4: ip, port: port}}}
+	}
+	rd := &relayData{relayKeyASCII: []byte("key"), relayTokens: [][]byte{{1}, {2}}, endpoints: []relayEndpoint{
+		endpoint("first", "192.0.2.1", 3478, 0, false),
+		endpoint("duplicate", "192.0.2.1", 3478, 0, false),
+		endpoint("duplicate again", "192.0.2.1", 3478, 0, false),
+		endpoint("different token", "192.0.2.1", 3478, 1, false),
+		endpoint("different port", "192.0.2.1", 3480, 0, false),
+		endpoint("fna", "192.0.2.2", 3478, 0, true),
+		endpoint("fna duplicate", "192.0.2.2", 3478, 0, true),
+		endpoint("fna alternate", "192.0.2.3", 3478, 0, true),
+	}}
+	out := mediaRelayCandidates(rd, false, false)
+	if len(out) != 3 || out[0] != &rd.endpoints[0] || out[1] != &rd.endpoints[3] || out[2] != &rd.endpoints[4] {
+		t.Fatalf("duplicate allocations displaced distinct direct candidates: %v", out)
+	}
+	in := mediaRelayCandidates(rd, true, false)
+	if len(in) != 2 || in[0] != &rd.endpoints[5] || in[1] != &rd.endpoints[7] {
+		t.Fatalf("duplicate or non-FNA candidates in incoming call: %v", in)
+	}
+	group := mediaRelayCandidates(rd, true, true)
+	if len(group) != 1 || group[0] != &rd.endpoints[5] {
+		t.Fatal("group election changed")
+	}
+}
