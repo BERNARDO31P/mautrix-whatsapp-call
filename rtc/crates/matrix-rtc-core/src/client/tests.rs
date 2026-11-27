@@ -92,15 +92,20 @@ async fn a_room_feeds_itself_and_a_join_keeps_itself_alive() {
 
     room.join(join_params()).await.expect("join");
     assert_eq!(room.state().lock().await.joined_slots(), vec![SLOT]);
+    crate::tests::await_initial_restart(&mock).await;
     tokio::time::sleep(
         Duration::from_millis(crate::DEFAULT_KEEP_ALIVE_INTERVAL_MS * 2) + Duration::from_millis(1),
     )
     .await;
-    assert_eq!(mock.restarted_events.lock().unwrap().len(), 2);
+    assert_eq!(mock.restarted_events.lock().unwrap().len(), 3);
+    assert_eq!(crate::tests::restart_attempts(&mock), 3);
 
     room.leave(SLOT, LeaveSessionParams::new())
         .await
         .expect("leave");
+    tokio::time::sleep(Duration::from_millis(crate::DEFAULT_KEEP_ALIVE_INTERVAL_MS * 2)).await;
+    assert_eq!(mock.restarted_events.lock().unwrap().len(), 3);
+    assert_eq!(crate::tests::restart_attempts(&mock), 3);
 }
 
 #[tokio::test]

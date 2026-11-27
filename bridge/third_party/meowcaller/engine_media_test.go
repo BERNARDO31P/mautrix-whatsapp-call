@@ -223,3 +223,21 @@ func TestMediaSrtcpReceiverRekeysForAnsweringDevice(t *testing.T) {
 		t.Fatal("rekeyed SRTCP receiver rejected answering-device report")
 	}
 }
+
+func TestVideoSenderReportsDiscardedFrameAndRetiredProtection(t *testing.T) {
+	idr := []byte{0, 0, 0, 1, 0x65, 1, 2, 3}
+	sender := &videoSender{active: true}
+	if err := sender.send(idr, 0); err != ErrVideoFrameDropped || !sender.keyframeRequired {
+		t.Fatalf("missing relay must report a drop: %v", err)
+	}
+	pipe, err := NewMediaPipeline(iota32(), "111111111111111:0@lid", "222222222222222:0@lid", 0x55667788, FrameSamples)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender.pipe = pipe
+	sender.stream = rtp.NewVideoRtpStream(0x55667788, 4500)
+	pipe.retire()
+	if packets := sender.protectAccessUnit(idr, 0); len(packets) != 0 || !sender.keyframeRequired {
+		t.Fatal("failed protection must not clear recovery gate")
+	}
+}

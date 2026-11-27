@@ -17,35 +17,51 @@ RTC_EVENT_TYPES=(
     "org.matrix.msc4310.rtc.decline"
 )
 
-set_rtc_power_levels() {
-    local json="$1"
-    local level="$2"
-    local preserve_existing="${3:-0}"
-    local jq_program='.events = (.events // {})'
-    local event_type
-    for event_type in "${RTC_EVENT_TYPES[@]}"; do
-        # Add missing RTC permissions at PL0, but never lower an explicit
-        # administrator/bridge restriction (Note-to-Self uses PL100).
-        if [[ "$preserve_existing" == "1" ]]; then
-            jq_program+=" | .events[\"$event_type\"] = (.events[\"$event_type\"] // $level)"
-        else
-            jq_program+=" | .events[\"$event_type\"] = $level"
-        fi
-    done
-    jq -c "$jq_program" <<<"$json"
+# Keep the same event classification and restriction markers as the bridge.
+# Sticky member/slot events also use message-event authorization, so preserve
+# the stricter inherited rule when either event form is used.
+rtc_power_policy() {
+    local json="$1" mode="$2" floor="${3:-100}"
+    jq -c --arg mode "$mode" --argjson floor "$floor" \
+        --argjson types "$(printf '%s\n' "${RTC_EVENT_TYPES[@]}" | jq -R . | jq -s .)" '
+        def state_only($k): $k == "org.matrix.msc3401.call.member" or $k == "m.call.member";
+        def state_or_message($k): $k == "m.rtc.slot" or $k == "org.matrix.msc4143.rtc.slot" or $k == "m.rtc.member" or $k == "org.matrix.msc4143.rtc.member";
+        def inherited($k):
+            if state_only($k) then (.state_default // 50)
+            elif state_or_message($k) then ([.state_default // 50, .events_default // 0] | max)
+            else (.events_default // 0) end;
+        reduce $types[] as $key (.;
+            ("org.mautrix.whatsapp.rtc.previous." + $key) as $previous |
+            ("org.mautrix.whatsapp.rtc.inherited." + $key) as $inherited |
+            (inherited($key)) as $default |
+            ((.events // {}) | has($key)) as $explicit |
+            (if $explicit then .events[$key] else $default end) as $effective |
+            if $mode == "enable" then
+                # Migration deliberately enables ordinary legacy portals, but
+                # never overrides custom inherited defaults or managed restrictions.
+                if ($explicit | not) and ((.events // {}) | (has($previous) or has($inherited)) | not)
+                    and (if state_only($key) then (.state_default // 50) == 50
+                         elif state_or_message($key) then (.state_default // 50) == 50 and (.events_default // 0) == 0
+                         else (.events_default // 0) == 0 end)
+                then .events[$key] = 0 else . end
+            elif $mode == "restrict" and $effective < $floor then
+                if $explicit then
+                    .events[$previous] = $effective | del(.events[$inherited])
+                else
+                    .events[$inherited] = 0 | del(.events[$previous])
+                end | .events[$key] = $floor
+            elif $mode == "control" and $effective < $floor then
+                .events[$key] = $floor
+            else . end)
+    ' <<<"$json"
 }
 
 merge_power_levels() {
-    set_rtc_power_levels "$1" 0 1
+    rtc_power_policy "$1" enable
 }
 
 restrict_power_levels() {
-    # Preserve any explicit stronger rule and remember what this installer changed.
-    jq -c --argjson types "$(printf '%s\n' "${RTC_EVENT_TYPES[@]}" | jq -R . | jq -s .)" '
-        .events //= {} | reduce $types[] as $key (.;
-        if (.events[$key] // 0)<100 then
-            .events["org.mautrix.whatsapp.rtc.previous."+$key]=(.events[$key] // 0) | .events[$key]=100
-        else . end)' <<<"$1"
+    rtc_power_policy "$1" restrict
 }
 
 bot_control_levels() {
@@ -62,7 +78,7 @@ restrict_bot_control_power_levels() {
     local json="$1"
     local human="$2"
     local bot="$3"
-    local levels human_level bot_level jq_program event_type
+    local levels human_level bot_level
 
     levels="$(bot_control_levels "$json" "$human" "$bot")"
     human_level="$(jq -r '.human' <<<"$levels")"
@@ -73,46 +89,8 @@ restrict_bot_control_power_levels() {
         return 0
     fi
 
-    # The bot already outranks the human. Require at least the bot's existing
-    # level for every RTC event, while preserving any stronger restriction.
-    jq_program='.events = (.events // {})'
-    for event_type in "${RTC_EVENT_TYPES[@]}"; do
-        jq_program+=" | .events[\"$event_type\"] = ([((.events[\"$event_type\"] // 0) | tonumber), $bot_level] | max)"
-    done
-    jq -c "$jq_program" <<<"$json"
-}
-
-transfer_bot_control_power_to_bot() {
-    local json="$1"
-    local human="$2"
-    local bot="$3"
-    local levels human_level bot_level target_level new_human_level jq_program event_type
-
-    levels="$(bot_control_levels "$json" "$human" "$bot")"
-    human_level="$(jq -r '.human' <<<"$levels")"
-    bot_level="$(jq -r '.bot' <<<"$levels")"
-    (( human_level > 0 )) || { printf '%s\n' "$json"; return 0; }
-
-    target_level="$human_level"
-    if (( bot_level > target_level )); then
-        target_level="$bot_level"
-    fi
-    new_human_level=$((target_level - 1))
-
-    # This event is sent as the human through the local double-puppet
-    # appservice. Matrix auth allows a sender to lower its own PL and to raise
-    # another user no higher than the sender's current PL. For a 100/100 legacy
-    # room this becomes human=99, bot=100, RTC=100 in one authorised event.
-    jq_program='.users = (.users // {})'
-    jq_program+=" | .users[\"$human\"] = $new_human_level"
-    if (( bot_level < target_level )); then
-        jq_program+=" | .users[\"$bot\"] = $target_level"
-    fi
-    jq_program+=' | .events = (.events // {})'
-    for event_type in "${RTC_EVENT_TYPES[@]}"; do
-        jq_program+=" | .events[\"$event_type\"] = ([((.events[\"$event_type\"] // 0) | tonumber), $target_level] | max)"
-    done
-    jq -c "$jq_program" <<<"$json"
+    # Preserve stronger explicit and inherited restrictions.
+    rtc_power_policy "$json" control "$bot_level"
 }
 
 merge_direct_mapping() {
@@ -161,14 +139,7 @@ select_candidate() {
 # The protocol and channel come from the bridge info it published for its portal.
 # Fail closed on ambiguous or foreign bridge metadata. A group can have one remaining ghost.
 portal_kind() {
-    jq -r --arg bot "$2" --argjson ghosts "$3" '
-      [ .[] | select(.type=="m.bridge" or .type=="uk.half-shot.bridge") ] as $all
-      | [$all[] | . as $e | select(.content.bridgebot==$bot and .content.protocol.id=="whatsapp"
-          and (.sender==$bot or any($ghosts[]; . as $r | $e.sender|test($r))))
-          | .content | if (.channel.id|endswith("@g.us")) then "group"
-            elif (.["com.beeper.room_type.v2"] // .["com.beeper.room_type"])=="dm" and
-                 (.channel.id|test("@(s\\.whatsapp\\.net|lid|hosted|hosted\\.lid|bot)$")) then "dm" else "other" end] | unique
-      | if length==1 then .[0] elif ($all|length)==0 then "none" else "other" end' <<<"$1"
+    python3 -B "$(dirname "${BASH_SOURCE[0]}")/worker/portal_kind.py" "$2" "$3" <<<"$1"
 }
 
 select_group_candidate() {
@@ -228,6 +199,12 @@ run_self_test() {
     [[ "$(portal_kind "$input_kind" "$b" '[]')" == dm ]]
     [[ "$(portal_kind "$(jq -c '.[0].sender="@foreign:example.org"' <<<"$state")" "$b" '[]')" == other ]]
     [[ "$(portal_kind '[]' "$b" '[]')" == none ]]
+    local mixed
+    mixed="$(jq -c '. + [.[0] | .sender="@foreign:example.org"]' <<<"$input_kind")"
+    [[ "$(portal_kind "$mixed" "$b" '[]')" == other ]]
+    mixed="$(jq -c '. + [.[0] | .type="uk.half-shot.bridge"]' <<<"$input_kind")"
+    [[ "$(portal_kind "$mixed" "$b" '[]')" == dm ]]
+
     local input='{"users":{"@whatsappbot:example.org":100},"users_default":0,"events_default":0,"state_default":50,"events":{"m.room.name":0}}'
     local merged
     merged="$(merge_power_levels "$input")"
@@ -252,24 +229,45 @@ run_self_test() {
     restricted="$(merge_power_levels "$restricted")"
     jq -e '.events["m.rtc.slot"] == 100 and .events["m.rtc.invite"] == 50 and .events["m.rtc.member"] == 0' <<<"$restricted" >/dev/null
 
+    local custom='{"state_default":75,"events_default":40,"events":{"m.room.name":5}}'
+    local custom_after
+    custom_after="$(merge_power_levels "$custom")"
+    jq -e --argjson before "$custom" '. == $before' <<<"$custom_after" >/dev/null
+    local mixed_defaults='{"state_default":50,"events_default":60,"events":{}}'
+    jq -e '.events == {"org.matrix.msc3401.call.member":0,"m.call.member":0}' \
+        <<<"$(merge_power_levels "$mixed_defaults")" >/dev/null
+    local high='{"state_default":120,"events_default":110,"events":{}}'
+    jq -e --argjson before "$high" '. == $before' <<<"$(restrict_power_levels "$high")" >/dev/null
+    local owned='{"state_default":75,"events_default":40,"events":{"m.rtc.invite":12,"m.room.name":5}}'
+    local owned_after
+    owned_after="$(restrict_power_levels "$owned")"
+    jq -e '
+        .events["m.rtc.member"] == 100 and
+        .events["org.mautrix.whatsapp.rtc.inherited.m.rtc.member"] == 0 and
+        (.events | has("org.mautrix.whatsapp.rtc.previous.m.rtc.member") | not) and
+        .events["m.rtc.invite"] == 100 and
+        .events["org.mautrix.whatsapp.rtc.previous.m.rtc.invite"] == 12 and
+        (.events | has("org.mautrix.whatsapp.rtc.inherited.m.rtc.invite") | not) and
+        .events["m.room.name"] == 5 and .state_default == 75 and .events_default == 40
+    ' <<<"$owned_after" >/dev/null
+    jq -e --argjson before "$owned_after" '. == $before' <<<"$(restrict_power_levels "$owned_after")" >/dev/null
+    jq -e --argjson before "$owned_after" '. == $before' <<<"$(merge_power_levels "$owned_after")" >/dev/null
+    local stale_marker='{"events":{"org.mautrix.whatsapp.rtc.previous.m.rtc.slot":25}}'
+    jq -e '.events | has("m.rtc.slot") | not' <<<"$(merge_power_levels "$stale_marker")" >/dev/null
+    local control_high='{"users":{"@human:example.org":20,"@bot:example.org":100},"state_default":150,"events_default":120,"events":{}}'
+    jq -e --argjson before "$control_high" '. == $before' \
+        <<<"$(restrict_bot_control_power_levels "$control_high" "@human:example.org" "@bot:example.org")" >/dev/null
+
     local tied_admin='{"users":{"@bernardo:example.org":100,"@whatsappbot:example.org":100},"users_default":0,"events":{"m.rtc.slot":100,"m.rtc.invite":100}}'
     local tied_after
     tied_after="$(restrict_bot_control_power_levels "$tied_admin" '@bernardo:example.org' '@whatsappbot:example.org')"
     jq -e --argjson before "$tied_admin" '. == $before' <<<"$tied_after" >/dev/null
-    tied_after="$(transfer_bot_control_power_to_bot "$tied_admin" '@bernardo:example.org' '@whatsappbot:example.org')"
-    jq -e '
-        .users["@bernardo:example.org"] == 99 and
-        .users["@whatsappbot:example.org"] == 100 and
-        .events["m.rtc.slot"] == 100 and
-        .events["m.rtc.invite"] == 100 and
-        .events["m.rtc.decline"] == 100
-    ' <<<"$tied_after" >/dev/null
+    local human_above='{"users":{"@human:example.org":100,"@whatsappbot:example.org":50},"users_default":0,"events":{"m.room.name":75}}'
+    local human_after
+    human_after="$(restrict_bot_control_power_levels "$human_above" '@human:example.org' '@whatsappbot:example.org')"
+    jq -e --argjson before "$human_above" '. == $before' <<<"$human_after" >/dev/null
 
-    local human_above='{"users":{"@bernardo:example.org":100,"@whatsappbot:example.org":50},"users_default":0,"events":{}}'
-    human_above="$(transfer_bot_control_power_to_bot "$human_above" '@bernardo:example.org' '@whatsappbot:example.org')"
-    jq -e '.users["@bernardo:example.org"] == 99 and .users["@whatsappbot:example.org"] == 100 and .events["m.rtc.slot"] == 100' <<<"$human_above" >/dev/null
-
-    local elevated_bot='{"users":{"@bernardo:example.org":75,"@whatsappbot:example.org":9001},"users_default":0,"events":{"m.rtc.slot":100,"m.rtc.invite":9500}}'
+    local elevated_bot='{"users":{"@bernardo:example.org":75,"@whatsappbot:example.org":9001},"users_default":0,"events":{"m.rtc.slot":100,"m.rtc.invite":9500,"m.room.name":42},"state_default":50,"invite":70}'
     elevated_bot="$(restrict_bot_control_power_levels "$elevated_bot" '@bernardo:example.org' '@whatsappbot:example.org')"
     jq -e '
         .users["@bernardo:example.org"] == 75 and
@@ -277,7 +275,8 @@ run_self_test() {
         .events["m.rtc.slot"] == 9001 and
         .events["m.rtc.invite"] == 9500 and
         .events["m.rtc.member"] == 9001 and
-        .events["m.rtc.decline"] == 9001
+        .events["m.rtc.decline"] == 9001 and
+        .events["m.room.name"] == 42 and .state_default == 50 and .invite == 70
     ' <<<"$elevated_bot" >/dev/null
 
     local default_tie='{"users_default":100,"events":{}}'
@@ -387,7 +386,6 @@ UNCHANGED=0
 GROUP_ELIGIBLE=0
 BOT_CONTROL_RESTRICTED=0
 BOT_CONTROL_RUNTIME_ONLY=0
-BOT_CONTROL_HUMAN_TRANSFER=0
 
 while IFS= read -r ROOM; do
     [[ -n "$ROOM" ]] || continue
@@ -431,36 +429,8 @@ while IFS= read -r ROOM; do
                         BOT_CONTROL_RUNTIME_ONLY=$((BOT_CONTROL_RUNTIME_ONLY + 1))
                     fi
                 fi
-            elif (( HUMAN_LEVEL > 0 )); then
-                # Equal/lower bot PL legacy rooms can be fixed by sending one
-                # power-level event as the human through the double-puppet AS:
-                # elevate/retain the bot at the old human level, lower only the
-                # human's own PL by one, and require that level for RTC events.
-                HUMAN_ESC="$(jq -rn --arg v "$HUMAN" '$v|@uri')"
-                DP_QUERY="user_id=$HUMAN_ESC"
-                DP_WHOAMI_WITH_CODE="$(curl -sS -w '\n%{http_code}' "${DP_AUTH[@]}" "$HS/_matrix/client/v3/account/whoami?$DP_QUERY" 2>/dev/null || true)"
-                DP_WHOAMI_CODE="${DP_WHOAMI_WITH_CODE##*$'\n'}"
-                DP_WHOAMI_BODY="${DP_WHOAMI_WITH_CODE%$'\n'*}"
-                DP_ACTUAL="$(jq -r '.user_id // empty' <<<"$DP_WHOAMI_BODY" 2>/dev/null || true)"
-                if [[ "$DP_WHOAMI_CODE" == "200" && "$DP_ACTUAL" == "$HUMAN" ]]; then
-                    UPDATED="$(transfer_bot_control_power_to_bot "$POWER" "$HUMAN" "$BOT_MXID")"
-                    PUT_WITH_CODE="$(curl -sS -w '\n%{http_code}' -X PUT "${DP_AUTH[@]}" -H "Content-Type: application/json" --data "$UPDATED" \
-                        "$HS/_matrix/client/v3/rooms/$ROOM_ESC/state/m.room.power_levels/?$DP_QUERY" 2>/dev/null || true)"
-                    PUT_CODE="${PUT_WITH_CODE##*$'\n'}"
-                    if [[ "$PUT_CODE" == "200" ]]; then
-                        NEW_LEVELS="$(bot_control_levels "$UPDATED" "$HUMAN" "$BOT_MXID")"
-                        echo "RTC disabled for legacy WhatsApp bridge-bot control room via human self-demotion: $ROOM (human_pl=$(jq -r '.human' <<<"$NEW_LEVELS") bot_pl=$(jq -r '.bot' <<<"$NEW_LEVELS"))"
-                        BOT_CONTROL_HUMAN_TRANSFER=$((BOT_CONTROL_HUMAN_TRANSFER + 1))
-                    else
-                        echo "RTC UI restriction unavailable for legacy WhatsApp bridge-bot control room: $ROOM (human_pl=$HUMAN_LEVEL bot_pl=$BOT_LEVEL HTTP=$PUT_CODE); runtime decline remains active" >&2
-                        BOT_CONTROL_RUNTIME_ONLY=$((BOT_CONTROL_RUNTIME_ONLY + 1))
-                    fi
-                else
-                    echo "RTC UI restriction unavailable for legacy WhatsApp bridge-bot control room: $ROOM (double-puppet impersonation failed HTTP=$DP_WHOAMI_CODE); runtime decline remains active" >&2
-                    BOT_CONTROL_RUNTIME_ONLY=$((BOT_CONTROL_RUNTIME_ONLY + 1))
-                fi
             else
-                echo "RTC UI restriction unavailable for legacy WhatsApp bridge-bot control room: $ROOM (human_pl=$HUMAN_LEVEL bot_pl=$BOT_LEVEL); runtime decline remains active" >&2
+                echo "RTC UI restriction would require changing room ownership: $ROOM (human_pl=$HUMAN_LEVEL bot_pl=$BOT_LEVEL); runtime decline remains active" >&2
                 BOT_CONTROL_RUNTIME_ONLY=$((BOT_CONTROL_RUNTIME_ONLY + 1))
             fi
         fi
@@ -583,7 +553,7 @@ if [[ -s "$MAP_FILE" ]]; then
     done < <(cut -f1 "$MAP_FILE" | sort -u)
 fi
 
-echo "WhatsApp RTC migration complete: scanned=$SCANNED eligible=$ELIGIBLE groups=$GROUP_ELIGIBLE bot_control_restricted=$BOT_CONTROL_RESTRICTED bot_control_human_transfer=$BOT_CONTROL_HUMAN_TRANSFER bot_control_runtime_only=$BOT_CONTROL_RUNTIME_ONLY unencrypted_legacy_dms=$UNENCRYPTED_DMS power_changed=$CHANGED power_unchanged=$UNCHANGED direct_users=$DIRECT_USERS direct_changed=$DIRECT_CHANGED direct_mappings=$DIRECT_MAPPINGS"
+echo "WhatsApp RTC migration complete: scanned=$SCANNED eligible=$ELIGIBLE groups=$GROUP_ELIGIBLE bot_control_restricted=$BOT_CONTROL_RESTRICTED bot_control_runtime_only=$BOT_CONTROL_RUNTIME_ONLY unencrypted_legacy_dms=$UNENCRYPTED_DMS power_changed=$CHANGED power_unchanged=$UNCHANGED direct_users=$DIRECT_USERS direct_changed=$DIRECT_CHANGED direct_mappings=$DIRECT_MAPPINGS"
 
 case "${MATRIXRTC_FAIL_ON_UNENCRYPTED_DMS:-0}" in
     1|true|TRUE|yes|YES) STRICT_UNENCRYPTED=1 ;;

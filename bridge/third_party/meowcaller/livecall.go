@@ -2,6 +2,7 @@ package meowcaller
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -16,41 +17,47 @@ type Call struct {
 	id   string
 	peer types.JID
 
-	mu                        sync.Mutex
-	phase                     CallPhase
-	player                    *Player
-	sink                      AudioSink
-	onReady                   func()
-	mediaReady                bool
-	onEnd                     func(reason string)
-	terminalReason            string
-	onState                   func(CallPhase)
-	onPeerAccept              func()
-	peerAccepted              bool
-	acceptNotified            bool
-	onMuteState               func(muted bool)
-	lastMute                  *bool
-	lastVideoState            *VideoState
-	muteVersion, videoVersion uint64
-	videoSink                 VideoSink
-	onVideoState              func(VideoState)
-	onVideoKeyframeRequest    func()
-	onParticipantVideoFrame   func(ParticipantVideoFrame)
-	onReaction                func(CallReaction)
-	groupState                *GroupCallState
-	onGroupState              func(GroupCallState)
-	groupCallbackGeneration   uint64
-	waitingRoomState          *WaitingRoomState
-	onWaitingRoomState        func(WaitingRoomState)
-	waitingRoomGeneration     uint64
-	waitingCallbackGeneration uint64
-	notifyMu                  sync.Mutex
-	notifyRunning             bool
-	notifyQueue               []func()
-	onHandRaise               func(HandRaiseState)
-	handRaises                map[types.JID]bool
-	onScreenShare             func(ScreenShareState)
-	screenShares              map[types.JID]ScreenShareState
+	mu                                              sync.Mutex
+	phase                                           CallPhase
+	player                                          *Player
+	sink                                            AudioSink
+	onReady                                         func()
+	mediaReady                                      bool
+	onEnd                                           func(reason string)
+	terminalReason                                  string
+	onState                                         func(CallPhase)
+	onPeerAccept                                    func()
+	peerAccepted                                    bool
+	acceptNotified                                  bool
+	onMuteState                                     func(muted bool)
+	lastMute                                        *bool
+	lastVideoState                                  *VideoState
+	muteCallbackGeneration, videoCallbackGeneration uint64
+	videoSink                                       VideoSink
+	onVideoState                                    func(VideoState)
+	onVideoKeyframeRequest                          func()
+	onParticipantVideoFrame                         func(ParticipantVideoFrame)
+	onParticipantAudioFrame                         func(ParticipantAudioFrame)
+	participantEpochMu                              sync.Mutex
+	participantEpoch                                ParticipantMediaEpoch
+	onParticipantMediaEpoch                         func(ParticipantMediaEpoch)
+	onReaction                                      func(CallReaction)
+	groupState                                      *GroupCallState
+	onGroupState                                    func(GroupCallState)
+	groupCallbackGeneration                         uint64
+	waitingRoomState                                *WaitingRoomState
+	onWaitingRoomState                              func(WaitingRoomState)
+	waitingRoomGeneration                           uint64
+	waitingControlGeneration                        uint64
+	waitingCallbackGeneration                       uint64
+	notifyMu                                        sync.Mutex
+	notifyRunning                                   bool
+	notifyQueue                                     []func()
+	onHandRaise                                     func(HandRaiseState)
+	handRaises                                      map[types.JID]bool
+	onScreenShare                                   func(ScreenShareState)
+	screenShares                                    map[types.JID]ScreenShareState
+	screenRoleRevisions                             map[types.JID]uint64
 }
 
 // GroupCallState is a sanitized group-call roster. Transaction zero may contain
@@ -58,6 +65,8 @@ type Call struct {
 type GroupCallState struct {
 	GroupJID       types.JID
 	TransactionID  uint32
+	HandRevision   uint64 // local snapshot sequence, advances on roster and hand changes
+	MediaRevision  uint64 // advances on roster and observed device media changes
 	RekeyRequested bool
 	Participants   []GroupCallParticipant
 }
@@ -77,6 +86,24 @@ type GroupCallDevice struct {
 	Platform string
 	PID      uint32
 	HasPID   bool
+	Media    GroupDeviceMediaState
+}
+
+// ParticipantAudioFrame is decoded, authenticated audio attributed to a WhatsApp
+// participant device before mixing. PCM is owned by the callback and may be retained.
+// Timestamp uses RTPClockRate, while PCM uses SampleRate (mono float32).
+type ParticipantAudioFrame struct {
+	Epoch         ParticipantMediaEpoch
+	ParticipantID string
+	Sender        types.JID
+	Device        types.JID
+	PID           uint32
+	HasPID        bool
+	SSRC          uint32
+	Timestamp     uint32
+	RTPClockRate  uint32
+	SampleRate    uint32
+	PCM           []float32
 }
 
 // CallReaction is a transient emoji reaction received over the call's RTC app-data stream.
@@ -113,9 +140,14 @@ type HandRaiseState struct {
 	Raised      bool
 }
 
-// ScreenShareState is one participant's independent screen-share state.
+// ScreenShareState is one participant's source-role signalling state. It does not advertise a second video stream.
 type ScreenShareState struct {
-	Participant      types.JID
+	Participant types.JID
+	// Device/PID are bound to the authoritative roster when the control arrives.
+	// An empty device means the signal is participant-level only.
+	Device           types.JID
+	PID              uint32
+	HasPID           bool
 	Active           bool
 	Version          uint32
 	ScreenShareID    uint32
@@ -149,6 +181,85 @@ func (c *Call) GroupState() (GroupCallState, bool) {
 		return GroupCallState{}, false
 	}
 	return cloneGroupCallState(*c.groupState), true
+}
+
+// GroupVideoRoles snapshots the roster and active screen shares under the
+// same lock. Explicit device controls are bound to their exact roster device.
+// Participant-only controls are bound only if the roster has exactly one device.
+type GroupVideoRole struct {
+	ScreenShare bool
+	Revision    uint64
+}
+
+func (c *Call) screenRoleRevisionLocked(key types.JID) uint64 {
+	if rev := c.screenRoleRevisions[key]; rev != 0 {
+		return rev
+	}
+	return 1
+}
+
+func (c *Call) advanceScreenRoleLocked(key types.JID) {
+	if c.screenRoleRevisions == nil {
+		c.screenRoleRevisions = make(map[types.JID]uint64)
+	}
+	c.screenRoleRevisions[key] = c.screenRoleRevisionLocked(key) + 1
+}
+
+// Resolve an explicit device or a unique participant-only device. Do not use
+// screen-share IDs as PIDs: they are unrelated signalling identifiers.
+func screenShareDevice(group *GroupCallState, key, requested types.JID) (GroupCallDevice, bool) {
+	if !connectedHandParticipant(group, key) {
+		return GroupCallDevice{}, false
+	}
+	for _, participant := range group.Participants {
+		if participant.JID.ToNonAD() != key {
+			continue
+		}
+		if requested.IsEmpty() && len(participant.Devices) != 1 {
+			return GroupCallDevice{}, false
+		}
+		var selected GroupCallDevice
+		count := 0
+		for _, d := range participant.Devices {
+			if !requested.IsEmpty() && d.JID != requested {
+				continue
+			}
+			if d.JID.IsEmpty() || !d.HasPID {
+				continue
+			}
+			selected = d
+			count++
+		}
+		return selected, count == 1
+	}
+	return GroupCallDevice{}, false
+}
+
+func screenShareBindingCurrent(group *GroupCallState, key types.JID, share ScreenShareState) bool {
+	if !share.HasPID || share.Device.IsEmpty() {
+		return false
+	}
+	d, ok := screenShareDevice(group, key, share.Device)
+	return ok && d.PID == share.PID
+}
+
+func (c *Call) GroupVideoRoles() (GroupCallState, map[string]GroupVideoRole, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.groupState == nil || c.phase == CallPhaseEnded {
+		return GroupCallState{}, nil, false
+	}
+	roles := make(map[string]GroupVideoRole)
+	for _, participant := range c.groupState.Participants {
+		if participant.State != "connected" {
+			continue
+		}
+		share, exists := c.screenShares[participant.JID.ToNonAD()]
+		for _, device := range participant.Devices {
+			roles[device.JID.String()] = GroupVideoRole{ScreenShare: exists && share.Active && share.HasPID && device.HasPID && share.Device == device.JID && share.PID == device.PID, Revision: c.screenRoleRevisionLocked(participant.JID.ToNonAD())}
+		}
+	}
+	return cloneGroupCallState(*c.groupState), roles, true
 }
 
 // OnGroupState registers a callback for group-call roster state. The latest
@@ -191,12 +302,45 @@ func (c *Call) setGroupState(state GroupCallState) {
 		c.mu.Unlock()
 		return
 	}
+	// A hand belongs to one continuous connected roster presence. Discard it
+	// on departure, disconnection, ambiguous identity, or the first authoritative roster.
+	if stored.TransactionID != 0 {
+		// Source roles cannot outlive continuous, unambiguous roster presence.
+		for key, share := range c.screenShares {
+			if !connectedHandParticipant(c.groupState, key) || !connectedHandParticipant(&stored, key) ||
+				(share.HasPID && (!screenShareBindingCurrent(c.groupState, key, share) || !screenShareBindingCurrent(&stored, key, share))) {
+				delete(c.screenShares, key)
+				c.advanceScreenRoleLocked(key)
+			}
+		}
+		for key := range c.handRaises {
+			if c.groupState == nil || c.groupState.TransactionID == 0 ||
+				!connectedHandParticipant(c.groupState, key) || !connectedHandParticipant(&stored, key) {
+				delete(c.handRaises, key)
+			}
+		}
+	}
 	for i := range stored.Participants {
-		stored.Participants[i].HandRaised = c.handRaises[stored.Participants[i].JID.ToNonAD()]
+		key := stored.Participants[i].JID.ToNonAD()
+		stored.Participants[i].HandRaised = connectedHandParticipant(&stored, key) && c.handRaises[key]
+	}
+	preserveGroupDeviceMedia(c.groupState, &stored)
+	if c.groupState != nil {
+		stored.MediaRevision = c.groupState.MediaRevision + 1
+		stored.HandRevision = c.groupState.HandRevision + 1
+	} else {
+		stored.HandRevision = 1
+		stored.MediaRevision = 1
 	}
 	c.groupState = &stored
 	callbackGeneration := c.groupCallbackGeneration
 	hasCallback := c.onGroupState != nil
+	// The live roster is subsequently updated in place by hand events.
+	// The queued callback owns an immutable, independent snapshot.
+	var notification GroupCallState
+	if hasCallback {
+		notification = cloneGroupCallState(stored)
+	}
 	c.mu.Unlock()
 	if !hasCallback {
 		return
@@ -210,7 +354,7 @@ func (c *Call) setGroupState(state GroupCallState) {
 		}
 		fn := c.onGroupState
 		c.mu.Unlock()
-		fn(cloneGroupCallState(stored))
+		fn(notification)
 	})
 }
 
@@ -287,10 +431,25 @@ func (c *Call) IsReceivingVideo() bool {
 }
 
 // Answer accepts an inbound call (preaccept + accept) and brings media up. No-op error
-// if the call is not in a ringing state.
+// if the call is not in a ringing state. ErrPickupNotSubmitted describes an
+// unsent attempt; ErrPickupOutcomeUnknown must not be retried. End the exact
+// call with Hangup if the submitted outcome cannot be established.
 func (c *Call) AnswerContext(ctx context.Context) error { return c.eng.answerContext(ctx, c) }
 
 func (c *Call) Answer() error { return c.eng.answer(c) }
+
+// DismissUnanswered releases an incoming ringing call locally without sending a
+// reject or terminate. It cannot dismiss a call with an active or submitted pickup.
+// The caller may use this when its local frontend is unavailable.
+func (c *Call) DismissUnanswered() bool {
+	return c.eng.finishCallMatchingOffer(c.id, "local-frontend-unavailable", false, c, "", false, true, nil)
+}
+
+// EndLocally retires this exact call without sending provider signaling.
+// Use after loss of stream ownership, not for a user's hangup or decline.
+func (c *Call) EndLocally(reason string) bool {
+	return c.eng.finishCallMatching(c.id, reason, false, c)
+}
 
 // Reject declines an inbound call.
 func (c *Call) Reject() error { return c.eng.reject(c) }
@@ -304,10 +463,79 @@ func (c *Call) StartVideo() error {
 	return c.eng.transitionVideo(c.id, signaling.VideoStateUpgradeRequestV2)
 }
 
+// ErrNoPendingVideoUpgrade indicates that an upgrade notification was already
+// accepted or withdrawn before the caller attempted to accept it.
+var ErrNoPendingVideoUpgrade = errors.New("meowcaller: no pending peer video upgrade")
+
+// ErrVideoDecisionMode indicates that the call uses the other decision policy.
+var ErrVideoDecisionMode = errors.New("meowcaller: video decision mode mismatch")
+
+// ErrVideoDecisionBusy means an older provider submission has not returned.
+var ErrVideoDecisionBusy = errors.New("meowcaller: video decision in flight")
+
+// VideoNegotiation is a complete call-scoped snapshot, not a delivery receipt.
+type VideoNegotiation struct {
+	Manual             bool   `json:"manual"`
+	LocalCamera        bool   `json:"local_camera"`
+	PeerCamera         bool   `json:"peer_camera"`
+	OutgoingPending    bool   `json:"outgoing_pending"`
+	IncomingGeneration uint64 `json:"incoming_generation"`
+}
+
+// VideoNegotiationState optionally enables manual decisions for the rest of this
+// direct call. A decision already reserved by the automatic path cannot be undone.
+func (c *Call) VideoNegotiationState(manual bool) (VideoNegotiation, error) {
+	c.eng.mu.Lock()
+	defer c.eng.mu.Unlock()
+	m := c.eng.calls[c.id]
+	if m == nil || m.call != c || m.group || c.State() == CallPhaseEnded {
+		return VideoNegotiation{}, errors.New("meowcaller: direct call unavailable")
+	}
+	if manual {
+		m.manualVideoDecision = true
+	}
+	state := VideoNegotiation{Manual: m.manualVideoDecision, LocalCamera: m.localVideo && !m.videoGate, PeerCamera: m.remoteVideo, OutgoingPending: m.videoGate}
+	if m.peerVideoUpgrade {
+		state.IncomingGeneration = m.peerVideoGeneration
+	}
+	return state, nil
+}
+
+// AutoAcceptVideo accepts only the generation associated with the callback and
+// only while automatic decisions remain selected.
+func (c *Call) AutoAcceptVideo(ctx context.Context, generation uint64) error {
+	return c.eng.transitionVideoContext(ctx, c.id, c, signaling.VideoStateUpgradeAccept, generation, 1)
+}
+
+// DecideVideoUpgrade consumes exactly one current manual request, even if the
+// transport outcome is ambiguous. The caller must not retry an uncertain send.
+func (c *Call) DecideVideoUpgrade(ctx context.Context, generation uint64, accept bool) error {
+	transition := signaling.VideoStateUpgradeReject
+	if accept {
+		transition = signaling.VideoStateUpgradeAccept
+	}
+	return c.eng.transitionVideoContext(ctx, c.id, c, transition, generation, 2)
+}
+
+// IsVideoTransmitReady excludes an unacknowledged outgoing upgrade. In particular
+// the gateway must not announce an enabled orientation before the peer accepts.
+func (c *Call) IsVideoTransmitReady() bool {
+	c.eng.mu.Lock()
+	defer c.eng.mu.Unlock()
+	m := c.eng.calls[c.id]
+	return m != nil && m.call == c && m.localVideo && !m.videoGate && c.State() != CallPhaseEnded
+}
+
 // AcceptVideo accepts a pending peer video upgrade without changing this client's
 // independent outbound video state.
 func (c *Call) AcceptVideo() error {
 	return c.eng.transitionVideo(c.id, signaling.VideoStateUpgradeAccept)
+}
+
+// RejectVideo declines a pending peer upgrade without altering local camera state.
+// A failed transmission is ambiguous; the same decision is not automatically retried.
+func (c *Call) RejectVideo() error {
+	return c.eng.transitionVideo(c.id, signaling.VideoStateUpgradeReject)
 }
 
 // StopVideo stops this client's outbound video while preserving peer video and audio.
@@ -360,19 +588,38 @@ func (c *Call) SendReaction(emoji string) error {
 	return c.eng.sendReaction(c.id, emoji)
 }
 
+// SendReactionContext submits only for this exact active call.
+func (c *Call) SendReactionContext(ctx context.Context, emoji string) error {
+	return c.eng.sendReactionContext(ctx, c, emoji)
+}
+
 // SetHandRaised announces this client's persistent hand state.
 func (c *Call) SetHandRaised(raised bool) error {
 	return c.eng.setHandRaised(c.id, raised)
 }
 
-// StartScreenShare announces a version-2 screen share independently from camera video.
+// SetHandRaisedContext submits a hand action only for this exact live group
+// call and its current connected local participant. Success is submission,
+// not a correlated remote acknowledgement.
+func (c *Call) SetHandRaisedContext(ctx context.Context, raised bool) error {
+	return c.eng.setGroupHandRaised(ctx, c, raised)
+}
+
+// StartScreenShare announces a version-2 source switch on the primary video stream.
+// The caller must switch the H.264 input; this does not create a second stream.
 func (c *Call) StartScreenShare(screenShareID *uint32) error {
-	return c.eng.setScreenShare(c.id, true, screenShareID)
+	return c.SetScreenShareContext(context.Background(), true, screenShareID)
+}
+
+// SetScreenShareContext submits a source-role change for the exact live group call.
+// A successful return means submission, not an acknowledged remote media switch.
+func (c *Call) SetScreenShareContext(ctx context.Context, active bool, screenShareID *uint32) error {
+	return c.eng.setScreenShare(ctx, c, active, screenShareID)
 }
 
 // StopScreenShare stops screen sharing without stopping camera video or ending the call.
 func (c *Call) StopScreenShare() error {
-	return c.eng.setScreenShare(c.id, false, nil)
+	return c.SetScreenShareContext(context.Background(), false, nil)
 }
 
 // OnHandRaise registers a participant hand-state listener.
@@ -382,7 +629,7 @@ func (c *Call) OnHandRaise(fn func(HandRaiseState)) {
 	c.mu.Unlock()
 }
 
-// OnScreenShare registers an independent screen-share state listener.
+// OnScreenShare registers a screen-share signalling listener. Consumers must reconcile the authoritative roster as well.
 func (c *Call) OnScreenShare(fn func(ScreenShareState)) {
 	c.mu.Lock()
 	c.onScreenShare = fn
@@ -393,6 +640,9 @@ func (c *Call) OnScreenShare(fn func(ScreenShareState)) {
 func (c *Call) ScreenShares() []ScreenShareState {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.phase == CallPhaseEnded {
+		return nil
+	}
 	shares := make([]ScreenShareState, 0, len(c.screenShares))
 	for _, share := range c.screenShares {
 		shares = append(shares, share)
@@ -455,6 +705,10 @@ func (c *Call) DenyParticipant(ctx context.Context, user string) error {
 }
 
 func (c *Call) setWaitingRoomState(state WaitingRoomState) {
+	c.storeWaitingRoomState(state, false)
+}
+
+func (c *Call) storeWaitingRoomState(state WaitingRoomState, preserveAdmission bool) {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/36d54857c74e45ccb08f6444a32d2afa13f20be9/datasheets/call-links-waiting-room.md#L62-L94
 	stored := cloneWaitingRoomState(state)
 	c.mu.Lock()
@@ -463,6 +717,9 @@ func (c *Call) setWaitingRoomState(state WaitingRoomState) {
 		state.TransactionID <= c.waitingRoomState.TransactionID {
 		c.mu.Unlock()
 		return
+	}
+	if preserveAdmission && c.waitingRoomState != nil {
+		stored.InWaitingRoom = c.waitingRoomState.InWaitingRoom
 	}
 	c.waitingRoomState = &stored
 	c.waitingRoomGeneration++
@@ -506,18 +763,31 @@ func (c *Call) setWaitingRoomAdmission() {
 	})
 }
 
-func (c *Call) enqueueNotification(notification func()) {
-	// Source of truth: https://github.com/purpshell/meowcaller/blob/36d54857c74e45ccb08f6444a32d2afa13f20be9/datasheets/call-links-waiting-room.md#L62-L94
+// queueNotification appends without executing user callbacks. Callers may hold
+// c.mu while queuing to preserve state-mutation order; the elected drainer must
+// release that lock before calling drainNotifications.
+func (c *Call) queueNotification(notification func()) bool {
 	if notification == nil {
-		return
+		return false
 	}
 	c.notifyMu.Lock()
+	defer c.notifyMu.Unlock()
 	c.notifyQueue = append(c.notifyQueue, notification)
 	if c.notifyRunning {
-		c.notifyMu.Unlock()
-		return
+		return false
 	}
 	c.notifyRunning = true
+	return true
+}
+
+func (c *Call) enqueueNotification(notification func()) {
+	if c.queueNotification(notification) {
+		c.drainNotifications()
+	}
+}
+
+func (c *Call) drainNotifications() {
+	c.notifyMu.Lock()
 	for len(c.notifyQueue) > 0 {
 		next := c.notifyQueue[0]
 		c.notifyQueue[0] = nil
@@ -531,19 +801,71 @@ func (c *Call) enqueueNotification(notification func()) {
 	c.notifyMu.Unlock()
 }
 
+// A participant identity must be unique in an authoritative roster. Do not
+// infer identity from an untrusted phone/LID alias or from the call JID.
+func connectedHandParticipant(group *GroupCallState, key types.JID) bool {
+	if group == nil || group.TransactionID == 0 || key.IsEmpty() ||
+		(key.Server != types.HiddenUserServer && key.Server != types.DefaultUserServer) {
+		return false
+	}
+	match := -1
+	for i, participant := range group.Participants {
+		if participant.JID.ToNonAD() == key {
+			if match != -1 || participant.State != "connected" {
+				return false
+			}
+			match = i
+		}
+	}
+	if match == -1 {
+		return false
+	}
+	alias := group.Participants[match].PN.ToNonAD()
+	for i, participant := range group.Participants {
+		if i == match {
+			continue
+		}
+		other, otherAlias := participant.JID.ToNonAD(), participant.PN.ToNonAD()
+		if otherAlias == key || (!alias.IsEmpty() && (other == alias || otherAlias == alias)) {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *Call) dispatchHandRaise(state HandRaiseState) {
+	c.dispatchHandRaiseAt(state, 0)
+}
+
+// A local completion must not update a replacement roster after submission.
+// A zero transaction is reserved for provider notifications (no roster epoch
+// is carried in the provider hand-action envelope).
+func (c *Call) dispatchHandRaiseAt(state HandRaiseState, transaction uint32) bool {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/36d54857c74e45ccb08f6444a32d2afa13f20be9/datasheets/group-video-reactions.md#L31-L43
 	c.mu.Lock()
 	if c.handRaises == nil {
 		c.handRaises = make(map[types.JID]bool)
 	}
 	key := state.Participant.ToNonAD()
+	if c.phase == CallPhaseEnded || key.IsEmpty() ||
+		(key.Server != types.HiddenUserServer && key.Server != types.DefaultUserServer) ||
+		(transaction != 0 && (c.groupState == nil || c.groupState.TransactionID != transaction)) ||
+		!connectedHandParticipant(c.groupState, key) {
+		c.mu.Unlock()
+		return false
+	}
+	if c.handRaises[key] == state.Raised {
+		c.mu.Unlock()
+		return true
+	}
+	state.Participant = key
 	if state.Raised {
 		c.handRaises[key] = true
 	} else {
 		delete(c.handRaises, key)
 	}
 	if c.groupState != nil {
+		c.groupState.HandRevision++
 		for i := range c.groupState.Participants {
 			if c.groupState.Participants[i].JID.ToNonAD() == key {
 				c.groupState.Participants[i].HandRaised = state.Raised
@@ -555,24 +877,84 @@ func (c *Call) dispatchHandRaise(state HandRaiseState) {
 	if fn != nil {
 		fn(state)
 	}
+	return true
 }
 
 func (c *Call) dispatchScreenShare(state ScreenShareState) {
+	c.dispatchScreenShareAt(state, 0)
+}
+
+func (c *Call) dispatchScreenShareAt(state ScreenShareState, transaction uint32) bool {
 	c.mu.Lock()
+	key := state.Participant.ToNonAD()
+	if c.phase == CallPhaseEnded || !connectedHandParticipant(c.groupState, key) ||
+		(transaction != 0 && c.groupState.TransactionID != transaction) ||
+		(state.Active && state.Version != 2) {
+		c.mu.Unlock()
+		return false
+	}
 	if c.screenShares == nil {
 		c.screenShares = make(map[types.JID]ScreenShareState)
 	}
-	key := state.Participant.ToNonAD()
+	state.Participant = key
+	requested := state.Device
+	if !requested.IsEmpty() && requested.ToNonAD() != key {
+		c.mu.Unlock()
+		return false
+	}
+	state.Device, state.PID, state.HasPID = types.EmptyJID, 0, false
+	previous, exists := c.screenShares[key]
 	if state.Active {
+		// Replayed bare controls cannot acquire a device merely because the
+		// roster changed since an ambiguous start. A fresh explicit device
+		// control may disambiguate the same share.
+		if requested.IsEmpty() && exists && !previous.HasPID &&
+			previous.HasScreenShareID == state.HasScreenShareID && previous.ScreenShareID == state.ScreenShareID {
+			c.mu.Unlock()
+			return true
+		}
+		if d, ok := screenShareDevice(c.groupState, key, requested); ok {
+			state.Device, state.PID, state.HasPID = d.JID, d.PID, true
+		} else if !requested.IsEmpty() {
+			c.mu.Unlock()
+			return false
+		}
+		// An ambiguous participant-only refresh cannot replace an explicit
+		// binding. In particular it cannot make another device the source.
+		if exists && previous.HasPID && !state.HasPID {
+			c.mu.Unlock()
+			return false
+		}
+		if exists && previous == state {
+			c.mu.Unlock()
+			return true
+		}
 		c.screenShares[key] = state
 	} else {
+		// A stop from a different explicit device cannot retire the current share.
+		if !requested.IsEmpty() && exists && (!previous.HasPID || previous.Device != requested) {
+			c.mu.Unlock()
+			return false
+		}
+		// A delayed, identified stop must not retire a newer share.
+		if state.HasScreenShareID && (!exists || !previous.HasScreenShareID || previous.ScreenShareID != state.ScreenShareID) {
+			c.mu.Unlock()
+			return false
+		}
+		if !exists {
+			c.mu.Unlock()
+			return true
+		}
+		state.Device, state.PID, state.HasPID = previous.Device, previous.PID, previous.HasPID
 		delete(c.screenShares, key)
 	}
+	c.advanceScreenRoleLocked(key)
 	fn := c.onScreenShare
 	c.mu.Unlock()
 	if fn != nil {
 		fn(state)
 	}
+	return true
 }
 
 func cloneWaitingRoomState(state WaitingRoomState) WaitingRoomState {
@@ -625,17 +1007,22 @@ func (c *Call) videoSinkRef() VideoSink {
 	return c.videoSink
 }
 
-// OnVideoState registers a callback fired for each inbound <video> state stanza — the peer's
-// video on/off, the audio→video upgrade, and device orientation (rotate by Orientation × 90°).
+// OnVideoState registers a callback for ordered inbound video transitions,
+// including camera stop/start and upgrade negotiation. Registration replays the
+// last known state, not the earlier history. Replacing the callback discards
+// queued notifications for the old registration (an in-flight callback may
+// finish). No new notifications are delivered after observing call termination.
 func (c *Call) OnVideoState(fn func(VideoState)) {
 	c.mu.Lock()
 	c.onVideoState = fn
-	c.videoVersion++
-	version := c.videoVersion
-	state := c.lastVideoState
+	c.videoCallbackGeneration++
+	drain := false
+	if c.lastVideoState != nil && fn != nil && c.phase != CallPhaseEnded {
+		drain = c.queueVideoStateLocked(*c.lastVideoState)
+	}
 	c.mu.Unlock()
-	if state != nil && fn != nil {
-		c.deliverVideoState(version, *state, fn)
+	if drain {
+		c.drainNotifications()
 	}
 }
 
@@ -647,6 +1034,63 @@ func (c *Call) OnVideoKeyframeRequest(fn func()) {
 	c.mu.Unlock()
 }
 
+// OnParticipantMediaEpoch installs a synchronous local fence and replays its
+// latest value. Callbacks execute under the media registry/epoch locks: they
+// must only update local admission state, never call provider methods or do I/O.
+func (c *Call) OnParticipantMediaEpoch(fn func(ParticipantMediaEpoch)) {
+	c.participantEpochMu.Lock()
+	defer c.participantEpochMu.Unlock()
+	c.onParticipantMediaEpoch = fn
+	if fn != nil {
+		fn(c.participantEpoch)
+	}
+}
+
+func (c *Call) recordParticipantMediaEpoch(epoch ParticipantMediaEpoch) {
+	c.participantEpochMu.Lock()
+	defer c.participantEpochMu.Unlock()
+	if c.participantEpoch == epoch {
+		return
+	}
+	c.participantEpoch = epoch
+	if c.onParticipantMediaEpoch != nil {
+		c.onParticipantMediaEpoch(epoch)
+	}
+}
+
+// OnParticipantAudioFrame registers a listener for independent inbound audio.
+// The callback runs on the receive goroutine, must return promptly, and is
+// additive to Receive. Passing nil detaches the listener. An already-running
+// callback may finish after detachment or call termination.
+func (c *Call) OnParticipantAudioFrame(fn func(ParticipantAudioFrame)) {
+	c.mu.Lock()
+	c.onParticipantAudioFrame = fn
+	c.mu.Unlock()
+}
+
+func (c *Call) dispatchParticipantAudioFrame(audio decodedParticipantAudio, clockRate uint32) {
+	c.mu.Lock()
+	fn := c.onParticipantAudioFrame
+	ended := c.phase == CallPhaseEnded
+	c.mu.Unlock()
+	if fn == nil || ended || len(audio.PCM) == 0 {
+		return
+	}
+	fn(ParticipantAudioFrame{
+		Epoch:         audio.Epoch,
+		ParticipantID: audio.ParticipantID,
+		Sender:        audio.UserJID,
+		Device:        audio.DeviceJID,
+		PID:           audio.PID,
+		HasPID:        audio.HasPID,
+		SSRC:          audio.SSRC,
+		Timestamp:     audio.Timestamp,
+		RTPClockRate:  clockRate,
+		SampleRate:    SampleRate,
+		PCM:           append([]float32(nil), audio.PCM...),
+	})
+}
+
 // OnParticipantVideoFrame registers a callback for authenticated H.264 access
 // units with their group participant identity. It is additive to ReceiveVideo.
 func (c *Call) OnParticipantVideoFrame(fn func(ParticipantVideoFrame)) {
@@ -656,10 +1100,35 @@ func (c *Call) OnParticipantVideoFrame(fn func(ParticipantVideoFrame)) {
 	c.mu.Unlock()
 }
 
+// Snapshot the signalled role before H.264 assembly; the role is not an RTP-authenticated field.
+func (c *Call) videoRoleLocked(epoch ParticipantMediaEpoch, sender, device types.JID, pid uint32, hasPID bool) GroupVideoRole {
+	if !epoch.Valid || c.groupState == nil || c.groupState.TransactionID != epoch.RosterTransaction || !hasPID {
+		return GroupVideoRole{}
+	}
+	key := sender.ToNonAD()
+	role := GroupVideoRole{Revision: c.screenRoleRevisionLocked(key)}
+	if share, exists := c.screenShares[key]; exists && share.Active && screenShareBindingCurrent(c.groupState, key, share) {
+		role.ScreenShare = share.Device == device && share.PID == pid
+	}
+	return role
+}
+
+func (c *Call) videoRole(epoch ParticipantMediaEpoch, sender, device types.JID, pid uint32, hasPID bool) GroupVideoRole {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.videoRoleLocked(epoch, sender, device, pid, hasPID)
+}
+
 func (c *Call) dispatchParticipantVideoFrame(frame ParticipantVideoFrame) bool {
-	// Source of truth: https://github.com/purpshell/meowcaller/blob/36d54857c74e45ccb08f6444a32d2afa13f20be9/datasheets/group-video-reactions.md#L32-L54
 	c.mu.Lock()
 	fn := c.onParticipantVideoFrame
+	if frame.Epoch.Valid {
+		role := c.videoRoleLocked(frame.Epoch, frame.Sender, frame.Device, frame.PID, frame.HasPID)
+		if role.Revision == 0 || frame.RoleRevision != role.Revision || frame.ScreenShare != role.ScreenShare {
+			c.mu.Unlock()
+			return false
+		}
+	}
 	c.mu.Unlock()
 	if fn == nil {
 		return false
@@ -690,22 +1159,30 @@ func (c *Call) requestVideoKeyframe() {
 	}
 }
 
-// onVideoStateFn returns the Call's video-state callback under its lock.
 func (c *Call) recordVideoState(state VideoState) {
 	c.mu.Lock()
+	if c.phase == CallPhaseEnded {
+		c.mu.Unlock()
+		return
+	}
 	c.lastVideoState = &state
-	c.videoVersion++
-	v := c.videoVersion
-	fn := c.onVideoState
+	drain := c.queueVideoStateLocked(state)
 	c.mu.Unlock()
-	if fn != nil {
-		c.deliverVideoState(v, state, fn)
+	if drain {
+		c.drainNotifications()
 	}
 }
-func (c *Call) deliverVideoState(v uint64, state VideoState, fn func(VideoState)) {
-	c.enqueueNotification(func() {
+
+// Caller holds c.mu. Queue insertion and recording are one ordered operation.
+func (c *Call) queueVideoStateLocked(state VideoState) bool {
+	fn := c.onVideoState
+	if fn == nil {
+		return false
+	}
+	generation := c.videoCallbackGeneration
+	return c.queueNotification(func() {
 		c.mu.Lock()
-		fresh := v == c.videoVersion
+		fresh := generation == c.videoCallbackGeneration && c.phase != CallPhaseEnded
 		c.mu.Unlock()
 		if fresh {
 			fn(state)
@@ -713,9 +1190,14 @@ func (c *Call) deliverVideoState(v uint64, state VideoState, fn func(VideoState)
 	})
 }
 
+// ErrVideoFrameDropped indicates that an access unit was not submitted to the relay.
+// The encoder should supply a fresh recovery IDR; this is not a call failure.
+var ErrVideoFrameDropped = errors.New("meowcaller: video access unit dropped")
+
 // SendVideo sends one already-encoded H.264 access unit (Annex-B) to the peer — fed from an
 // external encoder (browser WebCodecs, ffmpeg, hardware). Returns an error if the call has no
-// active video media yet. meowcaller does not encode pixels (no pure-Go H.264 encoder); this
+// active video media yet, ErrVideoFrameDropped for a discarded access unit, or a
+// transport error if relay submission fails. meowcaller does not encode pixels (no pure-Go H.264 encoder); this
 // is the video analog of writing a sample to a track.
 //
 // NOT VALIDATED: the video send media path is unproven.
@@ -735,7 +1217,7 @@ func (c *Call) SendVideoWithDuration(accessUnit []byte, duration time.Duration) 
 func (c *Call) OnReady(fn func()) {
 	c.mu.Lock()
 	c.onReady = fn
-	ready := c.mediaReady
+	ready := c.mediaReady && c.phase != CallPhaseEnded
 	c.mu.Unlock()
 	if ready && fn != nil {
 		fn()
@@ -767,7 +1249,7 @@ func (c *Call) OnStateChange(fn func(CallPhase)) {
 func (c *Call) OnPeerAccept(fn func()) {
 	c.mu.Lock()
 	c.onPeerAccept = fn
-	shouldNotify := c.peerAccepted && !c.acceptNotified && fn != nil
+	shouldNotify := c.phase != CallPhaseEnded && c.peerAccepted && !c.acceptNotified && fn != nil
 	if shouldNotify {
 		c.acceptNotified = true
 	}
@@ -779,6 +1261,10 @@ func (c *Call) OnPeerAccept(fn func()) {
 
 func (c *Call) markPeerAccepted() {
 	c.mu.Lock()
+	if c.phase == CallPhaseEnded {
+		c.mu.Unlock()
+		return
+	}
 	c.peerAccepted = true
 	fn := c.onPeerAccept
 	shouldNotify := !c.acceptNotified && fn != nil
@@ -791,35 +1277,47 @@ func (c *Call) markPeerAccepted() {
 	}
 }
 
-// OnMuteState registers a callback fired for each inbound WhatsApp mute_v2 state.
-// The callback describes the remote party's microphone state: true means muted.
+// OnMuteState registers a callback for ordered inbound WhatsApp mute_v2 states.
+// True means the remote microphone is muted. Registration replays only the last
+// known state. Callback replacement and termination follow OnVideoState semantics.
 func (c *Call) OnMuteState(fn func(muted bool)) {
 	c.mu.Lock()
 	c.onMuteState = fn
-	c.muteVersion++
-	v := c.muteVersion
-	muted := c.lastMute
+	c.muteCallbackGeneration++
+	drain := false
+	if c.lastMute != nil && fn != nil && c.phase != CallPhaseEnded {
+		drain = c.queueMuteLocked(*c.lastMute)
+	}
 	c.mu.Unlock()
-	if muted != nil && fn != nil {
-		c.deliverMute(v, *muted, fn)
+	if drain {
+		c.drainNotifications()
 	}
 }
 
 func (c *Call) recordMute(muted bool) {
 	c.mu.Lock()
+	if c.phase == CallPhaseEnded {
+		c.mu.Unlock()
+		return
+	}
 	c.lastMute = &muted
-	c.muteVersion++
-	v := c.muteVersion
-	fn := c.onMuteState
+	drain := c.queueMuteLocked(muted)
 	c.mu.Unlock()
-	if fn != nil {
-		c.deliverMute(v, muted, fn)
+	if drain {
+		c.drainNotifications()
 	}
 }
-func (c *Call) deliverMute(v uint64, muted bool, fn func(bool)) {
-	c.enqueueNotification(func() {
+
+// Caller holds c.mu. Queue insertion and recording are one ordered operation.
+func (c *Call) queueMuteLocked(muted bool) bool {
+	fn := c.onMuteState
+	if fn == nil {
+		return false
+	}
+	generation := c.muteCallbackGeneration
+	return c.queueNotification(func() {
 		c.mu.Lock()
-		fresh := c.muteVersion == v
+		fresh := generation == c.muteCallbackGeneration && c.phase != CallPhaseEnded
 		c.mu.Unlock()
 		if fresh {
 			fn(muted)
@@ -827,10 +1325,25 @@ func (c *Call) deliverMute(v uint64, muted bool, fn func(bool)) {
 	})
 }
 
+// advancePhase atomically prevents delayed signaling from regressing a call.
+func (c *Call) advancePhase(next CallPhase) {
+	c.mu.Lock()
+	if c.phase >= next || (next == CallPhaseRinging && c.phase != CallPhaseCalling) {
+		c.mu.Unlock()
+		return
+	}
+	c.phase = next
+	fn := c.onState
+	c.mu.Unlock()
+	if fn != nil {
+		fn(next)
+	}
+}
+
 // setPhase advances the call's phase and fires OnStateChange (used by the engine).
 func (c *Call) setPhase(next CallPhase) {
 	c.mu.Lock()
-	if c.phase == next {
+	if c.phase == next || c.phase == CallPhaseEnded {
 		c.mu.Unlock()
 		return
 	}

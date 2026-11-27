@@ -49,6 +49,9 @@ use crate::tile::{
     CallTile, DetailWindow, LocalState, TileId, TileRoster, Tiles, derive_tiles, window,
 };
 
+/// Maximum time to await a receive-side statistics sample.
+const RECEIVE_STATS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Capacity of the broadcast [`CallEvent`] channel. Subscribers that fall
 /// further behind than this observe a `Lagged` error and miss events; they
 /// should resynchronise from [`CallEngine::participants`].
@@ -224,21 +227,20 @@ enum ActorMessage {
         key_index: u8,
     },
     KeyDiscarded(DiscardedKey),
-    /// A local publication went up; the roster must show it and peers were
-    /// already told by the transport. `muted` is the state it was published
-    /// with, which the transport announced along with the track.
+    /// Completion of the reserved local publication. Only the actor may
+    /// commit it and acknowledge the caller.
     LocalPublished {
         kind: MediaStreamKind,
         muted: bool,
-        track: Arc<dyn LocalTrackHandle>,
+        connection: Arc<dyn TransportConnection>,
+        outcome: Result<Arc<dyn LocalTrackHandle>, TransportError>,
+        respond: oneshot::Sender<Result<Arc<dyn LocalTrackHandle>, TransportError>>,
     },
-    /// A local retraction resolved at the transport; the roster must drop it.
-    /// `track` identifies which publication was retracted, so a same-kind
-    /// publish that landed while the retraction was in flight is not the one
-    /// removed.
     LocalUnpublished {
         kind: MediaStreamKind,
         track: Arc<dyn LocalTrackHandle>,
+        outcome: Result<(), TransportError>,
+        respond: oneshot::Sender<Result<(), TransportError>>,
     },
     SetLocalMuted {
         kind: MediaStreamKind,
@@ -392,6 +394,7 @@ impl CallEngine {
             messages_tx: messages_tx.clone(),
             roster: Vec::new(),
             local_tracks: HashMap::new(),
+            local_operations: HashSet::new(),
             encryption_states: HashMap::new(),
             undecryptable_since: HashMap::new(),
             unmapped_since: HashMap::new(),
@@ -399,6 +402,7 @@ impl CallEngine {
             sent_in_clear: HashSet::new(),
             installed_keys: HashMap::new(),
             raised_hands: Vec::new(),
+            membership_generations: HashMap::new(),
             arrived: false,
             ended: false,
         };
@@ -675,7 +679,8 @@ impl CallEngine {
     /// Receive-side RTP counters for a participant's stream.
     ///
     /// `None` while no such stream is subscribed, or when the transport
-    /// reports no counters. Because the receive path emits frames whether or
+    /// reports no counters, the sample times out, or the subscribed track changes
+    /// before the sample completes. Because the receive path emits frames whether or
     /// not RTP arrives, this is how a caller distinguishes "nothing is
     /// arriving" from "arriving but not decoding" — sample twice and compare,
     /// the fields are cumulative totals. See [`ReceiveStats`].
@@ -687,15 +692,19 @@ impl CallEngine {
         // `remote_track` hands back an owned `Arc`, so the track-map lock is
         // released before the transport's (potentially slow) stats round trip.
         let track = self.remote_track(member_id, kind)?;
-        track.receive_stats().await
+        let stats = tokio::time::timeout(RECEIVE_STATS_TIMEOUT, track.receive_stats())
+            .await.ok().flatten()?;
+        let current = self.remote_track(member_id, kind)?;
+        Arc::ptr_eq(&track, &current).then_some(stats)
     }
 
     /// [`CallEngine::receive_stats`] for many streams at once.
     ///
     /// One entry per element of `streams`, in the same order — `None` under
-    /// the same conditions as the single call. The track map is locked once,
-    /// for the lookups only; the transports' stats round trips then run
-    /// concurrently, so a batch costs about one collection rather than one
+    /// the same conditions as the single call. The track map is locked only
+    /// for the initial lookups and again after sampling to validate freshness.
+    /// The transports' stats round trips run concurrently, so a batch costs
+    /// about one collection rather than one
     /// per stream. Bound the request to what is drawn (contract C12) and call
     /// this once per sample.
     pub async fn receive_stats_for(
@@ -709,13 +718,21 @@ impl CallEngine {
         // Unbounded on purpose: libwebrtc serialises stats collection on its
         // own thread. `futures_util::stream::iter(..).buffered(n)` is the
         // drop-in if a call size ever makes that a problem.
-        futures_util::future::join_all(tracks.into_iter().map(|track| async move {
+        let sampled = futures_util::future::join_all(tracks.iter().map(|track| async move {
             match track {
-                Some(track) => track.receive_stats().await,
+                Some(track) => tokio::time::timeout(RECEIVE_STATS_TIMEOUT, track.receive_stats())
+                    .await.ok().flatten(),
                 None => None,
             }
         }))
-        .await
+        .await;
+        let current = self.tracks.get_many(streams);
+        tracks.into_iter().zip(current).zip(sampled).map(|((original, current), stats)| {
+            match (original, current) {
+                (Some(original), Some(current)) if Arc::ptr_eq(&original, &current) => stats,
+                _ => None,
+            }
+        }).collect()
     }
 
     /// Close every pooled peer-focus connection, and report media detached to
@@ -795,6 +812,8 @@ struct Actor {
     /// roster can be corrected in one place, and so a membership landing after
     /// them can be seeded from them.
     local_tracks: HashMap<MediaStreamKind, LocalPublication>,
+    // One in-flight publish/retract per kind; never overwrite an owned track.
+    local_operations: HashSet<MediaStreamKind>,
     /// Key indices installed per member, in the order they were imported.
     ///
     /// Kept so a frame-encryption failure can say whether *any* key reached this
@@ -807,6 +826,7 @@ struct Actor {
     /// and of the membership it belongs to through different channels, and a
     /// hand that arrives first must not be lost.
     raised_hands: Vec<RaisedHand>,
+    membership_generations: HashMap<String, Option<u64>>,
     /// Whether a snapshot has held our own membership yet. The roster we
     /// find on arrival was there before us and is not news; every change
     /// after it is, through a lapse of our own membership too (034 R16): a
@@ -838,6 +858,19 @@ struct LocalPublication {
     /// What the transport was last told: the user's mute, or the lapse's
     /// pause on top of it (034 R17).
     applied_muted: bool,
+}
+
+// A late publication is never admitted to a replacement call. Mute before
+// asynchronous best-effort retraction; native failure remains diagnosable.
+fn retire_local_track(track: Arc<dyn LocalTrackHandle>) {
+    if let Err(error) = track.set_muted(true) {
+        log::warn!("could not mute retired local publication: {error}");
+    }
+    rt::spawn(async move {
+        if let Err(error) = track.unpublish().await {
+            log::warn!("could not retract retired local publication: {error}");
+        }
+    });
 }
 
 /// Waits for the raised-hands watch to change; never resolves when there is
@@ -976,6 +1009,14 @@ impl Actor {
                             status.detached();
                         }
                         self.end();
+                        // Close before draining so late senders either see a
+                        // closed mailbox or have their completion retired here.
+                        messages.close();
+                        while let Ok(message) = messages.try_recv() {
+                            if let ActorMessage::LocalPublished { outcome: Ok(track), .. } = message {
+                                retire_local_track(track);
+                            }
+                        }
                         let _ = ack.send(());
                         break;
                     }
@@ -1116,6 +1157,7 @@ impl Actor {
         let paused = self.lapsed();
         for (kind, publication) in &mut self.local_tracks {
             let effective = publication.muted || paused;
+            if !effective && self.local_operations.contains(kind) { continue; }
             if publication.applied_muted == effective {
                 continue;
             }
@@ -1140,9 +1182,13 @@ impl Actor {
     fn handle_message(&mut self, message: ActorMessage) {
         match message {
             ActorMessage::AdoptConnection { connection, events } => {
+                if self.ended { return; }
+                self.retire_local_publications();
                 self.pool.adopt_own_connection(connection, events);
             }
             ActorMessage::ConnectOwn { connection } => {
+                if self.ended { return; }
+                self.retire_local_publications();
                 let events = self.pool.connect_own(connection);
                 self.apply_pool_events(events);
             }
@@ -1171,30 +1217,32 @@ impl Actor {
                 });
             }
             ActorMessage::Publish { options, respond } => {
-                // Local tracks always go to the focus we announced in our
-                // membership — that is where peers subscribe to us. While it
-                // is down the handle takes them, and they go out once it is up.
+                let kind = options.kind;
+                if self.ended || respond.is_closed() {
+                    let _ = respond.send(Err(TransportError::Closed("call ended or publish cancelled".into())));
+                    return;
+                }
+                if self.local_tracks.contains_key(&kind) || self.local_operations.contains(&kind) {
+                    let _ = respond.send(Err(TransportError::Unsupported(format!(
+                        "a local {kind:?} publication already exists or is changing"
+                    ))));
+                    return;
+                }
                 match self.pool.own_handle() {
                     Some(connection) => {
-                        // The publish itself is awaited off-actor so a slow SFU
-                        // does not stall every other message; the actor learns
-                        // the outcome through `LocalPublished`, which is what
-                        // puts the stream on our own roster entry. Without that
-                        // a host sees no event for its own microphone and has to
-                        // shadow the state to render itself truthfully.
-                        let kind = options.kind;
+                        self.local_operations.insert(kind);
                         let muted = options.muted;
                         let messages = self.messages_tx.clone();
                         rt::spawn(async move {
                             let outcome = connection.publish(options).await;
-                            if let Ok(track) = &outcome {
-                                let _ = messages.send(ActorMessage::LocalPublished {
-                                    kind,
-                                    muted,
-                                    track: Arc::clone(track),
-                                });
+                            if let Err(error) = messages.send(ActorMessage::LocalPublished {
+                                kind, muted, connection, outcome, respond,
+                            }) {
+                                // Actor shutdown raced the network operation.
+                                if let ActorMessage::LocalPublished { outcome: Ok(track), .. } = error.0 {
+                                    retire_local_track(track);
+                                }
                             }
-                            let _ = respond.send(outcome);
                         });
                     }
                     None => {
@@ -1204,17 +1252,36 @@ impl Actor {
                     }
                 }
             }
-            ActorMessage::LocalPublished { kind, muted, track } => {
-                self.local_tracks.insert(
-                    kind,
-                    LocalPublication {
-                        track,
-                        muted,
-                        applied_muted: muted,
-                    },
-                );
+            ActorMessage::LocalPublished { kind, muted, connection, outcome, respond } => {
+                self.local_operations.remove(&kind);
+                if self.ended || !self.pool.own_handle().is_some_and(|current| Arc::ptr_eq(&current, &connection)) {
+                    if let Ok(track) = outcome { retire_local_track(track); }
+                    let _ = respond.send(Err(TransportError::Closed("publication owner changed".into())));
+                    return;
+                }
+                let track = match outcome {
+                    Ok(track) => track,
+                    Err(error) => { let _ = respond.send(Err(error)); return; }
+                };
+                self.local_tracks.insert(kind, LocalPublication {
+                    track: Arc::clone(&track), muted, applied_muted: muted,
+                });
+                self.apply_pause();
                 let own_member_id = self.own_member_id.clone();
                 self.add_local_stream(&own_member_id, kind);
+                // A cancelled caller cannot own a capture handle. Retain the
+                // publication for explicit retraction (including on failure),
+                // but do not intentionally leave it unmuted.
+                if respond.send(Ok(track)).is_err() {
+                    if let Some(publication) = self.local_tracks.get_mut(&kind) {
+                        publication.muted = true;
+                        match publication.track.set_muted(true) {
+                            Ok(()) => publication.applied_muted = true,
+                            Err(error) => log::warn!("could not mute abandoned local publication: {error}"),
+                        }
+                    }
+                    self.set_member_muted(&own_member_id, kind, true);
+                }
             }
             ActorMessage::SetLocalMuted {
                 kind,
@@ -1223,6 +1290,10 @@ impl Actor {
             } => {
                 // A mute set while paused holds, and only reaches the
                 // transport once the pause would not override it (034 R17).
+                if self.ended || self.local_operations.contains(&kind) {
+                    let _ = respond.send(Err(TransportError::Closed("call ended or publication is changing".into())));
+                    return;
+                }
                 let paused = self.lapsed();
                 let outcome = match self.local_tracks.get(&kind) {
                     Some(publication) => publication.track.set_muted(muted || paused),
@@ -1245,38 +1316,43 @@ impl Actor {
                 let _ = respond.send(outcome);
             }
             ActorMessage::Unpublish { kind, respond } => {
+                if self.ended || respond.is_closed() {
+                    let _ = respond.send(Err(TransportError::Closed("call ended or retract cancelled".into())));
+                    return;
+                }
+                if self.local_operations.contains(&kind) {
+                    let _ = respond.send(Err(TransportError::Unsupported(format!("local {kind:?} publication is changing"))));
+                    return;
+                }
                 let Some(publication) = self.local_tracks.get(&kind) else {
                     let _ = respond.send(Err(TransportError::Unsupported(format!(
                         "nothing of kind {kind:?} is published locally"
                     ))));
                     return;
                 };
-                // Awaited off-actor like the publish itself, and the actor
-                // learns the outcome through `LocalUnpublished`: a retraction
-                // can fail while the room is live (the room-closed case comes
-                // back as success from the transport), and clearing local
-                // state on a failed attempt would leave a still-live
-                // publication that nothing can mute or retract anymore.
                 let track = Arc::clone(&publication.track);
+                self.local_operations.insert(kind);
                 let messages = self.messages_tx.clone();
                 rt::spawn(async move {
                     let outcome = track.unpublish().await;
-                    if outcome.is_ok() {
-                        let _ = messages.send(ActorMessage::LocalUnpublished { kind, track });
-                    }
-                    let _ = respond.send(outcome);
+                    let _ = messages.send(ActorMessage::LocalUnpublished { kind, track, outcome, respond });
                 });
             }
-            ActorMessage::LocalUnpublished { kind, track } => {
-                if self
-                    .local_tracks
-                    .get(&kind)
+            ActorMessage::LocalUnpublished { kind, track, outcome, respond } => {
+                self.local_operations.remove(&kind);
+                if self.ended || !self.local_tracks.get(&kind)
                     .is_some_and(|current| Arc::ptr_eq(&current.track, &track))
                 {
+                    let _ = respond.send(Err(TransportError::Closed("retraction owner changed".into())));
+                    return;
+                }
+                if outcome.is_ok() {
                     self.local_tracks.remove(&kind);
                     let own_member_id = self.own_member_id.clone();
                     self.remove_stream(&own_member_id, kind);
                 }
+                // Failure retains the exact publication for a later retry.
+                let _ = respond.send(outcome);
             }
             ActorMessage::SetConstraints {
                 member_id,
@@ -1358,10 +1434,15 @@ impl Actor {
         // The roster becomes exactly the snapshot's members, so this is the
         // count after the change, whichever event carries it.
         let participant_count = current_ids.iter().collect::<HashSet<_>>().len() as u32;
+        let replaced: HashSet<&str> = snapshot.iter()
+            .filter(|member| self.pool.membership_replaced(member))
+            .map(|member| member.member_id.as_str())
+            .collect();
         let departed: Vec<Participant> = self
             .roster
             .iter()
-            .filter(|participant| !current_ids.contains(&participant.member_id))
+            .filter(|participant| !current_ids.contains(&participant.member_id)
+                || replaced.contains(participant.member_id.as_str()))
             .cloned()
             .collect();
         for participant in departed {
@@ -1371,6 +1452,7 @@ impl Actor {
             );
         }
 
+        self.membership_generations = snapshot.iter().map(|member| (member.member_id.clone(), member.membership_ts)).collect();
         for member in &snapshot {
             if self.roster.iter().any(|p| p.member_id == member.member_id) {
                 continue;
@@ -1463,6 +1545,7 @@ impl Actor {
                     log::info!("media connection {connection_key} is {state:?}");
                     // Our own focus up: the call's media is (034 R24).
                     if state == ConnectionState::Connected
+                        && self.pool.own_connection_state() == ConnectionState::Connected
                         && self.own_connection_key.as_deref() == Some(connection_key.as_str())
                         && let Some(status) = &self.media_status
                     {
@@ -1591,7 +1674,7 @@ impl Actor {
 
         // Seeded silently: a member arriving with their hand up did not just
         // raise it. The position is set once the roster is complete.
-        let hand_raised_at_ms = self.hand_raised_at(&member.member_id);
+        let hand_raised_at_ms = self.hand_raised_at(member);
         // Our own publications outlive any single membership: they can go up
         // before the first one lands (the SFU connection is adopted
         // independently of the snapshot) and they survive one being re-created.
@@ -1661,7 +1744,9 @@ impl Actor {
             let hand = self
                 .raised_hands
                 .iter()
-                .find(|hand| hand.member_id == participant.member_id);
+                .find(|hand| hand.member_id == participant.member_id
+                    && hand.sender == participant.user_id
+                    && self.membership_generations.get(&participant.member_id) == Some(&hand.membership_ts));
             let now = hand.map(|hand| hand.raised_at_ms);
             if participant.hand_raised_at_ms == now {
                 continue;
@@ -1701,10 +1786,11 @@ impl Actor {
         }
     }
 
-    fn hand_raised_at(&self, member_id: &str) -> Option<u64> {
+    fn hand_raised_at(&self, member: &JoinedMembership) -> Option<u64> {
         self.raised_hands
             .iter()
-            .find(|hand| hand.member_id == member_id)
+            .find(|hand| hand.member_id == member.member_id
+                && hand.sender == member.sender && hand.membership_ts == member.membership_ts)
             .map(|hand| hand.raised_at_ms)
     }
 
@@ -1722,6 +1808,10 @@ impl Actor {
         let mut next = 1;
         for hand in &self.raised_hands {
             if let Some(&i) = index.get(hand.member_id.as_str()) {
+                if hand.sender != self.roster[i].user_id
+                    || self.membership_generations.get(&hand.member_id) != Some(&hand.membership_ts) {
+                    continue;
+                }
                 positions[i] = Some(next);
                 next += 1;
             }
@@ -1746,7 +1836,9 @@ impl Actor {
         if !self
             .roster
             .iter()
-            .any(|participant| participant.member_id == reaction.member_id)
+            .any(|participant| participant.member_id == reaction.member_id
+                && participant.user_id == reaction.sender
+                && self.membership_generations.get(&participant.member_id) == Some(&reaction.membership_ts))
         {
             log::debug!(
                 "dropping reaction from {} ({}): not on the roster yet",
@@ -1908,6 +2000,14 @@ impl Actor {
         self.publish_roster();
     }
 
+    fn retire_local_publications(&mut self) {
+        let own = self.own_member_id.clone();
+        for (kind, publication) in std::mem::take(&mut self.local_tracks) {
+            retire_local_track(publication.track);
+            self.remove_stream(&own, kind);
+        }
+    }
+
     // ---- end ---------------------------------------------------------------
 
     /// Close all pooled peer-focus connections, once. The adopted own-focus
@@ -1919,6 +2019,7 @@ impl Actor {
             return;
         }
         self.ended = true;
+        self.retire_local_publications();
         self.pool.close();
     }
 
@@ -2157,6 +2258,7 @@ mod tests {
                 matrix_rtc_transport::ResolvedConstraints,
             )>,
         >,
+        publish_gate: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
         /// `(kind, muted)` of every local mute call that reached the transport.
         local_mutes: StdMutex<Vec<(MediaStreamKind, bool)>>,
         /// Kind of every unpublish call that reached the transport.
@@ -2235,6 +2337,8 @@ mod tests {
                 options.kind,
                 options.muted,
             ));
+            let gate = self.state.publish_gate.lock().unwrap().clone();
+            if let Some(gate) = gate { gate.acquire().await.unwrap().forget(); }
             Ok(Arc::new(FakeLocalTrack::new(
                 options.kind,
                 Arc::clone(&self.state),
@@ -2322,6 +2426,9 @@ mod tests {
         /// A barrier every `receive_stats` waits at before answering, so a
         /// test can prove several were in flight together.
         gate: Option<Arc<tokio::sync::Barrier>>,
+        entered: Option<Arc<tokio::sync::Barrier>>,
+        /// Model a permanently stalled stats RPC, even after cancellation.
+        stall_stats: bool,
     }
 
     impl FakeTrack {
@@ -2330,6 +2437,8 @@ mod tests {
                 kind,
                 stats: None,
                 gate: None,
+                entered: None,
+                stall_stats: false,
             }
         }
 
@@ -2338,6 +2447,8 @@ mod tests {
                 kind,
                 stats: Some(stats),
                 gate: None,
+                entered: None,
+                stall_stats: false,
             }
         }
     }
@@ -2359,6 +2470,12 @@ mod tests {
         }
 
         async fn receive_stats(&self) -> Option<ReceiveStats> {
+            if self.stall_stats {
+                return std::future::pending::<Option<ReceiveStats>>().await;
+            }
+            if let Some(entered) = &self.entered {
+                entered.wait().await;
+            }
             if let Some(gate) = &self.gate {
                 gate.wait().await;
             }
@@ -2525,6 +2642,7 @@ mod tests {
         ReceivedReaction {
             member_id: member_id.to_owned(),
             sender: format!("@{member_id}:example.org"),
+            membership_ts: None,
             emoji: "👏".to_owned(),
             name: "clapping".to_owned(),
             sound: matrix_rtc_call::ReactionSound::Named("clap".to_owned()),
@@ -2742,12 +2860,8 @@ mod tests {
 
     /// Let the actor apply everything queued so far.
     ///
-    /// `publish` resolves as soon as the transport answered, while the
-    /// `LocalPublished` that puts the stream on the roster is still queued —
-    /// and the membership watch is a different `select!` branch, so a test that
-    /// publishes and then feeds a snapshot would race the two. Muting a kind
-    /// that was never published is answered without touching any state, so its
-    /// reply proves every message queued before it has been applied.
+    /// Muting a kind that was never published is answered without touching
+    /// any state, so its reply proves earlier actor messages were applied.
     async fn settle(engine: &CallEngine) {
         engine
             .set_local_muted(MediaStreamKind::Data, true)
@@ -2817,6 +2931,54 @@ mod tests {
         // Everyone is on the own focus, which awaits adoption: the engine
         // must not have opened a connection itself.
         assert_eq!(connect_count(&fx, OWN_FOCUS), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_rejoin_replaces_roster_entry_without_an_empty_snapshot() {
+        let fx = fixture();
+        let own = member("own", "@alice:example.org");
+        let mut bob = member("bob", "@bob:example.org");
+        bob.membership_ts = Some(100);
+        fx.memberships.send(vec![own.clone(), bob.clone()]).unwrap();
+        rostered(&fx, &["own", "bob"]).await;
+        bob.membership_ts = Some(300);
+        fx.memberships.send(vec![own, bob]).unwrap();
+        wait_until(|| fx.engine.participants().iter().any(|p|
+            p.member_id == "bob" && p.joined_at_ms == Some(300))).await;
+        assert_eq!(fx.engine.participants().iter().filter(|p| p.member_id == "bob").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_replacement_does_not_inherit_queued_hand_or_reaction() {
+        let mut fx = fixture();
+        let own = member("own", "@alice:example.org");
+        let mut bob = member("bob", "@bob:example.org");
+        bob.membership_ts = Some(100);
+        fx.memberships.send(vec![own.clone(), bob.clone()]).unwrap();
+        rostered(&fx, &["own", "bob"]).await;
+        let old_hand = RaisedHand { membership_ts: Some(100), ..hand("bob", 110) };
+        fx.raised_hands.send(vec![old_hand.clone()]).unwrap();
+        wait_until(|| participant(&fx, "bob").hand_raised_at_ms == Some(110)).await;
+        bob.membership_ts = Some(300);
+        fx.memberships.send(vec![own, bob]).unwrap();
+        wait_until(|| participant(&fx, "bob").joined_at_ms == Some(300)).await;
+        assert_eq!(participant(&fx, "bob").hand_raised_at_ms, None);
+        assert_eq!(participant(&fx, "bob").hand_raised_position, None);
+        // A delayed old-generation hand watch cannot reseed the replacement.
+        fx.raised_hands.send(vec![old_hand]).unwrap();
+        // Broadcast order is FIFO: the fresh reaction fences the stale one.
+        fx.reactions.send(ReceivedReaction { membership_ts: Some(100), ..reaction_from("bob") }).unwrap();
+        fx.reactions.send(ReceivedReaction { membership_ts: Some(300), emoji: "new".into(), ..reaction_from("bob") }).unwrap();
+        loop {
+            if let CallEvent::Reaction { emoji, .. } = next_event(&mut fx.events).await {
+                assert_eq!(emoji, "new");
+                break;
+            }
+        }
+        assert_eq!(participant(&fx, "bob").hand_raised_at_ms, None);
+        fx.raised_hands.send(vec![RaisedHand { membership_ts: Some(300), ..hand("bob", 310) }]).unwrap();
+        wait_until(|| participant(&fx, "bob").hand_raised_at_ms == Some(310)).await;
+        assert_eq!(participant(&fx, "bob").hand_raised_position, Some(1));
     }
 
     /// Another device of ours is a participant of its own, and its arrival
@@ -3538,6 +3700,8 @@ mod tests {
             kind: Microphone,
             stats: Some(stats_with(n)),
             gate: Some(gate.clone()),
+            entered: None,
+            stall_stats: false,
         };
         with_tracks(
             &fx,
@@ -3568,6 +3732,64 @@ mod tests {
                 Some(stats_with(3))
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn receive_stats_discard_departed_tracks_but_keep_unchanged_peer() {
+        use MediaStreamKind::Microphone;
+        let fx = fixture();
+        fx.memberships.send(vec![member("bob", "@bob:example.org"),
+            member("carol", "@carol:example.org")]).unwrap();
+        rostered(&fx, &["bob", "carol"]).await;
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
+        with_tracks(&fx, vec![
+            ("bob", Microphone, FakeTrack { kind: Microphone, stats: Some(stats_with(1)),
+                entered: Some(entered.clone()), gate: Some(gate.clone()), stall_stats: false }),
+            ("carol", Microphone, FakeTrack::with_stats(Microphone, stats_with(2))),
+        ]).await;
+        let request = [("bob".to_owned(), Microphone), ("carol".to_owned(), Microphone)];
+        let sample = fx.engine.receive_stats_for(&request);
+        let departure = async {
+            entered.wait().await;
+            fx.memberships.send(vec![member("carol", "@carol:example.org")]).unwrap();
+            wait_until(|| fx.engine.remote_track("bob", Microphone).is_none()).await;
+            gate.wait().await;
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(sample, departure)
+        }).await.expect("stats and roster transition must finish");
+        assert_eq!(result, vec![None, Some(stats_with(2))]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receive_stats_timeout_does_not_report_zero_or_block_other_streams() {
+        use MediaStreamKind::Microphone;
+        let fx = fixture();
+        fx.memberships.send(vec![member("bob", "@bob:example.org"),
+            member("carol", "@carol:example.org")]).unwrap();
+        rostered(&fx, &["bob", "carol"]).await;
+        with_tracks(&fx, vec![
+            ("bob", Microphone, FakeTrack { kind: Microphone, stats: Some(stats_with(1)),
+                entered: None, gate: None, stall_stats: true }),
+            ("carol", Microphone, FakeTrack::with_stats(Microphone, stats_with(2))),
+        ]).await;
+        let request = [("bob".to_owned(), Microphone), ("carol".to_owned(), Microphone)];
+        // A Barrier::wait future is not cancellation-safe: a timed-out waiter
+        // can count toward its next generation. A permanently pending RPC
+        // models a stalled transport without leaking state across attempts.
+        for _ in 0..2 {
+            let started = tokio::time::Instant::now();
+            assert_eq!(tokio::time::timeout(Duration::from_secs(6), fx.engine.receive_stats_for(&request))
+                .await.expect("collection must be bounded"), vec![None, Some(stats_with(2))]);
+            assert!(started.elapsed() >= RECEIVE_STATS_TIMEOUT, "batch must await its timeout");
+            let started = tokio::time::Instant::now();
+            assert_eq!(tokio::time::timeout(Duration::from_secs(6), fx.engine.receive_stats("bob", Microphone))
+                .await.expect("single collection must be bounded"), None);
+            assert!(started.elapsed() >= RECEIVE_STATS_TIMEOUT, "single request must await its timeout");
+            assert_eq!(tokio::time::timeout(Duration::from_secs(1), fx.engine.receive_stats("carol", Microphone))
+                .await.expect("healthy track must remain responsive"), Some(stats_with(2)));
+        }
     }
 
     #[tokio::test]
@@ -4273,6 +4495,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn local_publish_is_reserved_and_acknowledged_after_roster_commit() {
+        let fx = fixture();
+        fx.memberships.send(vec![member("own", "@own:example.org")]).unwrap();
+        rostered(&fx, &["own"]).await;
+        let _connection = adopt(&fx);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *fx.state.publish_gate.lock().unwrap() = Some(gate.clone());
+        let first = fx.engine.publish(PublishOptions::microphone());
+        tokio::pin!(first);
+        tokio::select! {
+            _ = &mut first => panic!("publication completed before gate"),
+            _ = wait_until(|| !fx.state.published.lock().unwrap().is_empty()) => {}
+        }
+        assert!(fx.engine.publish(PublishOptions::microphone()).await.is_err());
+        assert_eq!(fx.state.published.lock().unwrap().len(), 1);
+        gate.add_permits(1);
+        first.await.expect("first publication succeeds");
+        assert!(fx.engine.participants().iter().any(|p| p.is_local && p.streams.len() == 1));
+        assert!(fx.engine.publish(PublishOptions::microphone()).await.is_err());
+        fx.engine.unpublish(MediaStreamKind::Microphone).await.unwrap();
+        assert!(fx.engine.participants().iter().any(|p| p.is_local && p.streams.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn late_local_publish_on_replaced_owner_is_retracted() {
+        let fx = fixture();
+        let _connection = adopt(&fx);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *fx.state.publish_gate.lock().unwrap() = Some(gate.clone());
+        let first = fx.engine.publish(PublishOptions::microphone());
+        tokio::pin!(first);
+        tokio::select! {
+            _ = &mut first => panic!("publication completed before gate"),
+            _ = wait_until(|| !fx.state.published.lock().unwrap().is_empty()) => {}
+        }
+        let _replacement = adopt(&fx);
+        settle(&fx.engine).await;
+        gate.add_permits(1);
+        assert!(first.await.is_err());
+        wait_until(|| !fx.state.unpublished.lock().unwrap().is_empty()).await;
+        assert_eq!(*fx.state.unpublished.lock().unwrap(), vec![MediaStreamKind::Microphone]);
+        assert_eq!(*fx.state.local_mutes.lock().unwrap(), vec![(MediaStreamKind::Microphone, true)]);
+    }
+
     /// Unpublishing something we never published is an error, mirroring mute.
     #[tokio::test]
     async fn unpublishing_an_unpublished_kind_fails() {
@@ -4777,6 +5044,7 @@ mod tests {
         RaisedHand {
             member_id: member_id.to_owned(),
             sender: format!("@{member_id}:example.org"),
+            membership_ts: None,
             reaction_event_id: format!("${member_id}"),
             raised_at_ms,
             from_backfill: false,

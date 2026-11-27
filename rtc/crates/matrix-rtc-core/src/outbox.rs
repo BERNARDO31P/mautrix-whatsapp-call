@@ -54,6 +54,8 @@ pub enum SendKind {
     SupersededLeave {
         sticky_key: String,
     },
+    /// One batched rollout of the current or next media key.
+    KeyRollout,
     /// The media key to one member.
     KeyDistribution {
         member_id: String,
@@ -195,6 +197,34 @@ pub enum SignallingHealth {
     },
 }
 
+/// Exact local ownership of one non-idempotent delayed creation.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelayOperation {
+    pub token: String,
+    pub room_id: String,
+    pub slot_id: String,
+    pub member_id: String,
+    pub user_id: String,
+    pub device_id: String,
+}
+
+/// Optional durable ownership record for a legacy state key. The host must
+/// serialize access for a given device, including across process restarts.
+/// A record must be durable before mark returns successfully. Errors are
+/// fail-closed, and clear must never delete a different owner's record.
+pub trait LegacyLeaveJournal: Send + Sync {
+    fn pending(&self, room_id: &str, state_key: &str) -> Result<bool, CommandError>;
+    fn mark(&self, room_id: &str, state_key: &str) -> Result<(), CommandError>;
+    fn clear(&self, room_id: &str, state_key: &str) -> Result<(), CommandError>;
+    // Other hosts may choose to implement durable operation ownership. The
+    // worker does; non-worker backends retain their existing in-memory policy.
+    fn records_delays(&self) -> bool { false }
+    fn begin_delay(&self, _operation: &DelayOperation) -> Result<(), CommandError> { Ok(()) }
+    fn identify_delay(&self, _operation: &DelayOperation, _id: &str) -> Result<(), CommandError> { Ok(()) }
+    fn settle_delay(&self, _operation: &DelayOperation, _id: Option<&str>) -> Result<(), CommandError> { Ok(()) }
+}
+
 /// The retry layer and health cell. Cheap to clone; clones share everything.
 #[derive(Clone)]
 pub struct Outbox {
@@ -203,6 +233,10 @@ pub struct Outbox {
 
 struct Inner {
     slots: Mutex<HashMap<SlotKey, Slot>>,
+    // Legacy state keys are reused even after reopening a room. Retain an
+    // uncertain leave fence for the lifetime of the client.
+    legacy_leaves: Mutex<HashMap<(String, String), Arc<tokio::sync::Mutex<bool>>>>,
+    legacy_journal: Option<Arc<dyn LegacyLeaveJournal>>,
     /// Bumped on every slot change and every "online", so a waiting send
     /// re-reads its slot.
     poke: watch::Sender<u64>,
@@ -239,9 +273,20 @@ impl Outbox {
 
     /// An outbox whose health timestamps come from `clock` (see [`RtcClock`]).
     pub fn with_clock(clock: RtcClock) -> Self {
+        Self::configured(clock, None)
+    }
+
+    /// A worker-owned outbox with durable legacy state-key ownership.
+    pub fn with_legacy_journal(journal: Arc<dyn LegacyLeaveJournal>) -> Self {
+        Self::configured(Arc::new(crate::own_membership::now_ms), Some(journal))
+    }
+
+    fn configured(clock: RtcClock, legacy_journal: Option<Arc<dyn LegacyLeaveJournal>>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 slots: Mutex::default(),
+                legacy_leaves: Mutex::default(),
+                legacy_journal,
                 poke: watch::Sender::new(0),
                 online_epoch: AtomicU64::new(0),
                 health: watch::Sender::new(SignallingHealth::Reachable),
@@ -249,6 +294,44 @@ impl Outbox {
                 clock,
             }),
         }
+    }
+
+    /// A shared fence for an exact room and legacy membership state key.
+    /// True means a previous leave has not been conclusively settled.
+    pub(crate) fn legacy_leave_fence(
+        &self,
+        room_id: &str,
+        state_key: &str,
+    ) -> Arc<tokio::sync::Mutex<bool>> {
+        let mut fences = self.inner.legacy_leaves.lock().unwrap();
+        fences.entry((room_id.to_owned(), state_key.to_owned()))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(false)))
+            .clone()
+    }
+
+    pub(crate) fn legacy_pending(&self, room: &str, key: &str) -> Result<bool, CommandError> {
+        self.inner.legacy_journal.as_ref().map_or(Ok(false), |j| j.pending(room, key))
+    }
+
+    pub(crate) fn mark_legacy(&self, room: &str, key: &str) -> Result<(), CommandError> {
+        self.inner.legacy_journal.as_ref().map_or(Ok(()), |j| j.mark(room, key))
+    }
+
+    pub(crate) fn clear_legacy(&self, room: &str, key: &str) -> Result<(), CommandError> {
+        self.inner.legacy_journal.as_ref().map_or(Ok(()), |j| j.clear(room, key))
+    }
+
+    pub(crate) fn records_delays(&self) -> bool {
+        self.inner.legacy_journal.as_ref().is_some_and(|j| j.records_delays())
+    }
+    pub(crate) fn begin_delay(&self, operation: &DelayOperation) -> Result<(), CommandError> {
+        self.inner.legacy_journal.as_ref().map_or(Ok(()), |j| j.begin_delay(operation))
+    }
+    pub(crate) fn identify_delay(&self, operation: &DelayOperation, id: &str) -> Result<(), CommandError> {
+        self.inner.legacy_journal.as_ref().map_or(Ok(()), |j| j.identify_delay(operation, id))
+    }
+    pub(crate) fn settle_delay(&self, operation: &DelayOperation, id: Option<&str>) -> Result<(), CommandError> {
+        self.inner.legacy_journal.as_ref().map_or(Ok(()), |j| j.settle_delay(operation, id))
     }
 
     /// The clock health timestamps come from, which a membership machine

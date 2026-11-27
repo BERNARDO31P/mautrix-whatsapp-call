@@ -21,6 +21,23 @@ use matrix_rtc_transport::livekit::token::{legacy_token_request, parse_sfu_token
 
 use crate::Error;
 
+// Shared syntax rules keep native and browser selection aligned.
+use matrix_rtc_transport::livekit::{valid_service_url, valid_sfu_url, valid_sfu_token};
+
+pub(crate) fn validate_service_url(url: &str) -> Result<(), Error> {
+    valid_service_url(url).then_some(()).ok_or(Error::InvalidEndpoint("JWT service"))
+}
+
+pub(crate) fn validate_sfu_url(url: &str) -> Result<(), Error> {
+    valid_sfu_url(url).then_some(()).ok_or(Error::InvalidEndpoint("SFU"))
+}
+
+pub(crate) fn validate_sfu_token(token: &SfuToken) -> Result<(), Error> {
+    validate_sfu_url(&token.url)?;
+    valid_sfu_token(token).then_some(()).ok_or(Error::InvalidToken)
+}
+
+
 /// Exchange an OpenID token for a LiveKit SFU JWT via the legacy JWT service's
 /// `/sfu/get` endpoint, for every transport naming a `livekit_service_url`.
 ///
@@ -33,6 +50,7 @@ pub async fn get_legacy_token(
     device_id: &str,
     openid_token: &OpenIdToken,
 ) -> Result<SfuToken, Error> {
+    validate_service_url(livekit_service_url)?;
     let (endpoint, body) = legacy_token_request(livekit_service_url, room, device_id, openid_token);
     post_for_token(http, &endpoint, &body, room).await
 }
@@ -60,6 +78,7 @@ async fn post_for_token(
     let token = parse_sfu_token(status, &body).inspect_err(|error| {
         log::warn!("SFU token request to {endpoint} failed: {error}");
     })?;
+    validate_sfu_token(&token)?;
     // Never the JWT itself.
     log::debug!(
         "[{log_tag}] SFU token granted for {} (jwt {} chars)",
@@ -67,4 +86,33 @@ async fn post_for_token(
         token.jwt.len(),
     );
     Ok(token)
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn service_base_requires_http_and_no_query_or_fragment() {
+        for url in ["https://matrix.example/livekit/jwt/", "http://localhost:8080"] {
+            assert!(validate_service_url(url).is_ok(), "{url}");
+        }
+        for url in ["", "relative", "wss://matrix.example", "https://matrix.example?query=1",
+                    "https://matrix.example/#x", "https://user:pass@matrix.example", "https://matrix.example:0"] {
+            assert!(validate_service_url(url).is_err(), "{url}");
+        }
+    }
+
+    #[test]
+    fn token_requires_websocket_endpoint_and_nonblank_credential() {
+        for (url, jwt) in [("wss://matrix.example/livekit/sfu", "mock-jwt"),
+                           ("ws://localhost:7880", "mock-jwt")] {
+            assert!(validate_sfu_token(&SfuToken { url: url.into(), jwt: jwt.into() }).is_ok());
+        }
+        for (url, jwt) in [("https://matrix.example", "mock-jwt"), ("", "mock-jwt"),
+                           ("wss://matrix.example", ""), ("wss://matrix.example", "x y"),
+                           ("wss://matrix.example", "x\n"), ("wss://matrix.example/#x", "mock-jwt")] {
+            assert!(validate_sfu_token(&SfuToken { url: url.into(), jwt: jwt.into() }).is_err());
+        }
+    }
 }

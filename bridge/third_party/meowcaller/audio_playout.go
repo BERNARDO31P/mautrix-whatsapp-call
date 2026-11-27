@@ -18,6 +18,8 @@ type audioPlayoutBuffer struct {
 	prefill        [][]float32
 	prefillSamples int
 	started        bool
+	clockScale     uint32 // RFC Opus RTP ticks per 16 kHz PCM sample; 0/1 for MLow
+	partialPCM     []float32
 }
 
 func newAudioPlayoutBuffer() *audioPlayoutBuffer {
@@ -31,18 +33,24 @@ func (p *audioPlayoutBuffer) Push(timestamp uint32, frame []float32, sink AudioS
 	}
 
 	delta := timestamp - p.pending.timestamp
-	if delta == 0 || delta > audioPlayoutMaxGapSamples {
+	// Duplicate PCM must not replace the pending frame or reset prefill.
+	if delta == 0 {
+		return false, nil
+	}
+	scale := max(p.clockScale, 1)
+	if delta > audioPlayoutMaxGapSamples*scale || delta%scale != 0 {
 		p.reset(timestamp, frame)
 		return false, nil
 	}
 
-	ready := alignAudioFrame(p.pending.pcm, int(delta))
+	ready := alignAudioFrame(p.pending.pcm, int(delta/scale))
 	p.pending = &audioPlayoutFrame{timestamp: timestamp, pcm: frame}
 	if p.started && sink != nil {
-		return false, sink.WriteFrame(ready)
+		return false, p.write(sink, ready)
 	}
 	if p.started {
 		p.started = false
+		p.partialPCM = nil
 		p.prefill = nil
 		p.prefillSamples = 0
 	}
@@ -59,7 +67,7 @@ func (p *audioPlayoutBuffer) Push(timestamp uint32, frame []float32, sink AudioS
 
 	for len(p.prefill) > 0 {
 		buffered := p.prefill[0]
-		if err = sink.WriteFrame(buffered); err != nil {
+		if err = p.write(sink, buffered); err != nil {
 			return false, err
 		}
 		p.prefillSamples -= len(buffered)
@@ -74,7 +82,7 @@ func (p *audioPlayoutBuffer) Flush(sink AudioSink) error {
 	if !p.started || p.pending == nil || sink == nil {
 		return nil
 	}
-	err := sink.WriteFrame(p.pending.pcm)
+	err := p.write(sink, p.pending.pcm)
 	p.pending = nil
 	return err
 }
@@ -89,11 +97,12 @@ func (p *audioPlayoutBuffer) Drain(sink AudioSink) error {
 	p.prefill = nil
 	p.prefillSamples = 0
 	p.started = false
+	defer func() { p.partialPCM = nil }()
 	if sink == nil {
 		return nil
 	}
 	for _, frame := range frames {
-		if err := sink.WriteFrame(frame); err != nil {
+		if err := p.write(sink, frame); err != nil {
 			return err
 		}
 	}
@@ -104,6 +113,7 @@ func (p *audioPlayoutBuffer) reset(timestamp uint32, frame []float32) {
 	p.pending = &audioPlayoutFrame{timestamp: timestamp, pcm: frame}
 	p.prefill = nil
 	p.prefillSamples = 0
+	p.partialPCM = nil
 	p.started = false
 }
 
@@ -121,4 +131,25 @@ func alignAudioFrame(frame []float32, samples int) []float32 {
 	aligned := make([]float32, samples)
 	copy(aligned, frame)
 	return aligned
+}
+
+// The bridge wire accepts exact 60 ms frames. Standard Opus may decode 2.5–120
+// ms; combine/split only the Opus path, retaining at most one partial frame.
+func (p *audioPlayoutBuffer) write(sink AudioSink, pcm []float32) error {
+	if p.clockScale <= 1 {
+		return sink.WriteFrame(pcm)
+	}
+	p.partialPCM = append(p.partialPCM, pcm...)
+	for len(p.partialPCM) >= FrameSamples {
+		frame := append([]float32(nil), p.partialPCM[:FrameSamples]...)
+		p.partialPCM = p.partialPCM[FrameSamples:]
+		if err := sink.WriteFrame(frame); err != nil {
+			p.partialPCM = nil
+			return err
+		}
+	}
+	if len(p.partialPCM) == 0 {
+		p.partialPCM = nil
+	}
+	return nil
 }

@@ -28,8 +28,10 @@ type Client struct {
 	getGroupInfo func(context.Context, types.JID) (*types.GroupInfo, error)
 	ownGroupJIDs func() []types.JID
 
-	mu             sync.Mutex
-	onIncomingCall func(*Call)
+	mu                   sync.Mutex
+	onIncomingCall       func(*Call)
+	incomingAdmission    func(*Call) bool
+	incomingOfferFactory func() (func(*Call) bool, func(*Call))
 }
 
 // CallOptions controls media negotiated for an outbound call.
@@ -41,6 +43,7 @@ type CallOptions struct {
 
 // GroupCallOptions controls media and optional chat binding for an outbound group call.
 type GroupCallOptions struct {
+	strictAdHoc   bool // preserve the unbound mode for the Matrix fixed-room extension
 	AvailableOnly bool
 	Targets       []string
 	// GroupJID binds the call to a WhatsApp group. Leave empty for an ad-hoc call.
@@ -297,6 +300,46 @@ func (c *Client) OnIncomingCall(fn func(*Call)) {
 	c.mu.Lock()
 	c.onIncomingCall = fn
 	c.mu.Unlock()
+}
+
+// SetIncomingCallAdmission installs an optional pre-preaccept policy. A false
+// result retires only the local ringing handle without a remote reject. The
+// policy runs outside the client and engine locks and must not answer the call.
+// Nil preserves the standalone caller's existing eager preparation behavior.
+func (c *Client) SetIncomingCallAdmission(fn func(*Call) bool) {
+	c.mu.Lock()
+	c.incomingAdmission = fn
+	c.mu.Unlock()
+}
+
+func (c *Client) admitsIncomingCall(call *Call) bool {
+	c.mu.Lock()
+	fn := c.incomingAdmission
+	c.mu.Unlock()
+	return fn == nil || fn(call)
+}
+
+// SetIncomingOfferFactory binds both preparation and delivery to a single offer
+// scope, captured before decryption. The legacy admission/listener pair remains
+// the default. A factory must not retain the Call after returning its callbacks.
+func (c *Client) SetIncomingOfferFactory(fn func() (func(*Call) bool, func(*Call))) {
+	c.mu.Lock()
+	c.incomingOfferFactory = fn
+	c.mu.Unlock()
+}
+
+func (c *Client) incomingOfferCallbacks() (func(*Call) bool, func(*Call)) {
+	c.mu.Lock()
+	factory := c.incomingOfferFactory
+	c.mu.Unlock()
+	if factory != nil {
+		return factory()
+	}
+	return c.admitsIncomingCall, func(call *Call) {
+		if fn := c.incomingCallHandler(); fn != nil {
+			fn(call)
+		}
+	}
 }
 
 // incomingCallHandler returns the registered inbound-call listener, or nil.

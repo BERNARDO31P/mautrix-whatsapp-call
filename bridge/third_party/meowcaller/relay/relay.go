@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"context"
 	"fmt"
 	"net"
 
@@ -75,15 +76,31 @@ func (e *CallTransportError) Unwrap() error { return e.Err }
 // DataChannel messages. It owns the whole stack so Close tears it down cleanly
 // (the reference relies on Rust Drop; Go needs explicit cleanup).
 type RelayMediaChannel struct {
-	udp      net.PacketConn
-	dtlsConn net.Conn
-	assoc    *sctp.Association
-	dc       *datachannel.DataChannel
-	log      zerolog.Logger
+	udp          net.PacketConn
+	dtlsConn     net.Conn
+	assoc        *sctp.Association
+	dc           *datachannel.DataChannel
+	log          zerolog.Logger
+	stopLifetime func() bool
+}
+
+// WatchCancellation interrupts blocked media I/O when ctx is cancelled.
+// Stop the returned watcher before releasing a temporary setup context.
+func (c *RelayMediaChannel) WatchCancellation(ctx context.Context) func() bool {
+	return watchSetupCancellation(ctx, c.udp)
+}
+
+// BindLifetime attaches the call context to the channel before it is shared.
+// The channel owns this watcher until Close; bind exactly once.
+func (c *RelayMediaChannel) BindLifetime(ctx context.Context) {
+	c.stopLifetime = c.WatchCancellation(ctx)
 }
 
 // Close tears down the media stack in reverse order of construction.
 func (c *RelayMediaChannel) Close() error {
+	if c.stopLifetime != nil {
+		defer c.stopLifetime()
+	}
 	c.log.Debug().Msg("tearing down relay media channel")
 	var firstErr error
 	for _, closer := range []func() error{c.dc.Close, c.assoc.Close, c.dtlsConn.Close, c.udp.Close} {
@@ -102,6 +119,7 @@ func (c *RelayMediaChannel) Send(data []byte) (int, error) {
 	// NOT VALIDATED: no vector exists for the live transport; exercised only against a real relay.
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/src/voip/transport.rs#L118-L124
 	n, err := c.dc.Write(data)
+	err = relayWriteResult(n, len(data), err)
 	if err != nil {
 		c.log.Debug().Err(err).Int("packet_bytes", len(data)).Msg("relay send failed")
 		return n, &CallTransportError{Op: "send", Err: err}
@@ -129,6 +147,14 @@ func (c *RelayMediaChannel) Recv(buf []byte) (int, error) {
 func ConnectRelayMedia(relayAddr *net.UDPAddr, opts ...Option) (*RelayMediaChannel, error) {
 	// NOT VALIDATED: no vector exists for the live transport; exercised only against a real relay.
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/src/voip/transport.rs#L136-L195
+	return ConnectRelayMediaContext(context.Background(), relayAddr, opts...)
+}
+
+// ConnectRelayMediaContext binds setup I/O to ctx until ownership is transferred.
+func ConnectRelayMediaContext(ctx context.Context, relayAddr *net.UDPAddr, opts ...Option) (*RelayMediaChannel, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, &CallTransportError{Op: "connect", Err: err}
+	}
 	cfg := resolveConfig(opts)
 	lg := cfg.log
 	lg.Debug().Str("relay_addr", relayAddr.String()).Msg("connecting relay media stack")
@@ -149,6 +175,8 @@ func ConnectRelayMedia(relayAddr *net.UDPAddr, opts ...Option) (*RelayMediaChann
 		return nil, &CallTransportError{Op: "connect", Err: fmt.Errorf("bind udp: %w", err)}
 	}
 	cleanup = append(cleanup, udp.Close)
+	stopSetup := watchSetupCancellation(ctx, udp)
+	defer stopSetup()
 	lg.Debug().Str("local_addr", udp.LocalAddr().String()).Msg("relay udp socket bound")
 
 	// 2. DTLS client (self-signed cert; skip server-cert verification).
@@ -164,6 +192,9 @@ func ConnectRelayMedia(relayAddr *net.UDPAddr, opts ...Option) (*RelayMediaChann
 		return fail(fmt.Errorf("dtls handshake: %w", err))
 	}
 	cleanup = append(cleanup, dtlsConn.Close)
+	if err := dtlsConn.HandshakeContext(ctx); err != nil {
+		return fail(fmt.Errorf("dtls handshake: %w", err))
+	}
 	lg.Debug().Msg("relay dtls handshake complete")
 
 	// 3. SCTP association over the DTLS conn.
@@ -183,6 +214,11 @@ func ConnectRelayMedia(relayAddr *net.UDPAddr, opts ...Option) (*RelayMediaChann
 	})
 	if err != nil {
 		return fail(fmt.Errorf("datachannel dial: %w", err))
+	}
+	cleanup = append(cleanup, dc.Close)
+	// Disarm the socket watcher before handing the channel to its owner.
+	if !stopSetup() || ctx.Err() != nil {
+		return fail(ctx.Err())
 	}
 	lg.Debug().Str("label", DataChannelLabel).Msg("relay datachannel open")
 

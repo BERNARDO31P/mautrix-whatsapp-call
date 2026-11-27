@@ -209,6 +209,7 @@ struct Parsed<'a> {
     /// `origin_server_ts`. Taking the minimum is also what stops a peer with a
     /// fast clock from looking alive longer than it is.
     joined_at: u64,
+    expires_at: u64,
     /// `content["m.call.intent"]`, if stated.
     intent: Option<&'a Value>,
     /// `foci_preferred[0]`, verbatim.
@@ -300,6 +301,13 @@ pub fn translate_state_memberships(
             }
         })
         .collect()
+}
+
+/// Earliest expiry of a currently live state membership. Use the same parser
+/// as translation so invalid or already expired events never arm a timer.
+pub(crate) fn next_expiry_ms(events: &[StateMemberEvent], now_ms: u64) -> Option<u64> {
+    events.iter().filter_map(|event| parse(event, now_ms))
+        .map(|member| member.expires_at).min()
 }
 
 /// Apply the per-event rules, or explain in the log why this event contributes
@@ -403,6 +411,7 @@ fn parse<'a>(event: &'a StateMemberEvent, now_ms: u64) -> Option<Parsed<'a>> {
         slot_id,
         application_type: application_type.to_owned(),
         joined_at,
+        expires_at: joined_at.saturating_add(expires),
         intent: object.get("m.call.intent"),
         own_focus: object
             .get("foci_preferred")
@@ -472,8 +481,10 @@ pub struct RoomStateDialect {
     /// perpetually the newest member and hand focus selection to somebody else.
     /// The refresh moves `expires` instead — see [`Self::member_content`].
     ///
-    /// Shared so a clone of the command sender agrees with the original.
-    created_ts: Arc<OnceLock<u64>>,
+    /// Shared wall/monotonic anchor so clones agree on the original join.
+    /// The wall component is serialized; the monotonic component is only
+    /// used to measure elapsed time.
+    join_clock: Arc<OnceLock<(u64, u64)>>,
 }
 
 impl RoomStateDialect {
@@ -492,7 +503,7 @@ impl RoomStateDialect {
             own_device_id: own_device_id.into(),
             room_id: room_id.into(),
             slot_id: slot_id.into(),
-            created_ts: Arc::new(OnceLock::new()),
+            join_clock: Arc::new(OnceLock::new()),
         }
     }
 
@@ -538,7 +549,7 @@ impl RoomStateDialect {
     /// valid *from now* — the same number the sticky dialect hands the
     /// homeserver as its TTL, so both dialects expire our membership on one
     /// clock. It becomes `expires`, measured from the pinned `created_ts`
-    /// (`expires = now - created_ts + lifetime_ms`), which is what makes a
+    /// (`expires = monotonic elapsed since join + lifetime_ms`), which makes a
     /// refresh actually move the deadline: peers read `created_ts + expires`,
     /// and `created_ts` deliberately never moves. `None` — the delayed leave,
     /// whose content is `{}` anyway — falls back to the JS SDK's four hours.
@@ -556,6 +567,16 @@ impl RoomStateDialect {
     /// clients land in different LiveKit rooms and never see each other while
     /// both connections look perfectly healthy.
     pub fn member_content(&self, spec: &Value, lifetime_ms: Option<u64>) -> Value {
+        self.member_content_at(spec, lifetime_ms, now_ms(), crate::own_membership::now_ms())
+    }
+
+    fn member_content_at(
+        &self,
+        spec: &Value,
+        lifetime_ms: Option<u64>,
+        wall_ms: u64,
+        monotonic_ms: u64,
+    ) -> Value {
         // A spec leave, or anything that is not a membership we can dress up.
         // `slot_id` is the tell: the core's leave content still carries one, but
         // an already-legacy content does not.
@@ -564,15 +585,13 @@ impl RoomStateDialect {
         }
 
         let (application, call_id) = legacy_session(&self.slot_id);
-        let created_ts = *self.created_ts.get_or_init(now_ms);
+        let (created_ts, joined_monotonic_ms) = *self.join_clock
+            .get_or_init(|| (wall_ms, monotonic_ms));
 
-        // Measured from `created_ts`, not from now, because that is where peers
-        // measure it from. On the first send the two instants are the same and
-        // this is just `lifetime_ms`; on a refresh it is the elapsed time plus
-        // the lifetime, which pushes `created_ts + expires` out to
-        // `now + lifetime_ms`.
-        let expires =
-            now_ms().saturating_sub(created_ts) + lifetime_ms.unwrap_or(DEFAULT_EXPIRES_MS);
+        // Preserve the protocol's original wall timestamp, but do not let a
+        // local wall-clock correction shorten or extend a refreshed lifetime.
+        let expires = monotonic_ms.saturating_sub(joined_monotonic_ms)
+            .saturating_add(lifetime_ms.unwrap_or(DEFAULT_EXPIRES_MS));
 
         let mut content = json!({
             "application": application,
@@ -1214,6 +1233,34 @@ mod tests {
         // JS SDK's four hours, as before.
         let unstated = dialect.member_content(&spec, None);
         assert!(unstated["expires"].as_u64().expect("stated") >= DEFAULT_EXPIRES_MS);
+    }
+
+    #[test]
+    fn refresh_expiry_ignores_wall_clock_corrections_across_clones() {
+        let dialect = dialect();
+        let spec = content(SPEC_JOIN);
+        let first = dialect.member_content_at(&spec, Some(60_000), 1_000_000, 100);
+        assert_eq!(first["created_ts"], json!(1_000_000));
+        assert_eq!(first["expires"], json!(60_000));
+
+        let backward = dialect.clone().member_content_at(&spec, Some(60_000), 1, 10_100);
+        assert_eq!(backward["created_ts"], first["created_ts"]);
+        assert_eq!(backward["expires"], json!(70_000));
+
+        let forward = dialect.member_content_at(&spec, Some(60_000), 99_000_000, 20_100);
+        assert_eq!(forward["created_ts"], first["created_ts"]);
+        assert_eq!(forward["expires"], json!(80_000));
+    }
+
+    #[test]
+    fn empty_membership_does_not_pin_join_clock_and_expiry_saturates() {
+        let dialect = dialect();
+        assert_eq!(dialect.member_content_at(&json!({}), None, 1, 1), json!({}));
+        let spec = content(SPEC_JOIN);
+        let first = dialect.member_content_at(&spec, Some(10), 2, 2);
+        assert_eq!(first["created_ts"], json!(2));
+        let refresh = dialect.member_content_at(&spec, Some(u64::MAX), 3, 12);
+        assert_eq!(refresh["expires"], json!(u64::MAX));
     }
 
     /// This generation validates `m.call.intent` and logs

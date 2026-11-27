@@ -16,6 +16,7 @@ use matrix_rtc_core::{
     MatrixBackend, Outbox, RawRtcTransport, RtcTransport, SendKind, SendPolicy, SlotKey,
     TransportIntent, executor,
 };
+use matrix_rtc_transport::livekit::{usable_transport, valid_sfu_url};
 use serde_json::Value;
 
 /// The LiveKit transport type a room in `format` publishes and subscribes
@@ -30,7 +31,7 @@ pub fn livekit_transport_type(format: MembershipFormat) -> &'static str {
 /// What a join does with transports.
 #[derive(Clone, Debug, Default)]
 pub enum JoinTransport {
-    /// Publish on the first LiveKit transport the homeserver advertises
+    /// Publish on the first usable LiveKit transport the homeserver advertises
     /// (MSC4143 `rtc_transports`); the join fails if there is none.
     #[default]
     Advertised,
@@ -50,7 +51,7 @@ impl From<LiveKitTransport> for JoinTransport {
 }
 
 /// The join's own choice wins; [`JoinTransport::Advertised`] takes the first
-/// LiveKit entry of the homeserver's transports array, which MSC4143 orders by
+/// usable LiveKit entry of the homeserver's transports array, which MSC4143 orders by
 /// preference, of the room's format's type: in MSC `m.livekit` with a `url`
 /// (R17); in room-state `livekit`, with its `url`, `livekit_service_url` or
 /// both, as Element Call web picks it (R39). No entry is an error rather than
@@ -63,6 +64,15 @@ pub fn choose(
     let transport_type = livekit_transport_type(format);
     match chosen {
         JoinTransport::Publish(transport) => {
+            // The core strips the legacy service field in MSC rooms. Validate
+            // the actual SFU endpoint that will be published, not that unused field.
+            let usable = match format {
+                MembershipFormat::Msc => transport.url().is_some_and(valid_sfu_url),
+                MembershipFormat::RoomState => usable_transport(&transport),
+            };
+            if !usable {
+                return Err(JoinError::InvalidTransport);
+            }
             Ok(TransportIntent::Publish(RtcTransport::LiveKit(transport)))
         }
         JoinTransport::ReceiveOnly => Ok(TransportIntent::ReceiveOnly {
@@ -79,10 +89,10 @@ pub fn choose(
             // every client gets its token for it, and so the identity peers
             // expect us under. In MSC, by its `url` alone.
             .find_map(|entry| match entry.into_typed_in(format) {
-                RtcTransport::LiveKit(livekit) => {
+                RtcTransport::LiveKit(livekit) if usable_transport(&livekit) => {
                     Some(TransportIntent::Publish(RtcTransport::LiveKit(livekit)))
                 }
-                RtcTransport::Unsupported(_) => None,
+                _ => None,
             })
             // Final: the homeserver's configuration, not a failure to reach it
             // (R18).
@@ -326,4 +336,37 @@ mod tests {
         let msc_only = json!([{ "type": "m.livekit", "url": "wss://sfu" }]);
         assert!(advertised_in(&msc_only, MembershipFormat::RoomState).is_none());
     }
+
+    #[test]
+    fn advertised_join_skips_unusable_endpoints_in_format_order() {
+        let advertised = json!([
+            {"type": "livekit", "livekit_service_url": "relative"},
+            {"type": "m.livekit", "url": "https://not-a-websocket.example"},
+            {"type": "livekit", "livekit_service_url": "https://valid.example/jwt"},
+            {"type": "m.livekit", "url": "wss://valid.example/sfu"}
+        ]);
+        assert_eq!(advertised_in(&advertised, MembershipFormat::RoomState),
+            Some(LiveKitTransport::service("https://valid.example/jwt")));
+        assert_eq!(advertised_in(&advertised, MembershipFormat::Msc),
+            Some(LiveKitTransport::sfu("wss://valid.example/sfu")));
+        assert!(matches!(choose(&json!([{"type": "livekit", "url": "invalid"}]),
+            JoinTransport::Advertised, MembershipFormat::RoomState),
+            Err(JoinError::NoLiveKitTransport { .. })));
+    }
+
+    #[test]
+    fn explicit_join_validates_the_effective_format_endpoint() {
+        let both = |url: &str, service: &str| JoinTransport::Publish(
+            LiveKitTransport::new(Some(url.into()), Some(service.into()), None).unwrap());
+        let select = |chosen, format| choose(&Value::Null, chosen, format);
+        assert!(select(both("wss://valid.example", "invalid"), MembershipFormat::Msc).is_ok());
+        assert!(matches!(select(both("wss://valid.example", "invalid"), MembershipFormat::RoomState),
+            Err(JoinError::InvalidTransport)));
+        assert!(matches!(select(both("invalid", "https://valid.example"), MembershipFormat::Msc),
+            Err(JoinError::InvalidTransport)));
+        assert!(select(both("invalid", "https://valid.example"), MembershipFormat::RoomState).is_ok());
+        assert!(matches!(select(livekit("https://valid.example"), MembershipFormat::Msc),
+            Err(JoinError::InvalidTransport)));
+    }
+
 }

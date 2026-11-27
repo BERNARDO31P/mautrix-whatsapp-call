@@ -8,7 +8,7 @@ For the source repository and current prebuilt releases, see <https://github.com
 
 - Linux AMD64 (`uname -m` returns `x86_64`), Docker Engine and Docker Compose v2. A runtime ZIP does not require Go, Rust, LLVM or a compiler on the server.
 - Existing Synapse and mautrix-whatsapp Compose services named exactly `synapse` and `mautrix-whatsapp`, on a shared Docker network where `http://synapse:8008` is reachable from the added services. Synapse must support the MatrixRTC transports API and experimental features below (target Synapse v1.165.0 or newer; verify compatibility before upgrades).
-- The installer probes `http://127.0.0.1:8008/_matrix/client/versions` on the host. Publish Synapse's HTTP listener to loopback if not already available there. The Synapse config directory must be mounted as `/data` in its container. Preserve the existing database, appservice registrations, signing key, media, and bridge sessions.
+- The installer probes `http://127.0.0.1:8008/_matrix/client/versions` on the host. Publish Synapse's HTTP listener to loopback if not already available there. Both `synapse` and `mautrix-whatsapp` must have writable `/data` bind mounts pointing at their respective existing directories under the Matrix root. The installer refuses alternate or shadowed configuration mounts (including separate mounts over the generated Synapse registrations) before building or pausing services; custom layouts require manual adaptation. Preserve the existing database, appservice registrations, signing key, media, and bridge sessions.
 - The WhatsApp bridge must already be logged in and successfully bridging messages. The release is based on mautrix-whatsapp v0.2611.0; do not downgrade an incompatible newer database/schema or silently change the base image. Back up first.
 - A public DNS name, trusted HTTPS certificate, reverse proxy with WebSocket support, and reachable LiveKit media ports. This overlay assumes the actual Matrix `server_name` is also the public HTTPS name (e.g. `matrix.example.com`); a split server-name/delegation topology requires adapting and testing the URLs and JWT homeserver mapping, not changing the existing Matrix identity domain.
 - A MatrixRTC-capable client, e.g. Element X (target Android 26.11.0). Grant microphone/camera permissions. Eligible existing DMs must be encrypted; the installer does not silently encrypt old unencrypted rooms or recreate them.
@@ -76,6 +76,8 @@ Check Synapse's actual `server_name` without printing the rest of its config:
 ```bash
 python3 -c 'import yaml; print(yaml.safe_load(open("/opt/matrix/synapse/homeserver.yaml"))["server_name"])'
 ```
+
+The deployment preflight (`preflight.sh`) requires Docker Compose v2, both existing base services and successful merged configuration validation. It does not report success for an offline YAML-only check. The installer also verifies that both base services exist and all required build inputs and installation helpers are present and nonempty before pausing calls. `bash mautrix-whatsapp-call/preflight.sh --payload-only` performs only that local payload check, without requiring generated credentials or Docker. This check does not prove that the binaries can run or the images can build.
 
 Do not change that name on an existing installation. Check DNS A/AAAA and routing; do not publish an unreachable AAAA record. Confirm your reverse proxy already serves the Matrix Client-Server API with trusted TLS.
 
@@ -264,6 +266,7 @@ Synapse (`/opt/matrix/synapse/homeserver.yaml`):
 ```yaml
 experimental_features:
   msc4143_enabled: true
+  msc4354_enabled: true
   msc4222_enabled: true
   msc4502_enabled: true
   msc4512_enabled: true
@@ -278,7 +281,7 @@ matrix_rtc:
       livekit_service_url: https://matrix.example.com/livekit/jwt
 ```
 
-Existing explicit `max_event_delay_duration` is retained. Existing unrelated YAML and appservice paths are preserved. Additions to `app_service_config_files` are:
+MSC4354 sticky events must be enabled for modern RTC membership and notifications. The worker checks the advertised MSC support before modern call setup; legacy room-state calls do not require sticky events. Existing explicit `max_event_delay_duration` is retained. Existing unrelated YAML and appservice paths are preserved. Additions to `app_service_config_files` are:
 
 ```yaml
   - /data/matrixrtc-registration.yaml
@@ -421,7 +424,7 @@ bash mautrix-whatsapp-call/install-or-upgrade.sh
 bash mautrix-whatsapp-call/verify-worker.sh
 ```
 
-The installer normalizes filesystem permissions, reconciles credentials, merges configs/registrations, validates Compose, builds the local images, temporarily pauses calling, starts LiveKit/JWT, restarts Synapse and the bridge, migrates existing eligible rooms and provisions ghost identities. It starts the background provisioner for future eligible portals and restores the call-enable setting from `.env` on success. On an error after pausing the worker it attempts to stop both the worker and the provisioner, leaving the saved `.env` unchanged. This is not an atomic rollback of configuration or room changes. Investigate nonzero exit status and confirm both services are stopped before retrying. The installer rejects a conflicting existing MatrixRTC transport rather than replacing another SFU silently.
+The installer prevalidates the deployment and builds the local images before changing configuration or pausing calling. A failed build leaves existing services running; local image tags and build cache may have changed. After a successful build, it normalizes filesystem permissions, temporarily pauses calling, reconciles credentials, merges configs/registrations, validates Compose again, starts LiveKit/JWT, restarts Synapse and the bridge, migrates existing eligible rooms and provisions ghost identities. It starts the background provisioner for future eligible portals and restores the call-enable setting from `.env` on success. On an error after pausing the worker it attempts to stop both the worker and the provisioner, leaving the saved `.env` unchanged. This is not an atomic rollback of configuration or room changes. Investigate nonzero exit status and confirm both services are stopped before retrying. The installer rejects a conflicting existing MatrixRTC transport rather than replacing another SFU silently.
 
 Room migration uses the HTTPS homeserver URL and requires the actual mautrix-whatsapp configuration, including its ghost username template. Provisioning checks the registered namespace, functional bot, local encrypted DM membership and bridge-published portal metadata before creating a new ghost device; an existing valid prepared device remains reusable. Custom or older rooms missing that metadata may require bridge-side repair rather than forced provisioning. A conflicting MatrixRTC transport must be reconciled manually.
 
@@ -482,3 +485,5 @@ bash mautrix-whatsapp-call/verify-worker.sh
 Repeat the inspection from step 10. Expect `RTC_WORKER_ENABLE_CALLS=1` and installer success. Force-stop and reopen the Matrix client once so cached room/call eligibility refreshes. Test against a consenting WhatsApp contact with an eligible encrypted DM. Test incoming and outgoing audio/video, mute, camera changes, accept, decline and hangup in both directions. Check media on Wi-Fi and a separate mobile network. Run the full acceptance checklist in [OPERATIONS.md](OPERATIONS.md) before declaring a new server or dependency upgrade production-ready.
 
 For existing groups, relay use and business contacts, call eligibility depends on room configuration and WhatsApp capabilities. Do not assume that a rendered call button means the destination accepts calls. Unsupported/self/control rooms and explicit WhatsApp business-call restrictions should not be bypassed. Do not confuse a successful health check with working media.
+
+Before pausing call services, the installer performs read-only candidate validation of the hostname templates, existing credentials, proposed bridge configuration and Synapse merge. This detects common configuration conflicts without generating credentials or editing live configuration. It does not replace validation of the actual generated files, native service startup, or staging rollback tests.

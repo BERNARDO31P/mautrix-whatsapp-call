@@ -560,6 +560,12 @@ func ParseGroupCallEncRekey(node *waBinary.Node) (*GroupCallEncRekey, error) {
 	}
 	attrs := node.AttrGetter()
 	rekey := &GroupCallEncRekey{CallID: attrs.String("call-id"), CallCreator: attrs.JID("call-creator")}
+	if err := attrs.Error(); err != nil {
+		return nil, fmt.Errorf("signaling: invalid group rekey identity: %w", err)
+	}
+	if rekey.CallID == "" || rekey.CallCreator.IsEmpty() {
+		return nil, fmt.Errorf("signaling: missing group rekey identity")
+	}
 	var err error
 	if rekey.TransactionID, err = requiredUint32Attr(attrs, "transaction-id"); err != nil {
 		return nil, err

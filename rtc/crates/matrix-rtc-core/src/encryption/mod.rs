@@ -217,12 +217,6 @@ pub mod types;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
-// `std::time::SystemTime::now()` panics on wasm32-unknown-unknown; web-time's
-// is the same API over `Date.now()`.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-use std::time::{SystemTime, UNIX_EPOCH};
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-use web_time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
@@ -233,15 +227,7 @@ use types::*;
 /// Closure type for getting current memberships, wrapped for thread-safety.
 type GetMembershipsFn = Arc<Mutex<Box<dyn Fn() -> Vec<JoinedMembership> + Send>>>;
 
-/// The default clock: wall-clock milliseconds since the Unix epoch.
-fn system_clock() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-/// Source of "now", in epoch milliseconds.
+/// Source of "now", in epoch milliseconds (monotonic for local deadlines by default).
 ///
 /// Every timing decision the manager makes — the key-rotation grace period, the
 /// `delayBeforeUse` still owed on a replay — is a comparison against this, so
@@ -253,6 +239,8 @@ use crate::error::CommandError;
 use crate::host::backend::{MatrixBackend, ToDeviceRecipient};
 use crate::host::event::EventOrigin;
 use crate::maybe_send::MaybeSend;
+use crate::outbox::{SendFailure, SendKind, SendPolicy};
+use crate::own_membership::{OwnMembershipMachine, OwnMembershipState};
 use crate::session::JoinedMembership;
 use crate::transport::{MIN_MEDIA_KEY_LEN, RtcTransport};
 
@@ -273,6 +261,38 @@ pub(crate) const MEDIA_KEY_BASE64: general_purpose::GeneralPurpose =
             .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
     );
 
+/// Maximum number of unmatched inbound media keys retained per session.
+const MAX_PENDING_INBOUND_KEYS: usize = 4096;
+/// Allow the membership event to catch up during call setup, not indefinitely.
+/// This local retention limit is independent of the lifetime of admitted keys.
+const MAX_PENDING_INBOUND_KEY_AGE_MS: u64 = 120_000;
+
+fn pending_inbound_key_is_fresh(first_seen_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(first_seen_ms) < MAX_PENDING_INBOUND_KEY_AGE_MS
+}
+/// Bound encoded key material before decoding (legacy 16-byte keys still work).
+pub(crate) const MAX_ENCODED_MEDIA_KEY_LEN: usize = 4096;
+/// Bound the decoded host DTO as well as the raw feeder envelope. Direct SDK
+/// callers do not necessarily pass through the bounded to-device feeder.
+const MAX_INBOUND_MEDIA_KEY_BYTES: usize = 16 * 1024;
+
+pub(crate) fn inbound_key_fits_budget(key: &ReceivedEncryptionKey) -> bool {
+    if key.key_b64.len() > MAX_ENCODED_MEDIA_KEY_LEN {
+        return false;
+    }
+    let origin_bytes = match &key.origin {
+        KeyOrigin::Encrypted { sender_user_id, sender_device_id, .. } => {
+            sender_user_id.len().saturating_add(sender_device_id.as_ref().map_or(0, String::len))
+        }
+        KeyOrigin::Cleartext => 0,
+    };
+    key.room_id.len()
+        .saturating_add(key.member_id.len())
+        .saturating_add(key.key_b64.len())
+        .saturating_add(origin_bytes) <= MAX_INBOUND_MEDIA_KEY_BYTES
+}
+
+
 /// Trait for handlers that receive key material signals.
 ///
 /// Implementations receive notifications when new key material is available
@@ -291,6 +311,34 @@ pub trait EncryptionKeySignalHandler: MaybeSend {
     /// # Arguments
     /// * `signal` - Contains the raw key bytes, key index, and RTC backend identity
     async fn on_new_key_material(&self, signal: KeyMaterialSignal);
+
+    /// An outbound activation has a single core-owned deadline. Native media
+    /// handlers can carry the clock through to their scheduled task instead of
+    /// starting a second relative timer. Other consumers retain the old API.
+    async fn on_outbound_key_material(
+        &self,
+        mut signal: KeyMaterialSignal,
+        activation_at_ms: u64,
+        clock: RtcClock,
+        is_current: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) {
+        if is_current() {
+            signal.use_after_ms = activation_at_ms.saturating_sub(clock());
+            self.on_new_key_material(signal).await;
+        }
+    }
+
+    /// Last successfully applied outbound key, if the handler can observe it.
+    /// A handler with no media readback leaves timing-based tracking in place.
+    fn active_outbound_key(&self, _identity: &str) -> Option<(u8, Vec<u8>)> {
+        None
+    }
+
+    /// A native handler may still be applying the key after the planned
+    /// activation instant. Keep a subsequent rotation from overtaking it.
+    fn outbound_activation_pending(&self, _identity: &str, _index: u8, _key: &[u8]) -> bool {
+        false
+    }
 
     /// Called when a key was received but refused, with the reason.
     ///
@@ -370,6 +418,125 @@ pub struct IdentitySubject<'a> {
 /// key, `member_id` for inbound keys).
 pub type RtcIdentityMapper = Arc<dyn Fn(&IdentitySubject<'_>) -> Option<String> + Send + Sync>;
 
+/// Serialize admission and the final follow-up decision. No mutex guard is
+/// held over network awaits. Only an independently scheduled owner may accept
+/// a fire-and-forget follow-up. An inline owner has no such lifetime guarantee.
+struct DistributionState {
+    running: bool,
+    pending: bool,
+    detached: bool,
+    released: watch::Sender<()>,
+}
+
+impl Default for DistributionState {
+    fn default() -> Self {
+        Self {
+            running: false,
+            pending: false,
+            detached: false,
+            released: watch::Sender::new(()),
+        }
+    }
+}
+
+struct DistributionOwner {
+    state: Arc<Mutex<DistributionState>>,
+    active: bool,
+}
+
+enum DistributionAdmission {
+    Owner(DistributionOwner),
+    Scheduled,
+    Wait(watch::Receiver<()>),
+}
+
+impl DistributionOwner {
+    fn acquire(state: &Arc<Mutex<DistributionState>>, detached: bool) -> DistributionAdmission {
+        let mut current = state.lock().unwrap();
+        if current.running {
+            if current.detached {
+                current.pending = true;
+                return DistributionAdmission::Scheduled;
+            }
+            // Subscribe while holding the admission lock. An inline owner's
+            // release cannot race between observing it and subscribing.
+            return DistributionAdmission::Wait(current.released.subscribe());
+        }
+        current.running = true;
+        current.pending = false;
+        current.detached = detached;
+        DistributionAdmission::Owner(Self { state: state.clone(), active: true })
+    }
+
+    // The owner either consumes the pending request or releases the slot,
+    // atomically with respect to a concurrent acquire.
+    fn finish_pass(&mut self) -> bool {
+        let mut current = self.state.lock().unwrap();
+        if std::mem::take(&mut current.pending) {
+            return true;
+        }
+        current.running = false;
+        current.detached = false;
+        self.active = false;
+        current.released.send_replace(());
+        false
+    }
+}
+
+impl Drop for DistributionOwner {
+    fn drop(&mut self) {
+        if self.active {
+            // An aborted owner must wake surviving inline waiters, even if it
+            // never reached its first network await. There is no detached
+            // work to recover once an entire executor has shut down.
+            let mut current = self.state.lock().unwrap();
+            current.running = false;
+            current.detached = false;
+            current.released.send_replace(());
+        }
+    }
+}
+
+/// Identity of the join against which an inbound key was authenticated.
+/// Latest event IDs and refresh timestamps deliberately do not participate.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+struct InboundJoin {
+    member_id: String,
+    sender: String,
+    origin: EventOrigin,
+    membership_ts: Option<u64>,
+}
+
+impl InboundJoin {
+    fn of(membership: &JoinedMembership) -> Self {
+        Self {
+            member_id: membership.member_id.clone(),
+            sender: membership.sender.clone(),
+            origin: membership.origin.clone(),
+            membership_ts: membership.membership_ts,
+        }
+    }
+
+    fn matches(&self, membership: &JoinedMembership) -> bool {
+        self.member_id == membership.member_id
+            && self.sender == membership.sender
+            && self.origin == membership.origin
+            && self.membership_ts == membership.membership_ts
+    }
+}
+
+#[derive(Clone)]
+struct CachedInboundKeys {
+    join: InboundJoin,
+    keys: Vec<InboundEncryptionKey>,
+}
+
+fn unique_inbound_member<'a>(memberships: &'a [JoinedMembership], member_id: &str) -> Option<&'a JoinedMembership> {
+    let mut matching = memberships.iter().filter(|membership| membership.member_id == member_id);
+    let member = matching.next()?;
+    if matching.next().is_some() { None } else { Some(member) }
+}
+
 /// The EncryptionManager manages encryption keys for an RTC session.
 ///
 /// This implementation follows the architecture of the JS SDK's RTCEncryptionManager
@@ -386,6 +553,9 @@ pub type RtcIdentityMapper = Arc<dyn Fn(&IdentitySubject<'_>) -> Option<String> 
 pub struct EncryptionManager<T: MatrixBackend> {
     /// Command sender for sending to-device messages
     backend: Arc<T>,
+
+    /// Session-scoped send admission; standalone encryption managers have no machine.
+    membership_machine: Option<Arc<OwnMembershipMachine<T>>>,
 
     /// Our own user ID (e.g., "@alice:example.org")
     own_user_id: String,
@@ -409,26 +579,23 @@ pub struct EncryptionManager<T: MatrixBackend> {
     /// Current outbound key (None if not joined)
     outbound_key: Arc<RwLock<Option<OutboundEncryptionKey>>>,
 
-    /// Inbound keys from other participants, keyed by member_id
-    inbound_keys: Arc<RwLock<HashMap<String, Vec<InboundEncryptionKey>>>>,
+    /// Inbound keys indexed by member ID and bound to the authenticated join.
+    inbound_keys: Arc<RwLock<HashMap<String, CachedInboundKeys>>>,
 
     /// Configuration
     config: EncryptionConfig,
 
     /// Handler for key material signals
-    signal_handler: Option<Arc<dyn EncryptionKeySignalHandler>>,
+    signal_handler: Arc<RwLock<Option<Arc<dyn EncryptionKeySignalHandler>>>>,
 
     /// Optional consumer-supplied mapper from `(user_id, device_id, member_id)`
     /// to the RTC-backend participant identity (see [`RtcIdentityMapper`]).
-    identity_mapper: Option<RtcIdentityMapper>,
+    identity_mapper: Arc<RwLock<Option<RtcIdentityMapper>>>,
     /// The transports we publish on, from which our own identity derives.
     own_transports: Vec<RtcTransport>,
 
-    /// Track if key distribution is in progress
-    key_distribution_in_progress: Arc<Mutex<bool>>,
-
-    /// Track if a new distribution is needed after current completes
-    need_new_distribution: Arc<Mutex<bool>>,
+    /// The running owner and its queued follow-up share one admission lock.
+    key_distribution: Arc<Mutex<DistributionState>>,
 
     /// Next key index to use (wraps at 256)
     next_key_index: Arc<Mutex<u8>>,
@@ -476,10 +643,18 @@ pub struct EncryptionManager<T: MatrixBackend> {
 }
 
 /// A key a rollout could not hand to one member.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct Undelivered {
     target: ParticipantDeviceInfo,
     key_index: u8,
+    // Identity of this obligation, not just the wrapping wire index.
+    token: Arc<()>,
+}
+
+impl PartialEq for Undelivered {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.token, &other.token)
+    }
 }
 
 /// What one retry of an undelivered key came to.
@@ -507,7 +682,7 @@ struct SupersededKey {
     in_use_until_ms: u64,
 }
 
-/// What we last told the app about our own key, and when.
+/// The original activation timing of the current outbound key.
 ///
 /// The timestamp is what makes a replay honest: a rotation signalled with a
 /// `delayBeforeUse` has an install pending in the media layer, so replaying it at
@@ -516,10 +691,11 @@ struct SupersededKey {
 #[derive(Clone, Copy, Debug)]
 struct SignalledKey {
     key_index: u8,
-    /// When it was signalled, in epoch milliseconds.
+    /// When the activation window began, in local monotonic epoch milliseconds.
     at_ms: u64,
     /// The `delayBeforeUse` it was signalled with.
     use_after_ms: u64,
+    dispatched: bool,
 }
 
 impl<T: MatrixBackend + 'static> EncryptionManager<T> {
@@ -545,6 +721,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     ) -> Self {
         Self {
             backend,
+            membership_machine: None,
             own_user_id,
             own_member_id,
             own_device_id,
@@ -554,15 +731,14 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             outbound_key: Arc::new(RwLock::new(None)),
             inbound_keys: Arc::new(RwLock::new(HashMap::new())),
             config: EncryptionConfig::default(),
-            signal_handler: None,
-            identity_mapper: None,
+            signal_handler: Arc::new(RwLock::new(None)),
+            identity_mapper: Arc::new(RwLock::new(None)),
             own_transports: Vec::new(),
-            key_distribution_in_progress: Arc::new(Mutex::new(false)),
-            need_new_distribution: Arc::new(Mutex::new(false)),
+            key_distribution: Arc::new(Mutex::new(DistributionState::default())),
             next_key_index: Arc::new(Mutex::new(0)),
             key_buffer: Arc::new(Mutex::new(OutdatedKeyFilter::default())),
             keys_without_membership: Arc::new(Mutex::new(Vec::new())),
-            clock: Arc::new(system_clock),
+            clock: Arc::new(crate::own_membership::now_ms),
             superseded_key: Arc::new(RwLock::new(None)),
             rotation_due_at: Arc::new(watch::Sender::new(None)),
             signalled_key: Arc::new(Mutex::new(None)),
@@ -581,6 +757,17 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         self.clock = clock;
     }
 
+    /// Bind the manager to the exact join before cloning it into upkeep.
+    pub(crate) fn set_membership_machine(&mut self, machine: Arc<OwnMembershipMachine<T>>) {
+        self.membership_machine = Some(machine);
+    }
+
+    fn join_ended(&self) -> bool {
+        self.membership_machine.as_ref().is_some_and(|machine| {
+            machine.state() != OwnMembershipState::Joined
+        })
+    }
+
     /// Sets the configuration.
     pub fn set_config(&mut self, config: EncryptionConfig) {
         self.config = config;
@@ -592,7 +779,13 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// signalled — see [`Self::replay_keys_to_handler`], which the consumer
     /// should call once the identity mapper is in place too.
     pub fn set_signal_handler(&mut self, handler: Arc<dyn EncryptionKeySignalHandler>) {
-        self.signal_handler = Some(handler);
+        *self.signal_handler.write().unwrap() = Some(handler);
+    }
+
+    // Upkeep is cloned before the media handler is registered. Every clone
+    // must observe the current handler; release the lock before invoking it.
+    fn current_signal_handler(&self) -> Option<Arc<dyn EncryptionKeySignalHandler>> {
+        self.signal_handler.read().unwrap().clone()
     }
 
     /// Re-signals every key we already hold to the current handler.
@@ -609,83 +802,42 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// without the mapper imports keys under fallback identities the transport
     /// never sees — which looks identical to not replaying at all.
     pub async fn replay_keys_to_handler(&self) {
-        let Some(handler) = self.signal_handler.clone() else {
+        let Some(handler) = self.current_signal_handler() else {
             log::debug!("no signal handler to replay keys to");
             return;
         };
 
-        let mut signals: Vec<KeyMaterialSignal> = Vec::new();
+        let mut signals: Vec<(Option<InboundJoin>, KeyMaterialSignal)> = Vec::new();
 
-        // Our own outbound key, under the same identity `signal_key_to_app`
-        // would use.
+        // Replay the current outbound key using its original activation deadline.
+        // The helper rechecks exact key material before dispatch, so a snapshot
+        // taken before a rotation cannot re-install its predecessor afterward.
         if let Some(outbound) = self.get_outbound_key() {
-            let rtc_backend_identity = self.own_rtc_identity();
-            // Replay with whatever is *left* of this key's `delayBeforeUse`,
-            // which is almost always nothing:
-            //
-            // - Never signalled (the join key, or a rotation made before any
-            //   handler existed): this replay is its first signal, and it must be
-            //   usable at once or we cannot encrypt at all.
-            // - Signalled and its delay elapsed: in use, so delaying again would
-            //   only stall media that could flow now.
-            // - Signalled and its delay still running: a rotation with an install
-            //   already pending in the media layer. Replaying at `0` would
-            //   install that index a second time *and* bypass MSC4143's
-            //   `delayBeforeUse`, so we would start encrypting with a key peers
-            //   have not installed yet.
-            let use_after_ms = self
-                .signalled_key
-                .lock()
-                .unwrap()
-                .filter(|signalled| signalled.key_index == outbound.key_index)
-                .map_or(0, |signalled| {
-                    let elapsed = self.timestamp_ms().saturating_sub(signalled.at_ms);
-                    signalled.use_after_ms.saturating_sub(elapsed)
-                });
-            signals.push(KeyMaterialSignal {
-                key: outbound.key.clone(),
-                key_index: outbound.key_index,
-                rtc_backend_identity,
-                use_after_ms,
-            });
+            self.signal_outbound_to_handler(&outbound, handler.clone()).await;
         }
 
-        // Peer keys, under the identity derived from their membership — the
-        // same derivation `add_key_to_participant` performs.
-        let memberships = {
-            let guard = self.get_memberships.lock().unwrap();
-            guard()
-        };
-        for (member_id, keys) in self.get_all_inbound_keys() {
-            let Some(membership) = memberships
-                .iter()
-                .find(|membership| membership.member_id == member_id)
-            else {
-                // No membership means no identity to derive; the key stays
-                // stored and will be signalled if their membership shows up.
-                log::debug!("not replaying keys for {member_id}: no known membership");
-                continue;
-            };
-            let Some(rtc_backend_identity) = self.peer_rtc_identity(membership) else {
-                log::debug!("not replaying keys for {member_id}: no derivable identity");
-                continue;
-            };
-            for key in keys {
-                signals.push(KeyMaterialSignal {
-                    key: key.key.clone(),
+        // Snapshot the generation along with the key. Recheck it before each
+        // callback, since a preceding callback may itself await and allow a
+        // roster update or a replacement at the same index.
+        let held = self.inbound_keys.read().unwrap().clone();
+        for cached in held.into_values() {
+            for key in cached.keys {
+                signals.push((Some(cached.join.clone()), KeyMaterialSignal {
+                    key: key.key,
                     key_index: key.key_index,
-                    rtc_backend_identity: rtc_backend_identity.clone(),
+                    rtc_backend_identity: String::new(),
                     use_after_ms: 0,
-                });
+                }));
             }
         }
 
-        if signals.is_empty() {
-            return;
-        }
-
-        log::info!("replaying {} held key(s) to the new handler", signals.len());
-        for signal in signals {
+        for (join, mut signal) in signals {
+            if let Some(join) = join {
+                let Some(identity) = self.current_inbound_identity(&join, signal.key_index, &signal.key) else {
+                    continue;
+                };
+                signal.rtc_backend_identity = identity;
+            }
             handler.on_new_key_material(signal).await;
         }
     }
@@ -693,7 +845,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// Sets the identity mapper used to derive the RTC-backend participant
     /// identity carried in [`KeyMaterialSignal`]s (see [`RtcIdentityMapper`]).
     pub fn set_identity_mapper(&mut self, mapper: RtcIdentityMapper) {
-        self.identity_mapper = Some(mapper);
+        *self.identity_mapper.write().unwrap() = Some(mapper);
     }
 
     /// Whether this manager sends and installs media keys at all: `false` in
@@ -710,8 +862,8 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
 
     /// Our RTC backend identity: the mapper's, else `user_id:device_id`.
     fn own_rtc_identity(&self) -> String {
-        self.identity_mapper
-            .as_ref()
+        let mapper = self.identity_mapper.read().unwrap().clone();
+        mapper.as_ref()
             .and_then(|mapper| {
                 mapper(&IdentitySubject {
                     user_id: &self.own_user_id,
@@ -725,7 +877,8 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
 
     /// A peer's RTC backend identity: the mapper's, else their `member_id`.
     fn peer_rtc_identity(&self, membership: &JoinedMembership) -> Option<String> {
-        match &self.identity_mapper {
+        let mapper = self.identity_mapper.read().unwrap().clone();
+        match mapper {
             Some(mapper) => mapper(&IdentitySubject {
                 user_id: &membership.sender,
                 device_id: membership.origin.sender_device_id(),
@@ -813,7 +966,11 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         };
 
         // Store it
-        *self.outbound_key.write().unwrap() = Some(first_key.clone());
+        {
+            let mut outbound = self.outbound_key.write().unwrap();
+            *outbound = Some(first_key.clone());
+            *self.signalled_key.lock().unwrap() = None;
+        }
         *self.next_key_index.lock().unwrap() = 1; // Next will be 1
 
         log::debug!(
@@ -864,7 +1021,8 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             return Ok(());
         }
 
-        // Check if we have keys waiting for membership
+        // Purge departed or replaced joins before accepting buffered keys.
+        self.prune_inbound_keys();
         self.check_keys_without_membership().await;
 
         // Check if we have an outbound key (i.e., we've joined)
@@ -890,7 +1048,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             let key = self.outbound_key.read().unwrap();
             let signalled = self.signalled_key.lock().unwrap();
             match key.as_ref() {
-                Some(key) => signalled.map(|signalled| signalled.key_index) != Some(key.key_index),
+                Some(key) => signalled.filter(|signal| signal.dispatched).map(|signal| signal.key_index) != Some(key.key_index),
                 None => false,
             }
         };
@@ -904,7 +1062,9 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             if let Some(key) = key_to_signal {
                 // The first key: signalled eagerly and usable at once, so the
                 // transport has a key ring before any media flows.
-                self.signal_key_to_app(&key, 0).await;
+                if let Some(handler) = self.current_signal_handler() {
+                    self.signal_outbound_to_handler(&key, handler).await;
+                }
             }
         }
 
@@ -912,68 +1072,107 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         self.ensure_key_distribution().await
     }
 
+    /// Reclaim unmatched key material even when no membership or key events arrive.
+    /// The session upkeep invokes this on its existing keep-alive beat; no network
+    /// operation or independent task is needed.
+    pub(crate) fn prune_expired_pending_keys(&self) {
+        let mut waiting = self.keys_without_membership.lock().unwrap();
+        let now = self.timestamp_ms();
+        waiting.retain(|pending| pending_inbound_key_is_fresh(pending.first_seen_ms, now));
+    }
+
     /// Checks keys that arrived before their membership was known.
     async fn check_keys_without_membership(&self) {
-        let keys_to_process = {
-            let mut waiting = self.keys_without_membership.lock().unwrap();
-            if waiting.is_empty() {
-                return;
-            }
-            std::mem::take(&mut *waiting)
-        };
-
         let known_memberships = {
             let guard = self.get_memberships.lock().unwrap();
             (guard)()
         };
-
-        for pending in keys_to_process {
-            let membership = known_memberships
-                .iter()
-                .find(|m| m.member_id == pending.key.member_id);
-
-            match membership {
-                // The membership is now known, so the MSC4143 sender/device
-                // check that could not run at receive time runs here.
-                Some(membership) => {
-                    self.accept_verified_key(pending.key, &pending.origin, membership)
-                        .await
+        // Partition under the lock, leaving unmatched entries in place. Do not
+        // temporarily empty the queue across awaits: new arrivals would see a
+        // false capacity reserve and old entries could overfill the queue.
+        let keys_to_process = {
+            let mut waiting = self.keys_without_membership.lock().unwrap();
+            let mut ready = Vec::new();
+            let now = self.timestamp_ms();
+            waiting.retain(|pending| {
+                if !pending_inbound_key_is_fresh(pending.first_seen_ms, now) {
+                    return false;
                 }
-                None => self.keys_without_membership.lock().unwrap().push(pending),
+                if known_memberships.iter().any(|m| m.member_id == pending.key.member_id) {
+                    ready.push(pending.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            ready
+        };
+        for pending in keys_to_process {
+            // A preceding asynchronous import may have consumed the remaining
+            // retention window. Do not start processing an expired entry.
+            if !pending_inbound_key_is_fresh(pending.first_seen_ms, self.timestamp_ms()) {
+                continue;
+            }
+            if let Some(membership) = unique_inbound_member(&known_memberships, &pending.key.member_id) {
+                self.accept_verified_key(pending.key, &pending.origin, membership).await;
             }
         }
     }
 
     /// Ensures key distribution happens (with coalescing).
     ///
-    /// If a distribution is already in progress, this will schedule a new
-    /// distribution to start immediately after the current one completes.
-    /// This coalesces multiple rapid membership changes into a single follow-up distribution.
+    /// If an independently scheduled distribution is already running, this
+    /// coalesces rapid membership changes into a single follow-up. When the
+    /// owner runs inline, concurrent requests instead wait for admission so
+    /// aborting the first caller cannot lose acknowledged work.
     pub async fn ensure_key_distribution(&self) -> Result<(), CommandError> {
         if !self.config.manage_media_keys {
             return Ok(());
         }
 
-        {
-            let mut guard = self.key_distribution_in_progress.lock().unwrap();
-            if *guard {
-                // Mark that we need a new distribution after current completes
-                log::debug!(
-                    "[{}/{}] Key distribution in progress, scheduling follow-up",
-                    self.room_id,
-                    self.slot_id
-                );
-                *self.need_new_distribution.lock().unwrap() = true;
-                return Ok(());
+        // Only an attached session has an outbox owning cancellation and send
+        // deadlines. Its independently scheduled task can safely accept a
+        // follow-up even if the original caller stops waiting. Standalone
+        // managers and native hosts without an executor keep inline sends;
+        // their concurrent callers must not acknowledge work that an aborted
+        // owner could silently lose.
+        let detached = self.membership_machine.is_some() && crate::executor::can_spawn();
+        let owner = loop {
+            match DistributionOwner::acquire(&self.key_distribution, detached) {
+                DistributionAdmission::Owner(owner) => break owner,
+                DistributionAdmission::Scheduled => {
+                    log::debug!(
+                        "[{}/{}] Key distribution in progress, scheduling follow-up",
+                        self.room_id, self.slot_id
+                    );
+                    return Ok(());
+                }
+                DistributionAdmission::Wait(mut released) => {
+                    // No mutex is held across the wait. A successful return
+                    // requires this caller to run a pass or hand it to an
+                    // independent owner, even if the previous owner vanished.
+                    released.changed().await.map_err(|_| CommandError::ClientRejected(
+                        "key distribution admission closed".to_owned()
+                    ))?;
+                }
             }
-            *guard = true;
+        };
+        if detached {
+            let manager = self.clone();
+            crate::executor::spawn(async move {
+                manager.run_distribution(owner).await;
+            })
+            .await
+            .map_err(|error| CommandError::ClientRejected(format!(
+                "key distribution task stopped: {error}"
+            )))?;
+        } else {
+            self.run_distribution(owner).await;
         }
+        Ok(())
+    }
 
-        // Loop rather than recurse. The recursive version called itself *before*
-        // clearing `key_distribution_in_progress`, so the follow-up took the
-        // "already in progress" branch above, re-set `need_new_distribution` and
-        // returned without rolling anything out — the coalesced distribution was
-        // dropped every time, and the flag stayed latched.
+    async fn run_distribution(&self, mut owner: DistributionOwner) {
         loop {
             if let Err(error) = self.rollout_outbound_key().await {
                 log::error!(
@@ -982,9 +1181,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                     self.slot_id,
                 );
             }
-
-            let needs_followup = std::mem::take(&mut *self.need_new_distribution.lock().unwrap());
-            if !needs_followup {
+            if !owner.finish_pass() {
                 break;
             }
             log::debug!(
@@ -993,10 +1190,6 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                 self.slot_id
             );
         }
-
-        *self.key_distribution_in_progress.lock().unwrap() = false;
-
-        Ok(())
     }
 
     /// Creates and distributes a new outbound key if needed.
@@ -1006,6 +1199,9 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// - If new joiners AND current key is young: Reuse current key (only send to new joiners)
     /// - If new joiners AND current key is old: Rotate key (send to all)
     async fn rollout_outbound_key(&self) -> Result<(), CommandError> {
+        if self.join_ended() {
+            return Ok(());
+        }
         let current_memberships = (self.get_memberships.lock().unwrap())();
 
         // Build the list of recipients: every membership but this device's.
@@ -1177,6 +1373,18 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             });
         }
 
+        if let Some(signal) = *self.signalled_key.lock().unwrap() {
+            if signal.key_index == current_key.key_index {
+                expires_at = expires_at.max(signal.at_ms.saturating_add(signal.use_after_ms));
+            }
+        }
+        if now >= expires_at && self.current_signal_handler().is_some_and(|handler| {
+            handler.outbound_activation_pending(&self.own_rtc_identity(), current_key.key_index, &current_key.key)
+        }) {
+            // The provider has not acknowledged activation yet. A bounded
+            // timer recheck preserves owed rotations even without a callback.
+            expires_at = now.saturating_add(100);
+        }
         let rotating = now >= expires_at;
         match (&reason, rotating) {
             (Some(reason), true) => {
@@ -1241,15 +1449,6 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             _ => 0,
         };
 
-        // What will be on the wire once this rollout settles, when that is not what
-        // the rollout is about to hand out — during a switch window, the key we are
-        // still encrypting with rather than the one in `outbound_key`. `None` when
-        // the two coincide.
-        let key_still_in_use = match (rotating, use_after_ms) {
-            // Switching at once: what we distribute is what we will use.
-            (true, 0) => None,
-            _ => self.key_in_use(now),
-        };
 
         let to_distribute_to: Vec<ParticipantDeviceInfo>;
         let use_new_key = rotating;
@@ -1282,9 +1481,16 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         // of the call. Recording only the served recipients makes the next
         // rollout see the rest as newly joined and try again.
         let key_b64 = MEDIA_KEY_BASE64.encode(&outbound_key_to_use.key);
-        let served = self
+        let Some(served) = self
             .send_key_to_participants(&key_b64, outbound_key_to_use.key_index, &to_distribute_to)
-            .await;
+            .await
+        else {
+            // The leave cancelled this rollout; never commit or signal its key.
+            return Ok(());
+        };
+        if self.join_ended() {
+            return Ok(());
+        }
 
         let unreached: Vec<&str> = to_distribute_to
             .iter()
@@ -1295,33 +1501,6 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                     .any(|participant| participant.member_id == *member_id)
             })
             .collect();
-
-        // Whoever this rollout missed is retried on backoff, independently of
-        // the next rollout; a rotation addresses everyone, so what was owed of
-        // the previous key is dropped (034 R32).
-        self.undelivered.send_if_modified(|undelivered| {
-            let before = undelivered.clone();
-            if use_new_key {
-                undelivered.clear();
-            }
-            for participant in &to_distribute_to {
-                if served
-                    .iter()
-                    .any(|recipient| recipient.same_join(participant))
-                {
-                    undelivered.remove(&participant.member_id);
-                } else {
-                    undelivered.insert(
-                        participant.member_id.clone(),
-                        Undelivered {
-                            target: participant.clone(),
-                            key_index: outbound_key_to_use.key_index,
-                        },
-                    );
-                }
-            }
-            *undelivered != before
-        });
 
         // One line per rollout saying how it went as a whole: per-recipient
         // errors are easy to miss in a busy log, and "distributed to 1 of 3" is
@@ -1355,11 +1534,48 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
 
         // Update or store the outbound key
         if use_new_key {
+            // Delivery can take longer than a previous switch window. Observe
+            // the predecessor and start the next window only after delivery,
+            // not at the earlier rotation decision.
+            let switch_started_at = self.timestamp_ms();
+            let key_still_in_use = if use_after_ms == 0 {
+                None
+            } else {
+                self.key_in_use(switch_started_at)
+            };
             {
                 let mut guard = self.outbound_key.write().unwrap();
+                if guard.is_none() || self.join_ended() {
+                    return Ok(());
+                }
                 let mut new_key = outbound_key_to_use.clone();
                 new_key.shared_with = served.clone();
                 *guard = Some(new_key);
+                *self.signalled_key.lock().unwrap() = Some(SignalledKey {
+                    key_index: outbound_key_to_use.key_index,
+                    at_ms: switch_started_at,
+                    use_after_ms,
+                    dispatched: false,
+                });
+                // Publish debt only after the matching key is committed. The
+                // retry reads the key and debt under the same lock ordering.
+                self.record_delivery_debt(
+                    true,
+                    outbound_key_to_use.key_index,
+                    &to_distribute_to,
+                    &served,
+                );
+                // Remember what stays on the wire for the length of the delay, and
+                // until when. This is the window later rollouts coalesce into, and the
+                // key a member arriving inside it has to be handed.
+                *self.superseded_key.write().unwrap() = match (use_after_ms, key_still_in_use) {
+                    (0, _) | (_, None) => None,
+                    (delay, Some((in_use_index, in_use_key))) => Some(SupersededKey {
+                        key: in_use_key,
+                        key_index: in_use_index,
+                        in_use_until_ms: switch_started_at.saturating_add(delay),
+                    }),
+                };
             }
 
             // Signal the new key immediately, telling the consumer how long to
@@ -1384,20 +1600,10 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                     "nobody present holds the key we are replacing"
                 },
             );
-            // Remember what stays on the wire for the length of the delay, and
-            // until when. This is the window later rollouts coalesce into, and the
-            // key a member arriving inside it has to be handed.
-            *self.superseded_key.write().unwrap() = match (use_after_ms, key_still_in_use) {
-                (0, _) | (_, None) => None,
-                (delay, Some((in_use_index, in_use_key))) => Some(SupersededKey {
-                    key: in_use_key,
-                    key_index: in_use_index,
-                    in_use_until_ms: now.saturating_add(delay),
-                }),
-            };
 
-            self.signal_key_to_app(&outbound_key_to_use, use_after_ms)
-                .await;
+            if let Some(handler) = self.current_signal_handler() {
+                self.signal_outbound_to_handler(&outbound_key_to_use, handler).await;
+            }
         } else {
             // Reusing the existing key: record only the recipients we reached,
             // so the rest are retried on the next rollout.
@@ -1409,12 +1615,16 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             // owed (via `left`) until the rotation mints a clean `shared_with`.
             {
                 let mut guard = self.outbound_key.write().unwrap();
-                if let Some(ref mut key) = *guard {
+                if let Some(ref mut key) = *guard
+                    && key.key_index == outbound_key_to_use.key_index
+                    && key.key == outbound_key_to_use.key
+                {
                     for recipient in &served {
                         if !key.shared_with.iter().any(|x| x.same_join(recipient)) {
                             key.shared_with.push(recipient.clone());
                         }
                     }
+                    self.record_delivery_debt(false, key.key_index, &to_distribute_to, &served);
                 }
             }
         }
@@ -1434,6 +1644,40 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         Ok(())
     }
 
+    // Caller holds the outbound-key write lock until this update completes.
+    fn record_delivery_debt(
+        &self,
+        rotating: bool,
+        key_index: u8,
+        recipients: &[ParticipantDeviceInfo],
+        served: &[ParticipantDeviceInfo],
+    ) {
+        self.undelivered.send_if_modified(|undelivered| {
+            let before = undelivered.clone();
+            if rotating {
+                undelivered.clear();
+            }
+            for participant in recipients {
+                if served
+                    .iter()
+                    .any(|recipient| recipient.same_join(participant))
+                {
+                    undelivered.remove(&participant.member_id);
+                } else {
+                    undelivered.insert(
+                        participant.member_id.clone(),
+                        Undelivered {
+                            target: participant.clone(),
+                            key_index,
+                            token: Arc::new(()),
+                        },
+                    );
+                }
+            }
+            *undelivered != before
+        });
+    }
+
     /// The members a rollout could not reach, by member id (034 R32).
     pub fn undelivered_members(&self) -> Vec<String> {
         self.undelivered.borrow().keys().cloned().collect()
@@ -1444,31 +1688,28 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         self.undelivered.subscribe()
     }
 
-    /// Stops retrying `member_id`: the host refused the send for good.
-    pub(crate) fn forget_undelivered(&self, member_id: &str) {
-        self.undelivered
-            .send_if_modified(|undelivered| undelivered.remove(member_id).is_some());
+    /// Capture the exact obligation before an outbox attempt is registered.
+    pub(crate) fn delivery_debt(&self, member_id: &str) -> Option<Undelivered> {
+        self.undelivered.borrow().get(member_id).cloned()
     }
 
-    /// One retry of the key owed to `member_id`, to that member alone. `Err`
-    /// is the host's failure of the whole send, which the outbox classifies.
-    pub(crate) async fn retry_undelivered_key(
+    /// One retry of the captured obligation. Never substitute a later one.
+    pub(crate) async fn retry_delivery_debt(
         &self,
-        member_id: &str,
+        owed: &Undelivered,
     ) -> Result<KeyRetry, CommandError> {
-        let Some(owed) = self.undelivered.borrow().get(member_id).cloned() else {
-            return Ok(KeyRetry::Moot);
+        let member_id = &owed.target.member_id;
+        let key = {
+            let outbound = self.outbound_key.read().unwrap();
+            if self.undelivered.borrow().get(member_id) != Some(owed) {
+                return Ok(KeyRetry::Moot);
+            }
+            outbound.as_ref()
+                .filter(|key| key.key_index == owed.key_index)
+                .map(|key| key.key.clone())
         };
-        let key = self
-            .outbound_key
-            .read()
-            .unwrap()
-            .as_ref()
-            .filter(|key| key.key_index == owed.key_index)
-            .map(|key| key.key.clone());
         let Some(key) = key else {
-            // Rotated since: the rotation's rollout addressed them.
-            self.drop_owed(&owed);
+            self.drop_owed(owed);
             return Ok(KeyRetry::Moot);
         };
 
@@ -1489,18 +1730,20 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             owed.key_index,
             member_id,
         );
-        if let Some(key) = self.outbound_key.write().unwrap().as_mut()
-            && key.key_index == owed.key_index
-            && !key.shared_with.iter().any(|x| x.same_join(&owed.target))
+        if let Some(current) = self.outbound_key.write().unwrap().as_mut()
+            && current.key_index == owed.key_index
+            && current.key == key
+            && self.undelivered.borrow().get(member_id) == Some(owed)
+            && !current.shared_with.iter().any(|x| x.same_join(&owed.target))
         {
-            key.shared_with.push(owed.target.clone());
+            current.shared_with.push(owed.target.clone());
         }
-        self.drop_owed(&owed);
+        self.drop_owed(owed);
         Ok(KeyRetry::Delivered)
     }
 
     /// Removes `owed`, unless a newer rollout has replaced it meanwhile.
-    fn drop_owed(&self, owed: &Undelivered) {
+    pub(crate) fn drop_owed(&self, owed: &Undelivered) {
         self.undelivered.send_if_modified(|undelivered| {
             let current = undelivered.get(&owed.target.member_id) == Some(owed);
             if current {
@@ -1516,6 +1759,13 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// it is made, but MSC4143 has us go on using its predecessor until
     /// `delayBeforeUse` has elapsed.
     fn key_in_use(&self, now: u64) -> Option<(u8, Vec<u8>)> {
+        // Native media reports the last accepted outbound installation. Timer
+        // expiry alone does not prove that the scheduled task has run.
+        if let Some(handler) = self.current_signal_handler() {
+            if let Some(active) = handler.active_outbound_key(&self.own_rtc_identity()) {
+                return Some(active);
+            }
+        }
         if let Some(superseded) = self.superseded_key.read().unwrap().as_ref()
             && now < superseded.in_use_until_ms
         {
@@ -1533,12 +1783,15 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     ///
     /// The session's scheduler drives [`Self::flush_due_rotation`] at the
     /// instant it comes up; see [`Self::subscribe_rotation_due`].
-    /// [`Self::retry_undelivered_key`], for tests standing in for the upkeep
+    /// [`Self::retry_delivery_debt`], for tests standing in for the upkeep
     /// that drives it: `true` when the member now holds the key.
     #[cfg(feature = "testing")]
     pub async fn retry_undelivered_key_now(&self, member_id: &str) -> Result<bool, CommandError> {
+        let Some(owed) = self.delivery_debt(member_id) else {
+            return Ok(false);
+        };
         Ok(matches!(
-            self.retry_undelivered_key(member_id).await?,
+            self.retry_delivery_debt(&owed).await?,
             KeyRetry::Delivered
         ))
     }
@@ -1612,20 +1865,37 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         key_b64: &str,
         index: u8,
         targets: &[ParticipantDeviceInfo],
-    ) -> Vec<ParticipantDeviceInfo> {
-        self.deliver_key(key_b64, index, targets)
-            .await
-            .unwrap_or_else(|error| {
-                // The batch never left; nobody was served, so nobody is recorded
-                // as holding the key and every one of them is retried.
-                log::error!(
-                    "[{}/{}] could not send key index {index} to any of {} recipient(s): {error}",
-                    self.room_id,
-                    self.slot_id,
-                    targets.len(),
-                );
-                Vec::new()
-            })
+    ) -> Option<Vec<ParticipantDeviceInfo>> {
+        if targets.is_empty() {
+            return (!self.join_ended()).then(Vec::new);
+        }
+        let outcome = if let Some(machine) = &self.membership_machine {
+            // Register under the machine's state lock. A leave either cancels
+            // this batch or prevents its registration entirely.
+            let pending = machine.begin_if_joined(SendKind::KeyRollout)?;
+            match pending
+                .run(SendPolicy::single_attempt(), || self.deliver_key(key_b64, index, targets))
+                .await
+            {
+                Ok(served) => Ok(served),
+                Err(SendFailure::Cancelled | SendFailure::Superseded) => return None,
+                Err(error) => Err(error.into_command_error()),
+            }
+        } else {
+            // The standalone manager has no membership/outbox lifecycle.
+            self.deliver_key(key_b64, index, targets).await
+        };
+        Some(outcome.unwrap_or_else(|error| {
+            // A failed or ambiguous batch is not proof of delivery. Record
+            // nobody as served and leave a retry obligation for the same key.
+            log::error!(
+                "[{}/{}] could not confirm key index {index} for {} recipient(s): {error}",
+                self.room_id,
+                self.slot_id,
+                targets.len(),
+            );
+            Vec::new()
+        }))
     }
 
     /// [`Self::send_key_to_participants`], with the host's error when the
@@ -1657,28 +1927,33 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         let mut addressed = Vec::with_capacity(targets.len());
 
         for target in targets {
-            let Some(membership) = memberships.iter().find(|m| m.member_id == target.member_id)
-            else {
+            // A retry is for a particular participation, not whichever device
+            // happens to claim that member id now. Sticky refreshes retain the
+            // generation; a legacy rejoin changes membership_ts.
+            let mut candidates = memberships.iter().filter(|membership| {
+                membership.room_id == self.room_id
+                    && membership.slot_id == self.slot_id
+                    && membership.member_id == target.member_id
+            });
+            let matches_target = |membership: &JoinedMembership| {
+                !target.device_id.is_empty()
+                    && membership.sender == target.user_id
+                    && membership.origin.sender_device_id() == Some(target.device_id.as_str())
+                    && membership.membership_ts == target.membership_ts
+            };
+            if !candidates.next().is_some_and(&matches_target)
+                || !candidates.all(matches_target)
+            {
                 log::warn!(
-                    "[{}/{}] cannot send key to member {}: no matching membership found",
+                    "[{}/{}] cannot send key to member {}: no unambiguous matching join and device",
                     self.room_id,
                     self.slot_id,
                     target.member_id,
                 );
                 continue;
-            };
-            let user_id = &membership.sender;
-            let Some(device_id) = membership.origin.sender_device_id() else {
-                log::warn!(
-                    "[{}/{}] cannot send key to member {}: its member event names no sending \
-                     device, and we will not broadcast the key to every device of {user_id}. \
-                     Their media will not decrypt for us.",
-                    self.room_id,
-                    self.slot_id,
-                    target.member_id,
-                );
-                continue;
-            };
+            }
+            let user_id = &target.user_id;
+            let device_id = target.device_id.as_str();
 
             // Recipient *and* index, on one line: an Android integration had to
             // add exactly this to discover that the core was addressing a key to
@@ -1754,35 +2029,58 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// Signals a key to the application layer.
     /// Reports a refused key to the handler, so the reason leaves the core.
     async fn signal_discarded_key(&self, discarded: DiscardedKey) {
-        if let Some(handler) = &self.signal_handler {
+        if let Some(handler) = self.current_signal_handler() {
             handler.clone().on_key_discarded(discarded).await;
         }
     }
 
-    /// Signals our own outbound key to the application layer.
-    ///
-    /// `use_after_ms` is the MSC4143 `delayBeforeUse` the consumer must observe
-    /// before encrypting with it; `0` for the first key, which is signalled
-    /// eagerly so the transport is listening.
-    async fn signal_key_to_app(&self, key: &OutboundEncryptionKey, use_after_ms: u64) {
-        if let Some(handler) = &self.signal_handler {
-            let rtc_backend_id = self.own_rtc_identity();
-            let signal = KeyMaterialSignal {
-                key: key.key.clone(),
-                key_index: key.key_index,
-                rtc_backend_identity: rtc_backend_id,
-                use_after_ms,
-            };
-
-            // Signal to app (async, fire-and-forget)
-            // Note: We don't use tokio::spawn here because the handler's future might not be Send
-            let handler_clone = handler.clone();
-            let _ = handler_clone.on_new_key_material(signal).await;
-            *self.signalled_key.lock().unwrap() = Some(SignalledKey {
+    /// Signal or replay an outbound key using its original activation deadline.
+    /// Record the first signal before invoking host code, rather than after an
+    /// arbitrary callback delay. Rotation commits install the same marker while
+    /// holding the outbound lock, before any racing membership replay sees it.
+    async fn signal_outbound_to_handler(
+        &self,
+        key: &OutboundEncryptionKey,
+        handler: Arc<dyn EncryptionKeySignalHandler>,
+    ) {
+        if self.join_ended() { return; }
+        let activation_at_ms = {
+            let outbound = self.outbound_key.read().unwrap();
+            if !outbound.as_ref().is_some_and(|current| {
+                current.key_index == key.key_index && current.key == key.key
+            }) { return; }
+            let mut marker = self.signalled_key.lock().unwrap();
+            let signal = marker.get_or_insert(SignalledKey {
                 key_index: key.key_index,
                 at_ms: self.timestamp_ms(),
-                use_after_ms,
+                use_after_ms: 0,
+                dispatched: false,
             });
+            if signal.key_index != key.key_index { return; }
+            signal.at_ms.saturating_add(signal.use_after_ms)
+        };
+        let outbound = self.outbound_key.clone();
+        let expected_index = key.key_index;
+        let expected_key = key.key.clone();
+        let joined = self.membership_machine.as_ref().map(|machine| machine.joined_probe());
+        let is_current = Arc::new(move || {
+            if joined.as_ref().is_some_and(|probe| !probe()) { return false; }
+            outbound.read().unwrap().as_ref().is_some_and(|current| {
+                current.key_index == expected_index && current.key == expected_key
+            })
+        });
+        let signal = KeyMaterialSignal {
+            key: key.key.clone(),
+            key_index: key.key_index,
+            rtc_backend_identity: self.own_rtc_identity(),
+            use_after_ms: activation_at_ms.saturating_sub(self.timestamp_ms()),
+        };
+        handler.on_outbound_key_material(signal, activation_at_ms, self.clock.clone(), is_current).await;
+        let outbound = self.outbound_key.read().unwrap();
+        if outbound.as_ref().is_some_and(|current| current.key_index == key.key_index && current.key == key.key) {
+            if let Some(marker) = self.signalled_key.lock().unwrap().as_mut() {
+                marker.dispatched = true;
+            }
         }
     }
 
@@ -1877,6 +2175,10 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// they can be checked once it does — a key is never signalled to the
     /// application before it has been verified.
     pub async fn receive_key(&self, received: ReceivedEncryptionKey) -> Result<(), CommandError> {
+        if !inbound_key_fits_budget(&received) {
+            log::warn!("Ignoring oversized inbound media key or provenance");
+            return Ok(());
+        }
         // What the host claimed, logged before we decide anything about it, so a
         // discard can be read against the message that caused it.
         match &received.origin {
@@ -1949,9 +2251,11 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             let guard = self.get_memberships.lock().unwrap();
             (guard)()
         };
-        let membership = known_memberships
-            .iter()
-            .find(|m| m.member_id == received.member_id);
+        let membership = unique_inbound_member(&known_memberships, &received.member_id);
+        if membership.is_none() && known_memberships.iter().any(|m| m.member_id == received.member_id) {
+            log::warn!("Ignoring media key for ambiguous membership");
+            return Ok(());
+        }
 
         match membership {
             Some(membership) => {
@@ -1965,13 +2269,32 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                     self.slot_id,
                     received.member_id
                 );
-                self.keys_without_membership
-                    .lock()
-                    .unwrap()
-                    .push(PendingInboundKey {
-                        key: inbound_key,
-                        origin: received.origin,
-                    });
+                let mut waiting = self.keys_without_membership.lock().unwrap();
+                let now = self.timestamp_ms();
+                waiting.retain(|pending| pending_inbound_key_is_fresh(pending.first_seen_ms, now));
+                // Only collapse an exact consecutive retransmission. Different
+                // origins or material must still be verified in arrival order.
+                if let Some(last) = waiting.last_mut() {
+                    if last.key.member_id == inbound_key.member_id
+                        && last.key.key_index == inbound_key.key_index
+                        && last.key.key == inbound_key.key
+                        && last.origin == received.origin
+                    {
+                        last.key.creation_ts = inbound_key.creation_ts;
+                        return Ok(());
+                    }
+                }
+                if waiting.len() >= MAX_PENDING_INBOUND_KEYS {
+                    log::debug!("Pending inbound media key capacity reached; dropping unmatched key");
+                    return Ok(());
+                }
+                waiting.push(PendingInboundKey {
+                    key: inbound_key,
+                    // Clone only the admitted bytes, not any spare allocation
+                    // capacity retained by a direct SDK caller.
+                    origin: received.origin.clone(),
+                    first_seen_ms: now,
+                });
             }
         }
 
@@ -2009,6 +2332,12 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             return;
         }
 
+        let join = InboundJoin::of(membership);
+        // A legacy member ID is reused on rejoin. Its old timestamp filter
+        // must not suppress new keys belonging to the replacement join.
+        let Ok(filter_identity) = serde_json::to_string(&join) else {
+            return;
+        };
         let outdated = {
             let mut guard = self.key_buffer.lock().unwrap();
             // Entries older than the filter's TTL can no longer make anything
@@ -2016,7 +2345,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             // (member, index) for the life of the session. This is the only place
             // keys are added, so it is the only place the buffer can grow.
             guard.cleanup(key.creation_ts);
-            guard.check_and_add(key.member_id.clone(), key.key_index, key.creation_ts)
+            guard.check_and_add(filter_identity, key.key_index, key.creation_ts)
         };
 
         if outdated {
@@ -2039,11 +2368,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         key: InboundEncryptionKey,
         membership: &JoinedMembership,
     ) {
-        // The participant's RTC backend identity, as the installed mapper derives
-        // it from the membership; `None` when it cannot be, and then the key is
-        // stored but there is no participant to hand it to.
-        let rtc_backend_id = self.peer_rtc_identity(membership);
-
+        let join = InboundJoin::of(membership);
         // Store the key: at most one entry per index, holding the newest material
         // we have seen for it.
         //
@@ -2064,7 +2389,20 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         let map_key = key.member_id.clone();
         {
             let mut guard = self.inbound_keys.write().unwrap();
-            let held = guard.entry(map_key).or_default();
+            // Check under the cache admission lock so a delayed old snapshot
+            // cannot overwrite a newer generation's already committed key.
+            let current = self.current_memberships();
+            if !unique_inbound_member(&current, &join.member_id).is_some_and(|m| join.matches(m)) {
+                return;
+            }
+            let cached = guard.entry(map_key).or_insert_with(|| CachedInboundKeys {
+                join: join.clone(),
+                keys: Vec::new(),
+            });
+            if cached.join != join {
+                *cached = CachedInboundKeys { join: join.clone(), keys: Vec::new() };
+            }
+            let held = &mut cached.keys;
             match held
                 .iter_mut()
                 .find(|existing| existing.key_index == key.key_index)
@@ -2094,7 +2432,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         }
 
         // Signal to application
-        match rtc_backend_id {
+        match self.current_inbound_identity(&join, key.key_index, &key.key) {
             Some(rtc_backend_id) => self.signal_inbound_key_to_app(key, rtc_backend_id).await,
             None => log::debug!(
                 "[{}/{}] key from {} has no derivable participant identity; stored only",
@@ -2111,7 +2449,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         key: InboundEncryptionKey,
         rtc_backend_identity: String,
     ) {
-        if let Some(handler) = &self.signal_handler {
+        if let Some(handler) = self.current_signal_handler() {
             let signal = KeyMaterialSignal {
                 key: key.key.clone(),
                 key_index: key.key_index,
@@ -2127,10 +2465,43 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         }
     }
 
-    /// Gets all inbound keys for a specific participant by member_id.
+    fn current_memberships(&self) -> Vec<JoinedMembership> {
+        let guard = self.get_memberships.lock().unwrap();
+        guard()
+    }
+
+    fn prune_inbound_keys(&self) {
+        let mut cache = self.inbound_keys.write().unwrap();
+        let memberships = self.current_memberships();
+        cache.retain(|member_id, cached| {
+            unique_inbound_member(&memberships, member_id).is_some_and(|m| cached.join.matches(m))
+        });
+    }
+
+    fn current_inbound_identity(&self, join: &InboundJoin, index: u8, key: &[u8]) -> Option<String> {
+        let memberships = self.current_memberships();
+        let membership = unique_inbound_member(&memberships, &join.member_id)?;
+        if !join.matches(membership) {
+            return None;
+        }
+        {
+            let held = self.inbound_keys.read().unwrap();
+            let cached = held.get(&join.member_id)?;
+            if &cached.join != join || !cached.keys.iter().any(|k| k.key_index == index && k.key.as_slice() == key) {
+                return None;
+            }
+        }
+        self.peer_rtc_identity(membership)
+    }
+
+    /// Gets inbound keys only for the currently authenticated join.
     pub fn get_inbound_keys(&self, member_id: &str) -> Vec<InboundEncryptionKey> {
+        let memberships = self.current_memberships();
         let inbound_keys = self.inbound_keys.read().unwrap();
-        inbound_keys.get(member_id).cloned().unwrap_or_default()
+        inbound_keys.get(member_id)
+            .filter(|cached| unique_inbound_member(&memberships, member_id).is_some_and(|m| cached.join.matches(m)))
+            .map(|cached| cached.keys.clone())
+            .unwrap_or_default()
     }
 
     /// Gets the current outbound key.
@@ -2138,9 +2509,13 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         self.outbound_key.read().unwrap().clone()
     }
 
-    /// Gets all stored inbound keys.
+    /// Gets all inbound keys for the current, unambiguous roster.
     pub fn get_all_inbound_keys(&self) -> HashMap<String, Vec<InboundEncryptionKey>> {
-        self.inbound_keys.read().unwrap().clone()
+        let memberships = self.current_memberships();
+        self.inbound_keys.read().unwrap().iter()
+            .filter(|(id, cached)| unique_inbound_member(&memberships, id).is_some_and(|m| cached.join.matches(m)))
+            .map(|(id, cached)| (id.clone(), cached.keys.clone()))
+            .collect()
     }
 }
 
@@ -2148,6 +2523,7 @@ impl<T: MatrixBackend + 'static> Clone for EncryptionManager<T> {
     fn clone(&self) -> Self {
         Self {
             backend: self.backend.clone(),
+            membership_machine: self.membership_machine.clone(),
             own_user_id: self.own_user_id.clone(),
             own_member_id: self.own_member_id.clone(),
             own_device_id: self.own_device_id.clone(),
@@ -2160,8 +2536,7 @@ impl<T: MatrixBackend + 'static> Clone for EncryptionManager<T> {
             signal_handler: self.signal_handler.clone(),
             identity_mapper: self.identity_mapper.clone(),
             own_transports: self.own_transports.clone(),
-            key_distribution_in_progress: self.key_distribution_in_progress.clone(),
-            need_new_distribution: self.need_new_distribution.clone(),
+            key_distribution: self.key_distribution.clone(),
             next_key_index: self.next_key_index.clone(),
             key_buffer: self.key_buffer.clone(),
             keys_without_membership: self.keys_without_membership.clone(),
@@ -2188,6 +2563,62 @@ mod tests {
     use crate::host::event::EventOrigin;
     use crate::session::JoinedMembership;
     use std::sync::Arc;
+
+    fn admitted_owner(admission: DistributionAdmission) -> DistributionOwner {
+        match admission {
+            DistributionAdmission::Owner(owner) => owner,
+            _ => panic!("expected distribution owner"),
+        }
+    }
+
+    #[test]
+    fn distribution_owner_coalesces_and_releases_atomically() {
+        let state = Arc::new(Mutex::new(DistributionState::default()));
+        let mut owner = admitted_owner(DistributionOwner::acquire(&state, true));
+        assert!(matches!(DistributionOwner::acquire(&state, true), DistributionAdmission::Scheduled));
+        assert!(matches!(DistributionOwner::acquire(&state, false), DistributionAdmission::Scheduled));
+        assert!(owner.finish_pass());
+        assert!(!owner.finish_pass());
+        let next = admitted_owner(DistributionOwner::acquire(&state, true));
+        // Dropping an already released owner must not release its successor.
+        drop(owner);
+        assert!(matches!(DistributionOwner::acquire(&state, true), DistributionAdmission::Scheduled));
+        drop(next);
+        assert!(matches!(DistributionOwner::acquire(&state, true), DistributionAdmission::Owner(_)));
+    }
+
+    #[test]
+    fn cancelled_distribution_owner_does_not_latch_admission() {
+        let state = Arc::new(Mutex::new(DistributionState::default()));
+        let owner = admitted_owner(DistributionOwner::acquire(&state, true));
+        assert!(matches!(DistributionOwner::acquire(&state, true), DistributionAdmission::Scheduled));
+        drop(owner);
+        let mut replacement = admitted_owner(DistributionOwner::acquire(&state, true));
+        assert!(!replacement.finish_pass());
+        assert!(matches!(DistributionOwner::acquire(&state, true), DistributionAdmission::Owner(_)));
+    }
+
+    #[test]
+    fn inline_owner_release_is_observable_without_a_runtime() {
+        let state = Arc::new(Mutex::new(DistributionState::default()));
+        let owner = admitted_owner(DistributionOwner::acquire(&state, false));
+        let DistributionAdmission::Wait(waiter) = DistributionOwner::acquire(&state, false) else {
+            panic!("inline requests must not report scheduled work");
+        };
+        let DistributionAdmission::Wait(detached_waiter) = DistributionOwner::acquire(&state, true) else {
+            panic!("a runtime does not make an existing inline owner independent");
+        };
+        assert!(!waiter.has_changed().unwrap());
+        drop(owner);
+        assert!(waiter.has_changed().unwrap());
+        assert!(detached_waiter.has_changed().unwrap());
+        let mut successor = admitted_owner(DistributionOwner::acquire(&state, false));
+        let DistributionAdmission::Wait(waiter) = DistributionOwner::acquire(&state, false) else {
+            panic!("expected waiter");
+        };
+        assert!(!successor.finish_pass());
+        assert!(waiter.has_changed().unwrap());
+    }
 
     const ROOM_ID: &str = "!room:example.org";
     const SLOT_ID: &str = "m.call#room";
@@ -2272,6 +2703,7 @@ mod tests {
     struct RecordingHandler {
         signals: Mutex<Vec<KeyMaterialSignal>>,
         discarded: Mutex<Vec<DiscardedKey>>,
+        pending: Mutex<Option<(u8, Vec<u8>)>>,
     }
 
     impl RecordingHandler {
@@ -2294,6 +2726,12 @@ mod tests {
 
         async fn on_key_discarded(&self, discarded: DiscardedKey) {
             self.discarded.lock().unwrap().push(discarded);
+        }
+
+        fn outbound_activation_pending(&self, _identity: &str, index: u8, key: &[u8]) -> bool {
+            self.pending.lock().unwrap().as_ref().is_some_and(|(pending_index, material)| {
+                *pending_index == index && material.as_slice() == key
+            })
         }
     }
 
@@ -2353,6 +2791,99 @@ mod tests {
             SLOT_ID.to_string(),
             move || memberships.lock().unwrap().clone(),
         )
+    }
+
+    #[tokio::test]
+    async fn stale_delivery_attempt_cannot_remove_replacement_with_same_index() {
+        let backend = Arc::new(MockBackend::new());
+        let manager = manager_over(backend.clone(), Arc::new(Mutex::new(vec![bob_membership()])));
+        manager.join().await.unwrap();
+        let recipient = ParticipantDeviceInfo {
+            user_id: "@bob:example.org".into(),
+            device_id: "device456".into(),
+            member_id: "bob-device456-uuid".into(),
+            membership_ts: None,
+        };
+        let recipients = std::slice::from_ref(&recipient);
+        let old = {
+            let guard = manager.outbound_key.write().unwrap();
+            manager.record_delivery_debt(false, guard.as_ref().unwrap().key_index, recipients, &[]);
+            manager.delivery_debt("bob-device456-uuid").unwrap()
+        };
+        let replacement = {
+            let mut guard = manager.outbound_key.write().unwrap();
+            let mut new_key = guard.as_ref().unwrap().clone();
+            new_key.key = vec![42; new_key.key.len()];
+            *guard = Some(new_key);
+            // Simulate a wrapped wire index, which must not recycle debt identity.
+            manager.record_delivery_debt(true, guard.as_ref().unwrap().key_index, recipients, &[]);
+            manager.delivery_debt("bob-device456-uuid").unwrap()
+        };
+        assert_ne!(old, replacement);
+        assert_eq!(old.key_index, replacement.key_index);
+        manager.drop_owed(&old);
+        assert_eq!(manager.delivery_debt("bob-device456-uuid"), Some(replacement.clone()));
+        assert_eq!(manager.retry_delivery_debt(&old).await.unwrap(), KeyRetry::Moot);
+        assert!(to_device_recipients(&backend).is_empty());
+        assert_eq!(manager.retry_delivery_debt(&replacement).await.unwrap(), KeyRetry::Delivered);
+        assert_eq!(to_device_recipients(&backend), [(recipient.user_id.clone(), recipient.device_id.clone())]);
+        assert!(manager.delivery_debt("bob-device456-uuid").is_none());
+        assert!(manager.get_outbound_key().unwrap().shared_with.contains(&recipient));
+    }
+
+    #[tokio::test]
+    async fn delivery_debt_never_resolves_to_a_replacement_join() {
+        let backend = Arc::new(MockBackend::new());
+        let original = JoinedMembership {
+            membership_ts: Some(1000),
+            ..bob_membership()
+        };
+        let memberships = Arc::new(Mutex::new(vec![original.clone()]));
+        let manager = manager_over(backend.clone(), memberships.clone());
+        manager.join().await.unwrap();
+        let target = ParticipantDeviceInfo {
+            user_id: original.sender.clone(),
+            device_id: "device456".into(),
+            member_id: original.member_id.clone(),
+            membership_ts: original.membership_ts,
+        };
+        let owed = {
+            let guard = manager.outbound_key.write().unwrap();
+            manager.record_delivery_debt(
+                false, guard.as_ref().unwrap().key_index, std::slice::from_ref(&target), &[],
+            );
+            manager.delivery_debt(&target.member_id).unwrap()
+        };
+        let rejoined = JoinedMembership { membership_ts: Some(2000), ..original.clone() };
+        let other_device = JoinedMembership {
+            origin: EventOrigin::encrypted(Some("different-device".into())),
+            ..original.clone()
+        };
+        let other_user = JoinedMembership { sender: "@other:example.org".into(), ..original.clone() };
+        let other_slot = JoinedMembership { slot_id: "different-slot".into(), ..original.clone() };
+        for replacement in [
+            vec![],
+            vec![rejoined.clone()],
+            vec![other_device.clone()],
+            vec![other_user],
+            vec![other_slot],
+            vec![original.clone(), rejoined],
+            vec![other_device, original.clone()],
+        ] {
+            *memberships.lock().unwrap() = replacement;
+            assert_eq!(manager.retry_delivery_debt(&owed).await.unwrap(), KeyRetry::Undelivered);
+            assert!(to_device_recipients(&backend).is_empty());
+            assert_eq!(manager.delivery_debt(&target.member_id), Some(owed.clone()));
+        }
+        // An ordinary sticky refresh is the same join, even with a new event id.
+        *memberships.lock().unwrap() = vec![JoinedMembership {
+            membership_event_id: Some("$refreshed".into()),
+            origin_server_ts: Some(3000),
+            ..original
+        }];
+        assert_eq!(manager.retry_delivery_debt(&owed).await.unwrap(), KeyRetry::Delivered);
+        assert_eq!(to_device_recipients(&backend), [(target.user_id.clone(), target.device_id.clone())]);
+        assert!(manager.delivery_debt(&target.member_id).is_none());
     }
 
     /// One membership update per arriving peer, but only ever one signal per key
@@ -2972,6 +3503,206 @@ mod tests {
         );
     }
 
+    async fn joined_distribution_manager(
+        sender: Arc<MockBackend>,
+        memberships: Arc<Mutex<Vec<JoinedMembership>>>,
+    ) -> (EncryptionManager<MockBackend>, Arc<OwnMembershipMachine<MockBackend>>) {
+        let machine = Arc::new(OwnMembershipMachine::new(
+            sender.clone(), ROOM_ID.to_owned(), SLOT_ID.to_owned(),
+            MEMBER_ID.to_owned(), "m.call".to_owned(),
+            crate::own_membership::MembershipTimings::default(),
+        ));
+        machine.join(crate::transport::MemberTransports::default(), None).await.unwrap();
+        let mut manager = manager_over(sender, memberships);
+        manager.set_membership_machine(machine.clone());
+        manager.join().await.unwrap();
+        (manager, machine)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_distribution_waiter_preserves_queued_followup() {
+        use crate::host::backend::{MockMethod, MockOutcome};
+        use std::time::Duration;
+
+        let sender = Arc::new(MockBackend::new());
+        let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
+        let (manager, _machine) = joined_distribution_manager(sender.clone(), memberships.clone()).await;
+        sender.script(MockMethod::ToDevice, [MockOutcome::After(
+            Duration::from_secs(3), Box::new(MockOutcome::Ok),
+        )]);
+        let waiter = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.ensure_key_distribution().await }
+        });
+        for _ in 0..32 {
+            if !sender.calls_to(MockMethod::ToDevice).is_empty() { break; }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sender.calls_to(MockMethod::ToDevice).len(), 1);
+        memberships.lock().unwrap().push(JoinedMembership {
+            sender: "@carol:example.org".to_owned(),
+            origin: EventOrigin::encrypted(Some("CAROLDEV".to_owned())),
+            sticky_key: "carol-a".to_owned(), member_id: "carol-a".to_owned(),
+            ..bob_membership()
+        });
+        manager.ensure_key_distribution().await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let shared = manager.get_outbound_key().unwrap().shared_with;
+        assert!(shared.iter().any(|p| p.member_id == "carol-a"));
+        assert!(shared.iter().any(|p| p.member_id == bob_membership().member_id));
+        assert_eq!(sender.calls_to(MockMethod::ToDevice).len(), 2);
+        assert!(!manager.key_distribution.lock().unwrap().running);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_inline_distribution_transfers_admission_to_surviving_waiter() {
+        use crate::host::backend::{MockMethod, MockOutcome};
+        use std::time::Duration;
+
+        let sender = Arc::new(MockBackend::new());
+        let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
+        let manager = manager_over(sender.clone(), memberships.clone());
+        manager.join().await.unwrap();
+        sender.script(MockMethod::ToDevice, [MockOutcome::Hang, MockOutcome::Ok]);
+        let owner = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.ensure_key_distribution().await }
+        });
+        for _ in 0..32 {
+            if !sender.calls_to(MockMethod::ToDevice).is_empty() { break; }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sender.calls_to(MockMethod::ToDevice).len(), 1);
+        let successor = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.ensure_key_distribution().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!successor.is_finished());
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), successor).await.unwrap().unwrap().unwrap();
+        assert_eq!(sender.calls_to(MockMethod::ToDevice).len(), 2);
+        assert!(manager.get_outbound_key().unwrap().shared_with.iter().any(|p| p.member_id == bob_membership().member_id));
+        assert!(!manager.key_distribution.lock().unwrap().running);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leaving_cancels_distribution_even_after_waiter_is_gone() {
+        use crate::host::backend::{MockMethod, MockOutcome};
+        use std::time::Duration;
+
+        let sender = Arc::new(MockBackend::new());
+        let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
+        let (manager, machine) = joined_distribution_manager(sender.clone(), memberships).await;
+        sender.script(MockMethod::ToDevice, [MockOutcome::Hang]);
+        let waiter = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.ensure_key_distribution().await }
+        });
+        for _ in 0..32 {
+            if !sender.calls_to(MockMethod::ToDevice).is_empty() { break; }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sender.calls_to(MockMethod::ToDevice).len(), 1);
+        manager.ensure_key_distribution().await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        machine.leave(None).await.unwrap();
+        manager.leave();
+        // The outbox cancels the generation, but intentionally drains an
+        // already-submitted host request until its bounded attempt completes.
+        // Leaving must immediately discard key material and must never send
+        // the queued follow-up. A one-second owner-release deadline would
+        // contradict the outbox's 30-second attempt contract.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(sender.calls_to(MockMethod::ToDevice).len(), 1);
+        assert!(manager.get_outbound_key().is_none());
+        assert!(manager.key_distribution.lock().unwrap().running,
+            "the in-flight host attempt is still draining");
+
+        // Observe the actual owner release (not an arbitrary sleep or a
+        // weakened assertion), with an upper bound tied to the send policy.
+        let mut released = manager.key_distribution.lock().unwrap().released.subscribe();
+        tokio::time::timeout(crate::outbox::ATTEMPT_TIMEOUT, released.changed())
+            .await.expect("distribution must release at the attempt deadline")
+            .expect("distribution owner must signal release");
+        {
+            let state = manager.key_distribution.lock().unwrap();
+            assert!(!state.running);
+            assert!(!state.pending);
+        }
+        tokio::time::sleep(crate::outbox::ATTEMPT_TIMEOUT).await;
+        assert_eq!(sender.calls_to(MockMethod::ToDevice).len(), 1,
+            "the cancelled follow-up must never submit another key");
+        assert!(manager.get_outbound_key().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_delivery_does_not_consume_the_media_switch_window() {
+        use crate::host::backend::{MockMethod, MockOutcome};
+        use std::time::Duration;
+
+        let sender = Arc::new(MockBackend::new());
+        let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+        let config = EncryptionConfig {
+            key_rotation_grace_period_ms: 0,
+            delay_before_use_ms: 1_000,
+            ..EncryptionConfig::default()
+        };
+        manager.set_config(config);
+        let origin = tokio::time::Instant::now();
+        manager.set_clock(Arc::new(move || {
+            1_700_000_000_000 + origin.elapsed().as_millis() as u64
+        }));
+        manager.join().await.unwrap();
+        manager.on_memberships_update().await.unwrap();
+        let old_index = manager.get_outbound_key().unwrap().key_index;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        memberships.lock().unwrap().push(JoinedMembership {
+            sender: "@carol:example.org".to_string(),
+            origin: EventOrigin::encrypted(Some("CAROLDEV".to_string())),
+            sticky_key: "carol-a".to_string(),
+            member_id: "carol-a".to_string(),
+            ..bob_membership()
+        });
+        sender.script(MockMethod::ToDevice, [MockOutcome::After(
+            Duration::from_secs(3), Box::new(MockOutcome::Ok),
+        )]);
+        manager.on_memberships_update().await.unwrap();
+        let new_index = manager.get_outbound_key().unwrap().key_index;
+        assert_ne!(new_index, old_index);
+        assert_eq!(manager.key_in_use(manager.timestamp_ms()).unwrap().0, old_index);
+        tokio::time::advance(Duration::from_millis(999)).await;
+        assert_eq!(manager.key_in_use(manager.timestamp_ms()).unwrap().0, old_index);
+        manager.replay_keys_to_handler().await;
+        assert_eq!(handler.signals.lock().unwrap().last().unwrap().use_after_ms, 1);
+        // Distribution was slow enough that the creation-time grace period has
+        // already elapsed. A departure must still not replace the pending key
+        // before the actual post-delivery propagation deadline.
+        memberships.lock().unwrap().retain(|member| member.member_id != "carol-a");
+        manager.on_memberships_update().await.unwrap();
+        assert_eq!(manager.get_outbound_key().unwrap().key_index, new_index);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(manager.key_in_use(manager.timestamp_ms()).unwrap().0, new_index);
+        manager.replay_keys_to_handler().await;
+        assert_eq!(handler.signals.lock().unwrap().last().unwrap().use_after_ms, 0);
+        let committed = manager.get_outbound_key().unwrap();
+        *handler.pending.lock().unwrap() = Some((committed.key_index, committed.key));
+        manager.flush_due_rotation().await.unwrap();
+        assert_eq!(manager.get_outbound_key().unwrap().key_index, new_index);
+        assert_eq!(manager.rotation_due_at_ms(), Some(manager.timestamp_ms() + 100));
+        *handler.pending.lock().unwrap() = None;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        manager.flush_due_rotation().await.unwrap();
+        assert_ne!(manager.get_outbound_key().unwrap().key_index, new_index);
+    }
+
     /// MSC4143 sends the same key to a member whenever their membership event
     /// changes, so a receiver sees repeats. Storing each one grows the key list
     /// without bound and re-imports identical material; `OutdatedKeyFilter`
@@ -3040,6 +3771,57 @@ mod tests {
             .expect("bob's replacement key should be accepted");
 
         assert_eq!(handler.signals.lock().unwrap().len(), 2);
+    }
+
+    /// The upkeep manager is cloned before the media layer attaches. A
+    /// timer-triggered rollover must signal the replacement under the live
+    /// backend identity, not silently update only the core key ring.
+    #[tokio::test]
+    async fn upkeep_clone_observes_late_media_handler_and_mapper() {
+        let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
+        let mut manager = manager_over(Arc::new(MockBackend::new()), memberships);
+        let clock = TestClock::new();
+        manager.set_clock(clock.as_rtc_clock());
+        manager.join().await.unwrap();
+        let upkeep = manager.clone();
+        manager.on_memberships_update().await.unwrap();
+        let held = manager.get_outbound_key().unwrap().key_index;
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+        manager.set_identity_mapper(Arc::new(|subject: &IdentitySubject<'_>| {
+            Some(format!("mapped:{}", subject.member_id))
+        }));
+        manager.replay_keys_to_handler().await;
+        let due = manager.rotation_due_at_ms().unwrap();
+        clock.advance(due.saturating_sub(clock.now()) + 1);
+        upkeep.flush_due_rotation().await.unwrap();
+        let replacement = manager.get_outbound_key().unwrap();
+        assert_ne!(replacement.key_index, held);
+        assert!(handler.signals.lock().unwrap().iter().any(|signal| {
+            signal.key_index == replacement.key_index
+                && signal.key == replacement.key
+                && signal.rtc_backend_identity == format!("mapped:{MEMBER_ID}")
+        }));
+    }
+
+    #[tokio::test]
+    async fn existing_clone_observes_replaced_media_handler() {
+        let mut manager = manager_over(
+            Arc::new(MockBackend::new()),
+            Arc::new(Mutex::new(vec![bob_membership()])),
+        );
+        manager.join().await.unwrap();
+        let clone = manager.clone();
+        let old = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(old.clone());
+        let current = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(current.clone());
+        manager.set_identity_mapper(Arc::new(|subject: &IdentitySubject<'_>| {
+            Some(format!("mapped:{}", subject.member_id))
+        }));
+        clone.receive_key(bob_key(vec![7u8; 32], 0)).await.unwrap();
+        assert!(old.signals.lock().unwrap().is_empty());
+        assert_eq!(current.identities(), vec!["mapped:bob-device456-uuid".to_string()]);
     }
 
     /// The identity is the whole point of the replay: importing a key under one
@@ -3576,6 +4358,209 @@ mod tests {
         let keys = manager.get_inbound_keys("bob-device456-uuid");
         assert_eq!(keys.len(), 1, "only the genuine key should survive");
         assert_eq!(keys[0].key, vec![1u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn inbound_keys_do_not_follow_a_reused_membership_id() {
+        let mut bob = bob_membership();
+        bob.membership_ts = Some(100);
+        let memberships = Arc::new(Mutex::new(vec![bob.clone()]));
+        let mut manager = {
+            let memberships = memberships.clone();
+            EncryptionManager::new(
+                Arc::new(NoopBackend), USER_ID.into(), DEVICE_ID.into(),
+                MEMBER_ID.into(), ROOM_ID.into(), SLOT_ID.into(),
+                move || memberships.lock().unwrap().clone(),
+            )
+        };
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+        manager.receive_key(bob_key(vec![1u8; 32], 0)).await.unwrap();
+        bob.membership_event_id = Some("$refresh".into());
+        bob.origin_server_ts = Some(120);
+        *memberships.lock().unwrap() = vec![bob.clone()];
+        manager.on_memberships_update().await.unwrap();
+        assert_eq!(manager.get_inbound_keys(&bob.member_id).len(), 1);
+        handler.signals.lock().unwrap().clear();
+        manager.replay_keys_to_handler().await;
+        assert_eq!(handler.signals.lock().unwrap().len(), 1);
+
+        bob.membership_ts = Some(200);
+        *memberships.lock().unwrap() = vec![bob.clone()];
+        // Even before the asynchronous roster callback, the old key cannot replay.
+        handler.signals.lock().unwrap().clear();
+        assert!(manager.get_inbound_keys(&bob.member_id).is_empty());
+        assert!(manager.get_all_inbound_keys().is_empty());
+        manager.replay_keys_to_handler().await;
+        assert!(handler.signals.lock().unwrap().is_empty());
+        manager.on_memberships_update().await.unwrap();
+        assert!(manager.inbound_keys.read().unwrap().is_empty());
+        manager.receive_key(bob_key(vec![2u8; 32], 0)).await.unwrap();
+        assert_eq!(manager.get_inbound_keys(&bob.member_id)[0].key, vec![2u8; 32]);
+
+        // The same member ID and timestamp do not authorize a different device.
+        let mut changed_device = bob.clone();
+        changed_device.origin = EventOrigin::encrypted(Some("other-device".into()));
+        *memberships.lock().unwrap() = vec![changed_device];
+        handler.signals.lock().unwrap().clear();
+        manager.replay_keys_to_handler().await;
+        assert!(handler.signals.lock().unwrap().is_empty());
+        assert!(manager.get_inbound_keys(&bob.member_id).is_empty());
+
+        // An ambiguous same-ID roster cannot admit or replay a key.
+
+        let mut other = bob.clone();
+        other.membership_ts = Some(300);
+        *memberships.lock().unwrap() = vec![bob.clone(), other];
+        manager.receive_key(bob_key(vec![3u8; 32], 0)).await.unwrap();
+        manager.replay_keys_to_handler().await;
+        assert!(handler.signals.lock().unwrap().is_empty());
+        manager.on_memberships_update().await.unwrap();
+        assert!(manager.inbound_keys.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unmatched_inbound_keys_are_bounded_and_known_keys_bypass_capacity() {
+        let memberships = Arc::new(Mutex::new(Vec::new()));
+        let manager = {
+            let memberships = memberships.clone();
+            EncryptionManager::new(
+                Arc::new(NoopBackend), USER_ID.into(), DEVICE_ID.into(),
+                MEMBER_ID.into(), ROOM_ID.into(), SLOT_ID.into(),
+                move || memberships.lock().unwrap().clone(),
+            )
+        };
+        for i in 0..MAX_PENDING_INBOUND_KEYS {
+            let mut key = bob_key(vec![1u8; 32], 0);
+            key.member_id = format!("pending-{i}");
+            manager.receive_key(key.clone()).await.unwrap();
+            manager.receive_key(key).await.unwrap();
+        }
+        manager.receive_key(bob_key(vec![1u8; 32], 0)).await.unwrap();
+        assert_eq!(manager.keys_without_membership.lock().unwrap().len(), MAX_PENDING_INBOUND_KEYS);
+        *memberships.lock().unwrap() = vec![bob_membership()];
+        manager.on_memberships_update().await.unwrap();
+        manager.receive_key(bob_key(vec![2u8; 32], 1)).await.unwrap();
+        assert_eq!(manager.get_inbound_keys("bob-device456-uuid").len(), 1);
+        assert_eq!(manager.keys_without_membership.lock().unwrap().len(), MAX_PENDING_INBOUND_KEYS);
+        manager.leave();
+        assert!(manager.keys_without_membership.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unmatched_key_expiry_is_not_extended_by_duplicate() {
+        let memberships = Arc::new(Mutex::new(Vec::new()));
+        let mut manager = manager_over(Arc::new(MockBackend::new()), memberships.clone());
+        let clock = TestClock::new();
+        manager.set_clock(clock.as_rtc_clock());
+        let old = bob_key(vec![1u8; 32], 0);
+        manager.receive_key(old.clone()).await.unwrap();
+        clock.advance(MAX_PENDING_INBOUND_KEY_AGE_MS - 1);
+        manager.receive_key(old).await.unwrap();
+        manager.receive_key(bob_key(vec![2u8; 32], 1)).await.unwrap();
+        assert_eq!(manager.keys_without_membership.lock().unwrap().len(), 2);
+        clock.advance(1);
+        *memberships.lock().unwrap() = vec![bob_membership()];
+        manager.on_memberships_update().await.unwrap();
+        let keys = manager.get_inbound_keys("bob-device456-uuid");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, vec![2u8; 32]);
+        assert!(manager.keys_without_membership.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_pending_key_prune_preserves_unexpired_and_admitted_keys() {
+        let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
+        let mut manager = manager_over(Arc::new(MockBackend::new()), memberships.clone());
+        let clock = TestClock::new();
+        manager.set_clock(clock.as_rtc_clock());
+        manager.receive_key(bob_key(vec![3u8; 32], 0)).await.unwrap();
+        let mut old = bob_key(vec![1u8; 32], 0);
+        old.member_id = "pending-old".into();
+        manager.receive_key(old).await.unwrap();
+        clock.advance(MAX_PENDING_INBOUND_KEY_AGE_MS - 1);
+        manager.prune_expired_pending_keys();
+        assert_eq!(manager.keys_without_membership.lock().unwrap().len(), 1);
+        let mut fresh = bob_key(vec![2u8; 32], 1);
+        fresh.member_id = "pending-fresh".into();
+        manager.receive_key(fresh).await.unwrap();
+        clock.advance(1);
+        manager.prune_expired_pending_keys();
+        {
+            let waiting = manager.keys_without_membership.lock().unwrap();
+            assert_eq!(waiting.len(), 1);
+            assert_eq!(waiting[0].key.member_id, "pending-fresh");
+        }
+        assert_eq!(manager.get_inbound_keys("bob-device456-uuid")[0].key, vec![3u8; 32]);
+        clock.advance(MAX_PENDING_INBOUND_KEY_AGE_MS);
+        manager.prune_expired_pending_keys();
+        assert!(manager.keys_without_membership.lock().unwrap().is_empty());
+        assert_eq!(manager.get_inbound_keys("bob-device456-uuid").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn expired_unmatched_entries_release_capacity_on_next_admission() {
+        let memberships = Arc::new(Mutex::new(Vec::new()));
+        let mut manager = manager_over(Arc::new(MockBackend::new()), memberships.clone());
+        let clock = TestClock::new();
+        manager.set_clock(clock.as_rtc_clock());
+        for i in 0..MAX_PENDING_INBOUND_KEYS {
+            let mut key = bob_key(vec![1u8; 32], 0);
+            key.member_id = format!("expired-{i}");
+            manager.receive_key(key).await.unwrap();
+        }
+        clock.advance(MAX_PENDING_INBOUND_KEY_AGE_MS);
+        manager.receive_key(bob_key(vec![2u8; 32], 1)).await.unwrap();
+        assert_eq!(manager.keys_without_membership.lock().unwrap().len(), 1);
+        *memberships.lock().unwrap() = vec![bob_membership()];
+        manager.on_memberships_update().await.unwrap();
+        assert_eq!(manager.get_inbound_keys("bob-device456-uuid")[0].key, vec![2u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn oversized_inbound_key_is_not_stored() {
+        let manager = manager_with_bob();
+        manager.receive_key(bob_key(vec![1u8; MAX_ENCODED_MEDIA_KEY_LEN], 0)).await.unwrap();
+        assert!(manager.get_inbound_keys("bob-device456-uuid").is_empty());
+    }
+
+    #[tokio::test]
+    async fn direct_key_admission_bounds_all_retained_metadata() {
+        let memberships = Arc::new(Mutex::new(Vec::new()));
+        let manager = manager_over(Arc::new(MockBackend::new()), memberships);
+        let normal = bob_key(vec![1u8; 32], 0);
+        let mut boundary = normal.clone();
+        let normal_member_len = boundary.member_id.len();
+        let mut low = normal_member_len;
+        let mut high = MAX_INBOUND_MEDIA_KEY_BYTES;
+        while low < high {
+            let mid = (low + high + 1) / 2;
+            boundary.member_id = "x".repeat(mid);
+            if inbound_key_fits_budget(&boundary) { low = mid; } else { high = mid - 1; }
+        }
+        boundary.member_id = "x".repeat(low);
+        assert!(inbound_key_fits_budget(&boundary));
+        boundary.member_id.push('x');
+        assert!(!inbound_key_fits_budget(&boundary));
+        manager.receive_key(boundary).await.unwrap();
+        for field in 0..3 {
+            let mut oversized = normal.clone();
+            let value = "x".repeat(MAX_INBOUND_MEDIA_KEY_BYTES + 1);
+            match field {
+                0 => oversized.room_id = value,
+                1 => oversized.origin = KeyOrigin::Encrypted {
+                    sender_user_id: value, sender_device_id: None, sender_is_confirmed: true,
+                },
+                _ => oversized.origin = KeyOrigin::Encrypted {
+                    sender_user_id: "@bob:example.org".into(),
+                    sender_device_id: Some(value), sender_is_confirmed: true,
+                },
+            }
+            manager.receive_key(oversized).await.unwrap();
+        }
+        assert!(manager.keys_without_membership.lock().unwrap().is_empty());
+        manager.receive_key(normal).await.unwrap();
+        assert_eq!(manager.keys_without_membership.lock().unwrap().len(), 1);
     }
 
     /// A discarded key must not occupy its (member, index) slot in the

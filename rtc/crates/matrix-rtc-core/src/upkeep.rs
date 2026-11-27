@@ -31,7 +31,7 @@ use tokio::sync::watch;
 use crate::encryption::{EncryptionManager, KeyRetry, Undelivered};
 use crate::executor::{self, AbortOnDrop, JoinHandleExt};
 use crate::host::backend::MatrixBackend;
-use crate::outbox::{BACKOFF_INITIAL, BACKOFF_MAX, SendFailure, SendKind, SendPolicy, SlotKey};
+use crate::outbox::{BACKOFF_INITIAL, BACKOFF_MAX, SendFailure, SendKind, SendPolicy};
 use crate::own_membership::{OwnMembershipMachine, OwnMembershipState};
 
 /// What a joined slot session's upkeep needs.
@@ -78,11 +78,14 @@ impl<T: MatrixBackend + 'static> SessionUpkeep<T> {
         // The membership's sends, each retried through the outbox for as long
         // as it takes, run side by side: a refresh retrying through an outage
         // must not hold back the delayed leave's restart, nor the beat.
-        let mut restart = pin!(None);
+        // The timer was armed before the join was sent; do not wait a full
+        // interval before renewing it for the first time.
+        let mut restart = pin!(Some(machine.restart_delayed_leave()));
         let mut refresh = pin!(None);
         let mut recover = pin!(None);
         let mut republish = pin!(None);
         let mut departure = pin!(None);
+        let mut rotation = pin!(None);
 
         // One retry per member a rollout did not reach, side by side, so a
         // member who stays unreachable holds back nobody else's key.
@@ -103,8 +106,7 @@ impl<T: MatrixBackend + 'static> SessionUpkeep<T> {
                     if retrying.insert(member_id.clone()) {
                         key_retries.push(retry_key(
                             encryption.clone(),
-                            machine.outbox().clone(),
-                            machine.scope().to_owned(),
+                            machine.clone(),
                             member_id,
                         ));
                     }
@@ -132,6 +134,9 @@ impl<T: MatrixBackend + 'static> SessionUpkeep<T> {
                         break;
                     }
                     log::trace!("[{log_tag}] keep-alive");
+                    if let Some(encryption) = &encryption {
+                        encryption.prune_expired_pending_keys();
+                    }
                     // A restart still retrying is left to land; one whose delay
                     // has certainly fired by now gives way to the re-arm.
                     if restart.is_none() || machine.delayed_leave_overdue() {
@@ -140,8 +145,10 @@ impl<T: MatrixBackend + 'static> SessionUpkeep<T> {
                     if refresh.is_none() {
                         refresh.set(Some(machine.refresh_if_due()));
                     }
-                    if let Some(encryption) = &encryption {
-                        flush(encryption, &log_tag).await;
+                    if rotation.is_none() {
+                        if let Some(encryption) = &encryption {
+                            rotation.set(Some(flush(encryption, &log_tag)));
+                        }
                     }
                     machine.update_lapsed();
                     flushed_due = None;
@@ -152,6 +159,7 @@ impl<T: MatrixBackend + 'static> SessionUpkeep<T> {
                 () = drive(recover.as_mut()) => recover.set(None),
                 () = drive(republish.as_mut()) => republish.set(None),
                 () = drive(departure.as_mut()) => departure.set(None),
+                () = drive(rotation.as_mut()) => rotation.set(None),
                 _ = executor::sleep(lapse_in.unwrap_or_default()), if lapse_in.is_some() => {
                     machine.update_lapsed();
                 }
@@ -173,9 +181,9 @@ impl<T: MatrixBackend + 'static> SessionUpkeep<T> {
                         republish.set(Some(machine.republish()));
                     }
                 }
-                _ = executor::sleep(due_in.unwrap_or_default()), if due_in.is_some() => {
+                _ = executor::sleep(due_in.unwrap_or_default()), if due_in.is_some() && rotation.is_none() => {
                     if let Some(encryption) = &encryption {
-                        flush(encryption, &log_tag).await;
+                        rotation.set(Some(flush(encryption, &log_tag)));
                     }
                     flushed_due = due;
                 }
@@ -214,16 +222,10 @@ impl<T: MatrixBackend + 'static> SessionUpkeep<T> {
 /// delivering to this member says nothing about signalling.
 async fn retry_key<T: MatrixBackend + 'static>(
     encryption: EncryptionManager<T>,
-    outbox: crate::outbox::Outbox,
-    scope: String,
+    machine: Arc<OwnMembershipMachine<T>>,
     member_id: String,
 ) -> String {
-    let key = SlotKey::new(
-        scope,
-        SendKind::KeyDistribution {
-            member_id: member_id.clone(),
-        },
-    );
+    let outbox = machine.outbox();
     let mut owed = encryption.subscribe_undelivered();
     let mut recoveries = outbox.subscribe_recoveries();
     recoveries.mark_unchanged();
@@ -242,9 +244,17 @@ async fn retry_key<T: MatrixBackend + 'static>(
             }
         }
 
-        let outcome = outbox
-            .send(key.clone(), SendPolicy::single_attempt(), || {
-                encryption.retry_undelivered_key(&member_id)
+        let Some(attempted) = encryption.delivery_debt(&member_id) else {
+            return member_id;
+        };
+        let Some(pending) = machine.begin_if_joined(SendKind::KeyDistribution {
+            member_id: member_id.clone(),
+        }) else {
+            return member_id;
+        };
+        let outcome = pending
+            .run(SendPolicy::single_attempt(), || {
+                encryption.retry_delivery_debt(&attempted)
             })
             .await;
         match outcome {
@@ -260,7 +270,7 @@ async fn retry_key<T: MatrixBackend + 'static>(
             Err(SendFailure::TimedOut) => {}
             Err(SendFailure::Refused(error)) => {
                 log::warn!("key to member {member_id} refused for good, not retried: {error}");
-                encryption.forget_undelivered(&member_id);
+                encryption.drop_owed(&attempted);
                 return member_id;
             }
             // Cancelled by the leave, or superseded by a newer retry.
@@ -286,25 +296,30 @@ pub(crate) async fn tick<T: MatrixBackend + 'static>(
     log_tag: &str,
 ) {
     log::trace!("[{log_tag}] keep-alive");
+    // Local reclamation must not wait for a homeserver request.
+    if let Some(encryption) = encryption {
+        encryption.prune_expired_pending_keys();
+    }
     machine.keep_alive().await;
     if let Some(encryption) = encryption {
         flush(encryption, log_tag).await;
         // With no upkeep running, the tick is the retry's backoff (034 R32).
         for member_id in encryption.undelivered_members() {
-            let key = SlotKey::new(
-                machine.scope(),
-                SendKind::KeyDistribution {
-                    member_id: member_id.clone(),
-                },
-            );
-            let outcome = machine
-                .outbox()
-                .send(key, SendPolicy::single_attempt(), || {
-                    encryption.retry_undelivered_key(&member_id)
+            let Some(attempted) = encryption.delivery_debt(&member_id) else {
+                continue;
+            };
+            let Some(pending) = machine.begin_if_joined(SendKind::KeyDistribution {
+                member_id: member_id.clone(),
+            }) else {
+                break;
+            };
+            let outcome = pending
+                .run(SendPolicy::single_attempt(), || {
+                    encryption.retry_delivery_debt(&attempted)
                 })
                 .await;
             if let Err(SendFailure::Refused(_)) = outcome {
-                encryption.forget_undelivered(&member_id);
+                encryption.drop_owed(&attempted);
             }
         }
     }

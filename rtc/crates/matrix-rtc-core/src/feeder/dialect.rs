@@ -33,6 +33,36 @@ pub trait IngestDialect: MaybeSend {
         state: Vec<EventIn>,
     ) -> Vec<RawStickyEvent>;
 
+    /// Delay until the next locally enforced membership expiry, if any.
+    /// Server-enforced sticky membership needs no local timer.
+    fn membership_expiry_in(&self, _state: &[EventIn]) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Translate and schedule expiry from the same input. Time-dependent
+    /// dialects can override this to use a single clock sample for both.
+    fn current_membership_with_expiry(
+        &self,
+        room_id: &str,
+        sticky: Vec<EventIn>,
+        state: Vec<EventIn>,
+    ) -> (Vec<RawStickyEvent>, Option<std::time::Duration>) {
+        let expiry = self.membership_expiry_in(&state);
+        (self.current_membership(room_id, sticky, state), expiry)
+    }
+
+    /// Translate using the feeder's non-decreasing estimate of Unix time.
+    /// Dialects without locally enforced expiry keep their existing behavior.
+    fn current_membership_with_expiry_at(
+        &self,
+        room_id: &str,
+        sticky: Vec<EventIn>,
+        state: Vec<EventIn>,
+        _now_ms: u64,
+    ) -> (Vec<RawStickyEvent>, Option<std::time::Duration>) {
+        self.current_membership_with_expiry(room_id, sticky, state)
+    }
+
     /// A media key from a to-device message naming this room: one of the spec's
     /// key types, or a type beyond them the client subscribed to. The default
     /// reads MSC4143's body; a dialect overriding it reads its own, and should

@@ -119,7 +119,7 @@ func TestHandAndScreenShareStateUpdatesPublicSnapshots(t *testing.T) {
 	call := &Call{
 		groupState: &GroupCallState{
 			TransactionID: 1,
-			Participants:  []GroupCallParticipant{{JID: participant}},
+			Participants:  []GroupCallParticipant{{JID: participant, State: "connected"}},
 		},
 	}
 	var hand HandRaiseState
@@ -229,5 +229,44 @@ func TestWaitingRoomPhaseTransitions(t *testing.T) {
 		!session.TransitionTo(CallPhaseWaitingRoom) ||
 		!session.TransitionTo(CallPhaseConnecting) {
 		t.Fatalf("waiting-room transition stopped at %v", session.Phase())
+	}
+}
+
+func TestScreenShareDeviceBindingSurvivesOnlyExactRosterPresence(t *testing.T) {
+	participant := types.NewJID("200", types.HiddenUserServer)
+	a, b := participant, participant
+	a.Device, b.Device = 1, 2
+	roster := GroupCallState{TransactionID: 1, Participants: []GroupCallParticipant{{
+		JID: participant, State: "connected", Devices: []GroupCallDevice{
+			{JID: a, PID: 4, HasPID: true}, {JID: b, PID: 5, HasPID: true},
+		},
+	}}}
+	call := &Call{groupState: &roster}
+	start := ScreenShareState{Participant: participant, Active: true, Version: 2, ScreenShareID: 9, HasScreenShareID: true}
+	if !call.dispatchScreenShareAt(start, 1) {
+		t.Fatal("bare control rejected")
+	}
+	_, roles, _ := call.GroupVideoRoles()
+	if roles[a.String()].ScreenShare || roles[b.String()].ScreenShare {
+		t.Fatal("ambiguous bare control attributed")
+	}
+	start.Device = b
+	if !call.dispatchScreenShareAt(start, 1) {
+		t.Fatal("explicit control rejected")
+	}
+	_, roles, _ = call.GroupVideoRoles()
+	if roles[a.String()].ScreenShare || !roles[b.String()].ScreenShare {
+		t.Fatal("screen role not bound to exact device")
+	}
+	if call.dispatchScreenShareAt(ScreenShareState{Participant: participant, Device: a}, 1) {
+		t.Fatal("wrong device retired share")
+	}
+	next := cloneGroupCallState(roster)
+	next.TransactionID = 2
+	next.Participants[0].Devices[1].PID = 6
+	call.setGroupState(next)
+	_, roles, _ = call.GroupVideoRoles()
+	if len(call.ScreenShares()) != 0 || roles[b.String()].ScreenShare {
+		t.Fatal("changed PID inherited screen share")
 	}
 }

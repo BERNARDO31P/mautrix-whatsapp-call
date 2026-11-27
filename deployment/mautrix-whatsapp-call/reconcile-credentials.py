@@ -4,11 +4,10 @@ import secrets
 from pathlib import Path
 from config_files import atomic_write,load
 
-def reconcile(root,server):
+def plan_credentials(root,server):
     dest=root/"generated"
     if dest.is_symlink(): raise ValueError("generated directory is a symbolic link")
-    dest.mkdir(mode=0o700,exist_ok=True)
-    dest.chmod(0o700)
+    if dest.exists() and not dest.is_dir(): raise ValueError("generated path is not a directory")
     def yaml_at(path):
         if path.is_symlink() and path.parent == dest: raise ValueError("generated configuration is a symbolic link")
         return load(path.read_text()) if path.is_file() else {}
@@ -39,6 +38,13 @@ def reconcile(root,server):
         if len(values)>1: raise ValueError(f"conflicting surviving copies of {k}; existing credentials preserved")
     if not candidates["matrixrtc_store_passphrase"] and (any((root/"worker-state"/"identities").glob("*/crypto/*")) or any((root/"worker-state"/"identities").glob("*/matrixrtc-ready*")) or any((root/"worker-state"/"identities").glob("*/recovery-key.txt"))):
         raise ValueError("restore the existing matrixrtc_store_passphrase for the encrypted worker store")
+    return candidates
+
+def reconcile(root,server):
+    dest=root/"generated"
+    candidates=plan_credentials(root,server)
+    dest.mkdir(mode=0o700,exist_ok=True)
+    dest.chmod(0o700)
     for k,values in candidates.items():
         p=dest/k
         if p.is_file() and p.read_text().strip():

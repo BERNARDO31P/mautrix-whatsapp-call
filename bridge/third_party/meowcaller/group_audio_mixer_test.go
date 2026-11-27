@@ -159,16 +159,30 @@ func TestParticipantReceiveRegistryFeedsAddedParticipantMixer(t *testing.T) {
 	}
 	mixer := newParticipantAudioMixer()
 	mixer.Retain(registry.ActiveParticipantIDs())
+	peerSender, _ := newTestParticipantAudioSender(t, callKey, self, peer)
+	addedSender, _ := newTestParticipantAudioSender(t, callKey, self, added)
 	for range 2 {
-		peerPacket, _ := protectParticipantAudio(t, callKey, self, peer, []byte{0x11})
+		peerPacket, err := peerSender.ProtectAudio([]byte{0x11})
+		if err != nil {
+			t.Fatal(err)
+		}
 		peerAudio, ok := registry.DecodeAudio(peerPacket)
 		if !ok || !mixer.Add(peerAudio.ParticipantID, peerAudio.PCM) {
 			t.Fatal("original-peer media did not reach mixer")
 		}
-		addedPacket, _ := protectParticipantAudio(t, callKey, self, added, []byte{0x22})
+		if _, ok := registry.DecodeAudio(peerPacket); ok {
+			t.Fatal("duplicate peer packet reached mixer")
+		}
+		addedPacket, err := addedSender.ProtectAudio([]byte{0x22})
+		if err != nil {
+			t.Fatal(err)
+		}
 		addedAudio, ok := registry.DecodeAudio(addedPacket)
 		if !ok || !mixer.Add(addedAudio.ParticipantID, addedAudio.PCM) {
 			t.Fatal("added-participant media did not reach mixer")
+		}
+		if _, ok := registry.DecodeAudio(addedPacket); ok {
+			t.Fatal("duplicate added packet reached mixer")
 		}
 	}
 	chunk, ok := mixer.MixChunk()

@@ -1,8 +1,8 @@
 # Build
 
-The checked-in `bridge/` and `rtc/` trees are the effective source. The build does not download or apply source patches.
+Builds use the checked-in Go and Rust source in `bridge/` and `rtc/`.
 
-For the complete release publishing, checksum and build troubleshooting workflow, see [RELEASING.md](RELEASING.md). Server operators can use prebuilt runtime ZIPs without this toolchain; see the [installation guide](../deployment/mautrix-whatsapp-call/INSTALLATION.md).
+For release packaging, see [RELEASING.md](RELEASING.md). Runtime users do not need the native build toolchain.
 
 Pinned build inputs are prepared under `~/.cache/mautrix-whatsapp-call/`:
 
@@ -10,6 +10,7 @@ Pinned build inputs are prepared under `~/.cache/mautrix-whatsapp-call/`:
 - Rust 1.100.0
 - LLVM/Clang 21.1.8
 - LiveKit WebRTC `webrtc-a545de4`
+- Opus 1.5.2
 
 ## Windows: new PC
 
@@ -44,6 +45,6 @@ export MAUTRIX_WHATSAPP_CALL_CACHE="$HOME/.cache/mautrix-whatsapp-call"
 ./build/build.sh
 ```
 
-Do not set `MAUTRIX_WHATSAPP_CALL_SKIP_TESTS=1` for a release intended for deployment.
+Release builds reject `MAUTRIX_WHATSAPP_CALL_SKIP_TESTS=1`. Each attempt retains its own source snapshot, binaries, logs and (only after successful tests and compilation) build record under `~/.cache/mautrix-whatsapp-call/work/runs/`. Keep the completed run with its runtime ZIP; failed attempts do not overwrite earlier runs. A cache lock excludes concurrent release builds; do not run standalone preparation against an active builder.
 
 For direct builds, output defaults to `dist/mautrix-whatsapp-call-<timestamp>.zip` and `dist/mautrix-whatsapp-call-<timestamp>.zip.sha256`.

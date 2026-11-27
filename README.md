@@ -1,104 +1,48 @@
 # mautrix-whatsapp-call
 
-`mautrix-whatsapp-call` adds WhatsApp audio and video calling to **mautrix-whatsapp** rooms through MatrixRTC and LiveKit while preserving normal WhatsApp message bridging.
+WhatsApp voice and video calling for Matrix, based on [mautrix-whatsapp](https://github.com/mautrix/whatsapp), MatrixRTC and LiveKit.
 
-The repository contains the source required to build the modified mautrix-whatsapp bridge and the MatrixRTC call worker. Large build inputs such as Go, Rust, LLVM/Clang and the LiveKit WebRTC bundle are **not committed**; the bootstrap downloads pinned versions and verifies their SHA-256 digests.
+The project extends an existing mautrix-whatsapp installation. Messages continue to use the original WhatsApp bridge.
 
-## Installation and documentation
+> Calling is experimental. Native builds and deployment checks pass, but end-to-end WhatsApp audio and video have not yet been verified.
 
-**Installing on a Matrix server? Start with the [complete installation guide](deployment/mautrix-whatsapp-call/INSTALLATION.md).** It covers the prebuilt runtime, an existing Synapse/WhatsApp stack, automatic LiveKit and JWT service installation, credential generation, actual configuration examples, DNS/TLS, reverse proxy, firewall, room migration and verification. No separate LiveKit installation or build toolchain is required on the runtime host.
+## Features
 
-For upgrades, backup/restore, secret recovery, troubleshooting and the live test checklist, see the [operations guide](deployment/mautrix-whatsapp-call/OPERATIONS.md). Both guides are included in future runtime packages. Maintainers publishing builds should also see [Releasing](docs/RELEASING.md).
+- Incoming and outgoing audio/video calls
+- Call acceptance, rejection and termination
+- Microphone and camera controls
+- WhatsApp call availability and business account detection
+- Group call support with an aggregate bridge participant
 
-## Prebuilt releases
+See [client compatibility](docs/CLIENT-CALL-COMPATIBILITY.md) for limitations and experimental client extensions.
 
-Published runtime packages and their SHA-256 sidecars are available on the [GitHub Releases page](https://github.com/BERNARDO31P/mautrix-whatsapp-call/releases). Download matching files from a trusted release, verify the checksum and follow the installation guide. A source archive is not an installable runtime package. Audit candidates must pass the full build and live acceptance gate before publication.
+## Requirements
 
-## What it provides
+- Linux AMD64 (x86_64)
+- Docker and Docker Compose
+- An existing Synapse and mautrix-whatsapp installation
+- A MatrixRTC-capable client, such as Element X
+- HTTPS reverse proxy and reachable LiveKit media ports
 
-- outgoing and incoming WhatsApp audio/video calls from MatrixRTC-capable Matrix clients;
-- call accept, decline, cancel, no-answer and hangup handling;
-- audio/video mode changes and microphone/camera state changes;
-- WhatsApp business/callability checks;
-- direct and group-call support;
-- encrypted persistent MatrixRTC ghost identities;
-- LiveKit SFU + Element JWT service integration;
-- idempotent room/permission/m.direct migration for existing mautrix-whatsapp portals;
-- an upgrade-safe installer that preserves generated credentials and worker state.
+The installer configures LiveKit and the Element JWT service. See the [installation guide](deployment/mautrix-whatsapp-call/INSTALLATION.md) for the supported topology and ports.
 
-## Supported deployment model
+## Installation
 
-This project extends an **existing** Docker Compose Matrix installation. The supported server layout is:
+Download the runtime ZIP and its matching `.sha256` file from [Releases](https://github.com/BERNARDO31P/mautrix-whatsapp-call/releases).
 
-```text
-/opt/matrix/
-├── docker-compose.yml
-├── .env
-├── synapse/
-├── mautrix-whatsapp/
-└── mautrix-whatsapp-call/
+On Linux, verify the archive before extracting it:
+
+```bash
+sha256sum -c mautrix-whatsapp-call-YYYYMMDD-HHMMSS.zip.sha256
 ```
 
-The existing Compose project must expose services named `synapse` and `mautrix-whatsapp`. The default mautrix-whatsapp files are expected at:
+Replace the example filename with the downloaded filename. Follow the [installation guide](deployment/mautrix-whatsapp-call/INSTALLATION.md) to configure your existing Matrix deployment.
 
-```text
-/opt/matrix/mautrix-whatsapp/config.yaml
-/opt/matrix/mautrix-whatsapp/registration.yaml
-```
+For updates, see the [operations guide](deployment/mautrix-whatsapp-call/OPERATIONS.md). Preserve the existing configuration, generated credentials, WhatsApp sessions and worker state.
 
-If the registration is elsewhere, set `MATRIXRTC_WHATSAPP_REGISTRATION_PATH` in `/opt/matrix/.env`.
+## Build from source
 
-The build target is Linux AMD64. Windows builds use WSL2.
-
-## Repository layout
-
-```text
-bridge/                         modified mautrix-whatsapp + integrated meowcaller
-rtc/                            MatrixRTC crates + WhatsApp RTC worker
-bootstrap/                      pinned toolchain/WebRTC preparation
-build/                          build, source verification and packaging
-deployment/mautrix-whatsapp-call/ Docker Compose overlay + installer
-tests/                          project/deployment regression tests
-docs/                           architecture, build, deploy, migration and provenance
-licenses/                       license texts/notices
-```
-
-Unrelated upstream mobile/web/demo artifacts, downloaded toolchains, dependency caches, compiled binaries and runtime secrets are intentionally not part of the repository.
-
-## Quick start: Windows + WSL2
-
-### 1. Clone
-
-```powershell
-git clone https://github.com/BERNARDO31P/mautrix-whatsapp-call.git
-cd mautrix-whatsapp-call
-```
-
-### 2. Clean-machine bootstrap
-
-Use a supported x64 Windows 10/11 PC with virtualization enabled, Windows PowerShell 5.1 (64-bit), internet access, and sufficient free space (60 GB recommended). Open ordinary Windows PowerShell under your own account. Approve the UAC prompt if Windows system setup is needed. No separate Git installation is required if you extracted the source ZIP instead of cloning.
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Bootstrap.ps1" -BuilderRoot "$HOME\mautrix-whatsapp-call-builder" -Jobs 4
-```
-
-The bootstrap displays progress in the current console, enables WSL2, installs the runtime when necessary, imports a checksum-verified Ubuntu 22.04 AMD64 root filesystem, and calls the full build. Only WSL system setup requests elevation automatically, in a visible setup window. The original console waits for its exit code, then imports Ubuntu and builds under the original Windows user. An already working build distribution needs no elevation. No distribution is unregistered. Exit code `3010` means Windows requires a restart: restart and rerun the identical command. Exit code `1` indicates failure; read the error above it. `-PrepareOnly` downloads and prepares build inputs without compiling.
-
-The bootstrap places runtime ZIPs and checksums in `$HOME\mautrix-whatsapp-call-builder\dist`. Rerunning it reuses the dedicated distro and Linux dependency cache.
-
-### 3. Build on an existing WSL2 distribution
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Build.ps1" -DistroName "Ubuntu-22.04" -OutputRoot "$HOME\mautrix-whatsapp-call-builder\dist" -Jobs 4
-```
-
-Use `-DistroName "mautrix-whatsapp-call-Ubuntu-22.04"` for the dedicated bootstrap distro. `Build.ps1` does not require Windows elevation once WSL2 is operational. If no distro is specified, it prefers the dedicated distro, then Ubuntu-22.04; it never silently chooses Docker Desktop. Its default output is the repository `dist/` directory unless `-OutputRoot` is provided. Reduce `-Jobs` to 2 or 1 on memory-limited PCs.
-
-Successful builds run source verification, tests and release-binary TLS verification, then produce the verified Linux AMD64 runtime ZIP and its SHA-256 sidecar. See [build documentation](docs/BUILD.md) for troubleshooting.
-
-## Quick start: native Linux build
-
-On a supported Debian/Ubuntu-style Linux AMD64 build host:
+### Linux
 
 ```bash
 git clone https://github.com/BERNARDO31P/mautrix-whatsapp-call.git
@@ -106,220 +50,39 @@ cd mautrix-whatsapp-call
 bash build/build.sh
 ```
 
-`build/build.sh` invokes the build-input preparation automatically. Missing system packages are installed with `apt` (using `sudo` when needed), and pinned external toolchains are stored under `~/.cache/mautrix-whatsapp-call/`.
+### Windows (WSL2)
 
-To prepare inputs without compiling:
-
-```bash
-bash bootstrap/prepare-build-inputs.sh
-```
-
-## Server installation
-
-### 1. Configure the existing Matrix Compose project
-
-At minimum, `/opt/matrix/.env` must contain your Matrix server name:
-
-```dotenv
-MATRIXRTC_SERVER_NAME=matrix.example.com
-MATRIXRTC_ENABLE_CALLS=0
-MATRIXRTC_SOCKET_GID=29319
-```
-
-Keep calls disabled (`0`) until the initial installation and verification complete. Set it to `1` afterward and rerun the installer to enable calls.
-
-If mautrix-whatsapp's appservice registration is not at the default path, also set for example:
-
-```dotenv
-MATRIXRTC_WHATSAPP_REGISTRATION_PATH=./mautrix-whatsapp/registration.yaml
-```
-
-### 2. Copy the built runtime package to the server
-
-From Windows PowerShell:
+From the source directory, run:
 
 ```powershell
-$Release = Get-ChildItem ".\dist\mautrix-whatsapp-call-*.zip" |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
-
-scp `
-    $Release.FullName `
-    "$($Release.FullName).sha256" `
-    root@YOUR_SERVER:/root/
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Bootstrap.ps1" -Jobs 4
 ```
 
-### 3. Verify and extract it on the server
+For an existing Ubuntu WSL2 distribution:
 
-```bash
-cd /root
-ZIP="$(ls -1t mautrix-whatsapp-call-*.zip | head -n 1)"
-SHA="${ZIP}.sha256"
-EXPECTED="$(awk '{print $1}' "$SHA")"
-ACTUAL="$(sha256sum "$ZIP" | awk '{print $1}')"
-test "$EXPECTED" = "$ACTUAL"
-
-RELEASE="/root/${ZIP%.zip}"
-rm -rf "$RELEASE"
-unzip -q "$ZIP" -d /root
-cd "$RELEASE"
-sha256sum -c SHA256SUMS
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Build.ps1" -Jobs 4
 ```
 
-### 4. Install the deployment overlay
-
-```bash
-cd /opt/matrix
-mkdir -p mautrix-whatsapp-call
-
-rsync -a --delete \
-    --exclude="generated/" \
-    --exclude="worker-state/" \
-    "$RELEASE/deployment/mautrix-whatsapp-call/" \
-    /opt/matrix/mautrix-whatsapp-call/
-```
-
-For an upgrade, **never delete** these two directories:
-
-```text
-/opt/matrix/mautrix-whatsapp-call/generated/
-/opt/matrix/mautrix-whatsapp-call/worker-state/
-```
-
-They contain generated credentials and persistent encrypted MatrixRTC identity state. They are ignored by Git and normalized to private permissions by the installer.
-
-Validate Compose and install:
-
-```bash
-cd /opt/matrix
-
-docker compose \
-    -f docker-compose.yml \
-    -f mautrix-whatsapp-call/compose.yml \
-    config >/dev/null
-
-bash mautrix-whatsapp-call/install-or-upgrade.sh
-bash mautrix-whatsapp-call/verify-worker.sh
-```
-
-The installer temporarily disables calls while it updates Synapse/bridge configuration, migrates existing rooms and provisions RTC identities. It restores the previous `MATRIXRTC_ENABLE_CALLS` setting only after verification.
-
-### 5. Reverse proxy and firewall
-
-The public Matrix HTTPS virtual host must proxy:
-
-- `/livekit/jwt` to the local JWT service;
-- `/livekit/sfu` to the local LiveKit HTTP/WebSocket endpoint.
-
-An nginx fragment is supplied at:
-
-```text
-deployment/mautrix-whatsapp-call/nginx-443-locations.conf
-```
-
-Render/use it for your Matrix hostname and reload nginx after validation.
-
-LiveKit also needs its media ports reachable from Matrix clients:
-
-- TCP `7881`
-- UDP `7882`
-
-Do not expose the local-only JWT port (`18080`) or LiveKit HTTP port (`7880`) directly; the Compose overlay binds them to `127.0.0.1`.
-
-### 6. Enable calls
-
-After installation succeeds, set:
-
-```dotenv
-MATRIXRTC_ENABLE_CALLS=1
-```
-
-Then rerun:
-
-```bash
-cd /opt/matrix
-bash mautrix-whatsapp-call/install-or-upgrade.sh
-bash mautrix-whatsapp-call/verify-worker.sh
-```
-
-Force-stop/reopen Matrix clients once after an upgrade so cached call eligibility is refreshed.
-
-## Updating
-
-There are three different update paths: project releases, ordinary container-image updates, and upstream dependency bumps. They are intentionally separate. See [`docs/UPDATING.md`](docs/UPDATING.md) for the complete procedure.
-
-For a normal `mautrix-whatsapp-call` release upgrade, pull/build the newer source revision, copy the new runtime ZIP to the server, replace only the deployment files with `rsync` while excluding `generated/` and `worker-state/`, then rerun:
-
-```bash
-bash /opt/matrix/mautrix-whatsapp-call/install-or-upgrade.sh
-```
-
-The installer is designed to be idempotent and to preserve credentials/state.
-
-When updating unrelated containers in the Matrix stack, always include this project's Compose overlay. A safe pull is:
-
-```bash
-cd /opt/matrix
-docker compose \
-    -f docker-compose.yml \
-    -f mautrix-whatsapp-call/compose.yml \
-    pull --ignore-buildable
-
-docker compose \
-    -f docker-compose.yml \
-    -f mautrix-whatsapp-call/compose.yml \
-    up -d
-```
-
-`--ignore-buildable` deliberately skips the locally built call bridge and worker images. Do not run the base Compose file by itself when recreating `mautrix-whatsapp`, because that can recreate the ordinary upstream bridge image without the calling extension.
-
-## Verification and tests
-
-Source-only checks:
-
-```bash
-bash build/verify-source.sh
-python3 -B tests/test_project.py
-for test in tests/shell/*.sh; do bash "$test"; done
-```
-
-A normal build also runs focused Go tests, meowcaller tests, MatrixRTC core tests and RTC-worker tests before creating a runtime package.
-
-## What is deliberately not committed
-
-`.gitignore` excludes:
-
-- `dist/`, `target/`, caches and logs;
-- downloaded archives/toolchains;
-- generated bridge/worker binaries;
-- `.env`, generated registrations/secrets and worker crypto state;
-- databases and IDE/OS state.
-
-The repository **does** keep codec test vectors and other source fixtures required by the regression suite. Those are source/test data, not downloaded build dependencies.
-
-## Security
-
-Do not commit or share:
-
-- `/opt/matrix/.env`;
-- `generated/`;
-- `worker-state/`;
-- mautrix-whatsapp access tokens/registration secrets;
-- Matrix access tokens, recovery keys or crypto stores.
-
-The main call worker does not receive the mautrix-whatsapp appservice registration. Provisioning is separated into the dedicated provisioner container.
-
-See `SECURITY.md` and `docs/ARCHITECTURE.md` for more details.
+The build downloads the pinned toolchain and reuses cached dependencies. See [build instructions](docs/BUILD.md) for requirements, options and troubleshooting.
 
 ## Documentation
 
-- `docs/BUILD.md`
-- `docs/DEPLOY.md`
-- `docs/MIGRATION.md`
-- `docs/ARCHITECTURE.md`
-- `docs/TESTING.md`
-- `docs/PROVENANCE.md`
+- [Architecture](docs/ARCHITECTURE.md)
+- [Client compatibility and extensions](docs/CLIENT-CALL-COMPATIBILITY.md)
+- [Build instructions](docs/BUILD.md)
+- [Installation](deployment/mautrix-whatsapp-call/INSTALLATION.md)
+- [Operations](deployment/mautrix-whatsapp-call/OPERATIONS.md)
+- [Migration](docs/MIGRATION.md)
+- [Updating dependencies](docs/UPDATING.md)
+- [Testing](docs/TESTING.md)
+- [Publishing releases](docs/RELEASING.md)
+- [Upstream sources and dependencies](docs/PROVENANCE.md)
 
-## Licensing
+## Security
 
-This repository contains modified source derived from projects with different licenses. See `LICENSES.md`, the retained upstream license files under `bridge/`, `bridge/third_party/meowcaller/` and `rtc/`, and `licenses/` before redistribution.
+See [SECURITY.md](SECURITY.md).
+
+## Licence
+
+See [LICENSES.md](LICENSES.md) for the applicable licences and upstream notices.

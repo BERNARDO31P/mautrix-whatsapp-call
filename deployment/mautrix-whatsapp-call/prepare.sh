@@ -20,8 +20,14 @@ mkdir -p "$DEST"
 chmod 700 "$DEST"
 
 exec 9>"$DEST/.prepare.lock"
-flock -x 9
-python3 "$ROOT/reconcile-credentials.py" "$ROOT" "$SERVER"
+flock -x -w 30 9 || { echo "Another credential preparation holds the lock" >&2; exit 2; }
+# A killed render may leave temporary private files. Reconcile only canonical
+# credentials, never import a partial rendered copy or overwrite a bad target.
+for name in livekit.yaml matrixrtc-registration.yaml matrixrtc-doublepuppet-registration.yaml double_puppet_secret; do
+    target="$DEST/$name"
+    [[ ! -L "$target" && ( ! -e "$target" || -f "$target" ) ]] || { echo "Invalid generated target: $name" >&2; exit 2; }
+done
+python3 -B "$ROOT/reconcile-credentials.py" "$ROOT" "$SERVER"
 STAGING="$(mktemp -d "$DEST/.render.XXXXXX")"
 trap 'rm -rf "$STAGING"' EXIT
 
@@ -29,7 +35,7 @@ WORKER_STATE="$ROOT/worker-state"
 mkdir -p "$WORKER_STATE"
 chmod 700 "$WORKER_STATE"
 
-python3 - "$ROOT" "$DEST" "$STAGING" "$SERVER" <<'PYCONFIG'
+python3 -B - "$ROOT" "$DEST" "$STAGING" "$SERVER" <<'PYCONFIG'
 import re, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
@@ -64,7 +70,17 @@ write("matrixrtc-doublepuppet-registration.yaml", {
 atomic_write(out / "double_puppet_secret", ("as_token:" + secret("double_puppet_as_token") + "\n").encode())
 PYCONFIG
 
-for path in "$STAGING"/*; do chmod 600 "$path"; mv -f "$path" "$DEST/"; done
+# Each promotion is atomic, not a multi-file transaction. After interruption
+# the next run reconstructs the same outputs from already durable credentials.
+for path in "$STAGING"/*; do chmod 600 "$path"; mv -fT -- "$path" "$DEST/$(basename "$path")"; done
+python3 - "$DEST" <<'PYSYNC'
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PYSYNC
 
 cat <<TEXT
 MatrixRTC secrets and registrations generated locally for $SERVER.

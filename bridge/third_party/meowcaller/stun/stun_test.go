@@ -300,3 +300,26 @@ func TestPongMatching(t *testing.T) {
 		t.Error("pong with wrong tx falsely matched")
 	}
 }
+
+func TestControlReadersRejectMalformedFrames(t *testing.T) {
+	tx := [12]byte{1}
+	for _, kind := range []uint16{MsgAllocateSuccess, MsgAllocateError, MsgWhatsappPong} {
+		pkt := EncodeStunRequest(kind, tx, stunAttr(attrErrorCode, []byte{0, 0, 4, 1}), nil, false)
+		pkt[23] = 9 // Attribute claims more bytes than the complete message contains.
+		if _, ok := StunMessageType(pkt); ok {
+			t.Fatal("invalid message type accepted")
+		}
+		if _, ok := StunTransactionID(pkt); ok {
+			t.Fatal("invalid transaction accepted")
+		}
+		if IsAllocateOrBindingSuccess(pkt) || IsAllocateError(pkt) || IsWhatsappPong(pkt, nil) {
+			t.Fatal("invalid response accepted")
+		}
+		if attrs := ParseStunAttributes(pkt); attrs != nil {
+			t.Fatal("partial attributes accepted")
+		}
+		if _, ok := ParseStunErrorCode(pkt); ok {
+			t.Fatal("invalid error accepted")
+		}
+	}
+}

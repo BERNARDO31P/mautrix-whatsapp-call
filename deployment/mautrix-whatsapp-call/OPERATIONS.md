@@ -64,7 +64,8 @@ Prefer tested prebuilt Linux AMD64 runtime assets from <https://github.com/BERNA
 
 - Read release notes and confirm compatibility with your Synapse, bridge database schema, clients and pinned base images. Avoid updates while a call is active.
 - If you customize the reverse proxy, firewall or deployment templates, review the new versions and reapply supported changes. The installer regenerates configuration and rsync replaces project-owned files; it does not rewrite the host nginx vhost or firewall.
-- The installer temporarily disables calls, updates runtime wiring and room metadata, provisions eligible ghosts, restores the configured worker flag and verifies the socket. An error may leave partially updated configuration; the installer attempts to stop the call worker and background provisioner. Inspect the failure and confirm both are stopped; do not re-enable calls until the configuration and migration are repaired.
+- The installer temporarily disables calls, updates runtime wiring and room metadata, provisions eligible ghosts, restores the configured worker flag and verifies the socket. An error may leave partially updated configuration; the installer attempts to stop the call worker and background provisioner. The installer bounds each shutdown attempt (75 seconds for Compose stop, then at most 10 seconds each for listing and inspection, plus termination grace), refuses to start configuration changes unless the call containers are confirmed stopped or absent, and attempts shutdown again on failure. A timeout does not prove that Docker stopped the containers. Inspect the failure and confirm both are stopped; do not re-enable calls until the configuration and migration are repaired. An interrupted credential render is safe to rerun with the existing canonical credential files; preserve them and the crypto store. Private leftover `.render.*` directories are not reused or automatically deleted. If needed, remove only confirmed abandoned staging directories after stopping the call services and ensuring no preparation process is active.
+- An interrupted upgrade can leave a private `.matrixrtc-config-rollback.*` directory directly under `/opt/matrix`. The installer refuses a new transaction while such a journal exists. Before live configuration writes, the installer flushes the journal and its parent directory; a failed flush leaves the journal for review. Before any service recreation, the installer attempts to restore the four original configuration/registration files, after checking all manifest entries and private backup files. Invalid journal metadata or backup files, including older manifests without planned ownership and mode, require manual recovery. Unexpected live file ownership or permissions also prevent automatic recovery. Known intermediate chmod/chown states are accepted; concurrent edits between validation and replacement are not excluded. The installer revalidates the complete private snapshot and all original content digests before writing the restart marker. A `restart-started` marker means services may have consumed the new configuration; automatic file restoration is then disabled. Preserve the journal as sensitive evidence, inspect service status and configuration during a maintenance window, and reconcile with your known-good backup before moving the journal to a protected location and retrying. Never simply remove the marker to force a restore. The journal is not a database, image, or crypto-state backup and does not roll back room migrations. A successful verified upgrade removes the journal.
 - Recheck public JWT/SFU/transport endpoints, worker health, media and normal messages. Force-stop/reopen Matrix clients after room changes.
 
 For updating unrelated registry-backed services:
@@ -205,6 +206,8 @@ For a bug report include the release tag, platform/architecture, relevant compon
 
 ### Element X membership compatibility
 
+Element X 26.11.0 defaults to the embedded Element Call UI; its experimental native interface is a separate acceptance target. See `docs/CLIENT-CALL-COMPATIBILITY.md` in the source tree for supported and currently untranslated call controls. A Matrix-local reaction, hand raise or screen-share success is not a WhatsApp success.
+
 For incoming calls the default `MATRIXRTC_INCOMING_MEMBERSHIP_FORMAT=room_state`
 uses MSC3401 membership, MSC4075 notifications and legacy SFU authorization.
 This matches the Element X client observed in the November 24 deployment.
@@ -215,3 +218,64 @@ continue to select the dialect from the authenticated caller's invitation and
 related membership. An absent or mismatched membership must still prevent dial.
 Worker logs report the selected dialect and, on an admission timeout, the two
 roster snapshots (which contain identifiers, but not encryption key material).
+
+## Crypto-store ownership during manual repair
+
+Stop only the call worker before repairing an identity it has cached, and restart it after successful preparation. The provisioner may retry busy identities but must not open a worker-owned store. Preserve the persistent `.provision.lock` and `.crypto-owner.lock` files alongside the identity; deleting them is not a way to unlock a live process. All cooperating processes must use the same local state mount.
+
+### Ghost namespace consistency
+
+Auto-provisioning, call-room migration and direct-chat mapping use the same
+registration/configuration resolver. Both the bridge username template and an
+exclusive appservice user namespace must permit a ghost identity on the
+configured homeserver. A template alone or a non-exclusive registration does
+not establish ownership. If this check fails, correct the registration/config
+pair before retrying; the installer does not rewrite existing registrations.
+Custom registration regexes must be compatible with both Python and jq.
+
+### Recovery credential durability
+
+New ghost recovery uses a random per-identity passphrase persisted in `recovery-key.txt` (mode 0600) before the SDK enables recovery on Synapse. The filename is unchanged; older Base58 recovery keys still work. Back up this file together with the matching session and crypto store. Existing externally backed recovery can be supplied through `RTC_GHOST_RECOVERY_KEY`. If enablement is interrupted, preserve the credential and store; retrying may recover a completed server-side setup. If the server has only partially created the backup or no default key, stop and reconcile manually. Do not delete the file or reset the identity automatically. Provisioning now refuses readiness when the existing recovery credential cannot be verified.
+
+### Worker focus authorization
+
+The dedicated calling worker restricts legacy JWT exchanges and SFU connections to the canonical HTTPS/WSS endpoints on `MATRIXRTC_SERVER_NAME`. Its JWT HTTP client does not follow redirects. Rooms using a different focus are not supported by this worker; standalone SDK consumers keep their existing behaviour. Keep the advertised transports, JWT service response and reverse proxy configuration aligned with the generated deployment. This restriction does not modify the WhatsApp message bridge.
+
+The installer checks the rendered Compose JWT image and existing (including stopped) JWT containers before changing deployment files or stopping calls. It accepts only the pinned `ghcr.io/element-hq/lk-jwt-service:0.9.0` image reference, without a custom build. Version 0.9.0 hashes the legacy `m.call#ROOM` slot, whereas 0.10.0 normalizes it to `m.call#room` in its token paths; the aliases are different. Do not change the image pin independently of the calling protocol review. If a different version is already deployed, the installer refuses replacement: review client dialects and room compatibility in staging rather than automatically downgrading. The guard also records the local immutable Docker image ID, refuses a tag that points at different bytes than any existing container, rechecks the ID across installation, and recreates the JWT service without pulling. It checks the running container ID before enabling calls. Only a fresh install with no local image may pull the pinned tag. This is local image continuity, not registry signature verification or mixed-dialect interoperability; never retag the JWT image concurrently with deployment.
+
+### Inconsistent local ghost identity metadata
+
+Provisioning will not automatically replace an existing malformed or incomplete
+`session.json`, or create a replacement device when a crypto directory or
+readiness/recovery artifact survives (including dangling links). A valid session
+with a partially created non-empty crypto directory requires the matching store
+to be restored. Conflicting user/device metadata in `matrixrtc-ready-v1` also
+requires reconciliation; an intentionally invalidated `{}` marker can be retried
+with a valid matching store. Preserve all existing identity files, stop the
+worker and provisioner, and reconcile the session, store and recovery credential
+from a consistent backup before retrying. These local checks do not establish
+native cross-signing or server recovery correctness.
+
+### Unsettled delayed membership operation
+
+If a legacy call is refused because membership ownership is unsettled, stop the
+call worker during a maintenance window and preserve its identity directory.
+With the worker stopped, run the following read-only inspection on the installed
+server (replace the identity directory placeholder with the exact ghost's
+persistent identity directory):
+
+```bash
+cd /opt/matrix
+python3 mautrix-whatsapp-call/inspect-delayed-membership.py \
+    /opt/matrix/mautrix-whatsapp-call/worker-state/identities/IDENTITY_DIRECTORY
+```
+
+The report contains private room/device identifiers and exact delayed-event IDs;
+keep it local. A null ID is an ambiguous create, not proof that nothing was
+created. An interrupted ID update may include a candidate server ID. Neither an
+elapsed timeout nor `M_NOT_FOUND` is sufficient to conclude that the old state
+write cannot still arrive. Confirm departure and settlement of every delayed
+operation against the authoritative homeserver before explicitly reconciling the
+corresponding operation records and legacy ownership marker. Do not remove
+these records as an automatic repair, even when rolling back the worker image.
+The pinned API does not provide automatic reconciliation of an unknown ID.

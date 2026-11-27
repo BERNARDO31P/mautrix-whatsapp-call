@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, watch, OwnedMutexGuard};
 
 use crate::compat::MembershipFormat;
 use crate::encryption::types::ReceivedEncryptionKey;
@@ -141,19 +141,26 @@ pub struct PendingLeave<T: MatrixBackend + 'static> {
     upkeep: Option<AbortOnDrop<()>>,
     leave_reason: Option<LeaveReason>,
     log_tag: String,
+    // Held until both legacy leave sends are confirmed. A dropped pending
+    // send or an uncertain result leaves the state key fenced.
+    legacy_leave: Option<(OwnedMutexGuard<bool>, Outbox, String, String)>,
 }
 
 impl<T: MatrixBackend + 'static> PendingLeave<T> {
     /// Sends the leave. A failure is the leave event's; the delayed leave
     /// removes the membership then.
-    pub async fn send(self) -> Result<(), LeaveError> {
+    pub async fn send(mut self) -> Result<(), LeaveError> {
         let sent = self
             .machine
-            .leave(self.leave_reason)
+            .leave_with_settlement(self.leave_reason, self.legacy_leave.is_some())
             .await
             .inspect_err(|error| log::warn!("[{}] leave failed: {error}", self.log_tag));
         drop(self.upkeep);
         sent?;
+        if let Some((fence, outbox, room_id, state_key)) = self.legacy_leave.as_mut() {
+            outbox.clear_legacy(room_id, state_key)?;
+            **fence = false;
+        }
         log::info!("[{}] left", self.log_tag);
         Ok(())
     }
@@ -460,7 +467,38 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             JoinError::CommandError(CommandError::from_message("no backend configured"))
         })?;
 
+        let deadline = deadline.unwrap_or_else(|| {
+            executor::Instant::now() + Duration::from_millis(crate::join::DEFAULT_JOIN_BUDGET_MS)
+        });
+        // Legacy membership reuses a state key across joins. Wait for a
+        // detached previous leave before publishing another join to that key.
+        // Do not extend the caller's join budget while waiting.
         let membership_id = params.membership_id();
+        if self.own_membership_machine.as_ref().is_some_and(|m| m.sticky_key() == membership_id) {
+            return Err(JoinError::AlreadyJoined(membership_id));
+        }
+        let mut legacy_join = if self.format.reads_state_membership() {
+            let remaining = deadline.saturating_duration_since(executor::Instant::now());
+            if remaining.is_zero() {
+                return Err(JoinError::TimedOut);
+            }
+            let key = crate::compat::RoomStateDialect::new(
+                backend.own_user_id(), backend.own_device_id(),
+                self.room_id.clone(), self.slot_id.clone(),
+            ).state_key();
+            let fence = executor::timeout(remaining,
+                self.outbox.legacy_leave_fence(&self.room_id, &key).lock_owned())
+                .await.map_err(|_| JoinError::TimedOut)?;
+            if *fence || self.outbox.legacy_pending(&self.room_id, &key)? {
+                return Err(JoinError::Refused {
+                    errcode: None,
+                    message: "legacy membership ownership is unsettled; reconcile membership before reusing this device state key".to_owned(),
+                });
+            }
+            Some((fence, key))
+        } else {
+            None
+        };
         let user_id = backend.own_user_id();
         let device_id = backend.own_device_id();
         let transport = match params
@@ -493,16 +531,6 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             other => other,
         };
 
-        // Check if already joined with this membership
-        if self
-            .own_membership_machine
-            .as_ref()
-            .is_some_and(|machine| machine.sticky_key() == membership_id)
-        {
-            log::warn!("[{}] already joined as {membership_id}", self.log_tag);
-            return Err(JoinError::AlreadyJoined(membership_id));
-        }
-
         log::info!(
             "[{}] joining as {membership_id} ({user_id}/{device_id}, transport {transport:?})",
             self.log_tag,
@@ -534,8 +562,17 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
 
         machine.set_outbox(self.outbox.clone());
 
+        // Record ownership before either of the non-idempotent server writes.
+        // An interrupted/ambiguous join may already have armed a delayed leave.
+        // Do not permit another join to reuse its legacy state key blindly.
+        if let Some((fence, state_key)) = legacy_join.as_mut() {
+            self.outbox.mark_legacy(&self.room_id, state_key)?;
+            **fence = true;
+        }
         // Use the machine to join (async, awaits both delayed leave scheduling and join event)
-        let membership_event_id = machine.join(transports, deadline).await?;
+        let membership_event_id = machine.join(transports, Some(deadline)).await?;
+        // Release the per-key lock; the unsettled record remains until leave.
+        drop(legacy_join);
 
         // Store the machine
         self.own_membership_machine = Some(Arc::new(machine));
@@ -588,6 +625,9 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         encryption_manager.set_config(encryption_config);
         // One clock per client: key timings and the membership's share it.
         encryption_manager.set_clock(self.outbox.clock());
+        if let Some(machine) = &self.own_membership_machine {
+            encryption_manager.set_membership_machine(machine.clone());
+        }
 
         // Start the encryption manager (creates first key)
         encryption_manager.join().await.map_err(|e| {
@@ -603,6 +643,17 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
 
         // Store the encryption manager
         self.encryption_manager = Some(encryption_manager);
+
+        // Start maintenance before potentially slow membership/key network work.
+        self.upkeep = self.own_membership_machine.clone().and_then(|machine| {
+            SessionUpkeep {
+                machine,
+                encryption: self.encryption_manager.clone(),
+                interval: keep_alive_interval,
+                log_tag: self.log_tag.clone(),
+            }
+            .spawn()
+        });
 
         // Re-evaluate the joined memberships: we now have an `own_participation`, so any
         // still-sticky participation of this device from a previous call stops
@@ -633,15 +684,6 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             );
         }
 
-        self.upkeep = self.own_membership_machine.clone().and_then(|machine| {
-            SessionUpkeep {
-                machine,
-                encryption: self.encryption_manager.clone(),
-                interval: keep_alive_interval,
-                log_tag: self.log_tag.clone(),
-            }
-            .spawn()
-        });
 
         log::info!(
             "[{}] joined as {membership_id} (media keys {})",
@@ -698,11 +740,26 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         &mut self,
         params: LeaveSessionParams,
     ) -> Result<PendingLeave<T>, LeaveError> {
-        // Check if we have a membership machine (i.e., we've joined)
-        let machine = self.own_membership_machine.take().ok_or_else(|| {
+        if self.own_membership_machine.is_none() {
             log::warn!("[{}] leave rejected: not joined", self.log_tag);
-            LeaveError::NotJoined
-        })?;
+            return Err(LeaveError::NotJoined);
+        }
+        // Transfer the fence to PendingLeave before clearing local ownership.
+        // The returned send never needs the room lock to release this fence.
+        let legacy_leave = if self.format.reads_state_membership() {
+            let own = self.own_participation.as_ref().ok_or_else(||
+                CommandError::from_message("legacy leave has no local participation identity"))?;
+            let key = crate::compat::RoomStateDialect::new(
+                own.user_id.clone(), own.device_id.clone(),
+                self.room_id.clone(), self.slot_id.clone(),
+            ).state_key();
+            let mut fence = self.outbox.legacy_leave_fence(&self.room_id, &key).lock_owned().await;
+            *fence = true;
+            Some((fence, self.outbox.clone(), self.room_id.clone(), key))
+        } else {
+            None
+        };
+        let machine = self.own_membership_machine.take().expect("checked under exclusive session access");
         log::info!(
             "[{}] leaving as {} (reason {:?})",
             self.log_tag,
@@ -733,6 +790,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             upkeep: self.upkeep.take(),
             leave_reason: params.leave_reason,
             log_tag: self.log_tag.clone(),
+            legacy_leave,
         })
     }
 
@@ -1774,6 +1832,18 @@ pub struct JoinedMembership {
     /// Transport types this member can subscribe to
     /// (`content.transports.can_subscribe`).
     pub can_subscribe: Vec<String>,
+}
+
+impl JoinedMembership {
+    /// Identity of the participation, independent of sticky refresh or focus.
+    pub fn same_participation(&self, other: &Self) -> bool {
+        self.member_id == other.member_id
+            && self.room_id == other.room_id
+            && self.slot_id == other.slot_id
+            && self.sender == other.sender
+            && self.origin.sender_device_id() == other.origin.sender_device_id()
+            && self.membership_ts == other.membership_ts
+    }
 }
 
 /// MSC4143: Left membership payload.

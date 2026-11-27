@@ -111,6 +111,15 @@ impl Msc4195KeyProviders {
         }
     }
 
+    /// Cached keys alone are not evidence of a live provider installation.
+    fn is_key_installed(&self, identity: &str, index: u8, key: &[u8]) -> bool {
+        let providers = self.0.lock().expect("key providers mutex poisoned");
+        let identity = ParticipantIdentity::from(identity.to_owned());
+        !providers.live.is_empty() && providers.live.iter().all(|(_, provider)| {
+            provider.get_key(&identity, i32::from(index)).as_deref() == Some(key)
+        })
+    }
+
     /// `false` when a live provider refused the key.
     fn set_key(&self, identity: &str, index: u8, key: Vec<u8>) -> bool {
         let mut providers = self.0.lock().expect("key providers mutex poisoned");
@@ -165,6 +174,10 @@ impl FrameKeyRing for LiveKitKeyRing {
 
     async fn set_key(&self, identity: &str, index: u8, key: Vec<u8>) -> bool {
         self.0.set_key(identity, index, key)
+    }
+
+    fn is_key_installed(&self, identity: &str, index: u8, key: &[u8]) -> bool {
+        self.0.is_key_installed(identity, index, key)
     }
 }
 
@@ -262,6 +275,29 @@ mod tests {
 
         drop(first);
         assert_eq!(providers.0.lock().unwrap().live.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn staged_keys_are_not_live_installation_proof() {
+        let providers = Msc4195KeyProviders::new();
+        let bridge = msc4195_media_key_bridge(providers.clone());
+        bridge.on_new_key_material(KeyMaterialSignal {
+            key: vec![7u8; 32], key_index: 4,
+            rtc_backend_identity: "peer".to_owned(), use_after_ms: 0,
+        }).await;
+        assert!(bridge.key_for("peer").is_some());
+        assert!(!bridge.is_key_installed("peer"));
+        let first = providers.connection_provider();
+        assert!(bridge.is_key_installed("peer"));
+        let second = providers.connection_provider();
+        assert!(bridge.is_key_installed("peer"));
+        let identity = ParticipantIdentity::from("peer".to_owned());
+        assert!(second.provider().set_key(&identity, 4, vec![8u8; 32]));
+        assert!(!bridge.is_key_installed("peer"));
+        drop(second);
+        assert!(bridge.is_key_installed("peer"));
+        drop(first);
+        assert!(!bridge.is_key_installed("peer"));
     }
 
     #[test]

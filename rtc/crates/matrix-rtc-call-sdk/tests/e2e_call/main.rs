@@ -48,6 +48,8 @@
 mod provision;
 mod resilience;
 mod simulcast;
+#[cfg(target_os = "linux")]
+mod worker_bridge;
 
 use std::env;
 use std::error::Error;
@@ -745,14 +747,19 @@ async fn run(
     // first participation held and must hand his new one a key it can decrypt the
     // next frame with, on a frame cryptor that starts empty.
     let (rejoin_tone_ok, rejoin_key_ok) = if scenario == Scenario::RejoinSameProcess {
+        let previous_index = alice.call.testing_active_outbound_index();
+        let previous_membership = bob.call.membership_id().to_owned();
         let Participant {
             call: first_call,
             _sync,
         } = bob;
         println!("[bob] leaving, then redialling in the same process");
         first_call.leave().await?;
+        // Legacy room-state reuses the member ID by design. Observe the actual
+        // departure before redial rather than treating an ID change as universal.
+        let leave_seen = wait_for_member_count(&alice.call, 1, "alice-before-redial").await;
 
-        let mut second = Participant {
+        let second = Participant {
             call: open_call(
                 &cfg,
                 &bob_room_again,
@@ -763,9 +770,12 @@ async fn run(
             .await?,
             _sync,
         };
-        if !wait_for_members(&second.call, 2, "bob-redial").await {
-            println!("[bob] WARNING: the second call never saw alice's membership");
-        }
+        let members_ok = wait_for_members(&second.call, 2, "bob-redial").await;
+        let fresh_membership = leave_seen && if compat == MembershipFormat::RoomState {
+            second.call.membership_id() == previous_membership
+        } else {
+            second.call.membership_id() != previous_membership
+        };
 
         // Wait for alice's key before recording, which the first call never had
         // to do. There, both peers exchanged keys while the call settled and
@@ -777,8 +787,19 @@ async fn run(
         //
         // The wait is the test being fair, not the test being lenient: a peer
         // that never gets a key fails it just the same, on the deadline.
-        let key_ok = wait_for_key(&second.call, alice.call.local_identity(), "bob-redial").await;
-        let tone_ok = record_and_verify_tone(&mut second.call, "redial").await?;
+        let imported = wait_for_key(&second.call, alice.call.local_identity(), "bob-redial").await;
+        // A cached first key is not proof of the rollout. Wait for the actual
+        // sender activation and exact receiver readback before sampling media.
+        let activated = tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                if previous_index.is_some() && alice.call.testing_active_outbound_index().is_some_and(|index| Some(index) != previous_index)
+                    && second.call.testing_has_active_key_from(&alice.call) { break; }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }).await.is_ok();
+        println!("[bob] fresh participation: {fresh_membership}; rotated sender key installed: {activated}");
+        let key_ok = members_ok && fresh_membership && imported && activated;
+        let tone_ok = if key_ok { record_peer_tone(&second.call, "redial-after-rotation", 440.0).await? } else { false };
         bob = second;
         (tone_ok, key_ok)
     } else {
@@ -1334,7 +1355,7 @@ async fn record_peer_tone(
         "[{label}] {freq} Hz energy ratio: {energy:.3} over {} samples",
         pcm.len()
     );
-    Ok(energy > 0.5)
+    Ok(pcm.len() >= target_samples && energy > 0.5)
 }
 
 /// Consume bob's SFU events until a remote audio track is subscribed, record a

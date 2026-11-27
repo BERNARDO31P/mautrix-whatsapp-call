@@ -5,3 +5,5 @@
 !session_files.py
 !provision-ghost.py
 !auto-provision-whatsapp-ghosts.py
+!ghost_namespace.py
+!portal_kind.py

@@ -12,6 +12,8 @@
 //! lives in `matrix-rtc-call`.
 
 mod rtc_requests;
+mod recipient_scope;
+pub use recipient_scope::{CallKeyRecipients, CallRecipientKeys};
 pub mod sdk;
 
-pub use sdk::{SdkMatrixBackend, TimelineIngest, timeline_ingest_from_raw};
+pub use sdk::{refresh_user_keys, FreshUserKeys, SdkMatrixBackend, TimelineIngest, timeline_ingest_from_raw};

@@ -224,6 +224,14 @@ pub fn to_core_state_memberships(
     room_id: &str,
     events: Vec<LegacyStateMemberEventIn>,
 ) -> Vec<RawStickyEvent> {
+    to_core_state_memberships_at(room_id, events, crate::own_membership::now_ms())
+}
+
+fn to_core_state_memberships_at(
+    room_id: &str,
+    events: Vec<LegacyStateMemberEventIn>,
+    now_ms: u64,
+) -> Vec<RawStickyEvent> {
     let parsed: Vec<room_state::StateMemberEvent> = events
         .into_iter()
         .filter_map(|event| {
@@ -248,7 +256,7 @@ pub fn to_core_state_memberships(
         })
         .collect();
 
-    let translated = room_state::translate_state_memberships(&parsed, room_state::now_ms());
+    let translated = room_state::translate_state_memberships(&parsed, now_ms);
     log::debug!(
         "[{room_id}] {} {} state event(s) translated to {} live membership(s)",
         parsed.len(),
@@ -309,6 +317,16 @@ pub fn merge_current_membership(
     member_events: Vec<RawMemberEventIn>,
     legacy_state_events: Vec<LegacyStateMemberEventIn>,
 ) -> Vec<RawStickyEvent> {
+    merge_current_membership_at(format, room_id, member_events, legacy_state_events, crate::own_membership::now_ms())
+}
+
+fn merge_current_membership_at(
+    format: MembershipFormat,
+    room_id: &str,
+    member_events: Vec<RawMemberEventIn>,
+    legacy_state_events: Vec<LegacyStateMemberEventIn>,
+    now_ms: u64,
+) -> Vec<RawStickyEvent> {
     let mut current: Vec<RawStickyEvent> = member_events
         .into_iter()
         .filter_map(|event| to_core_member_event(format, room_id, event))
@@ -321,7 +339,7 @@ pub fn merge_current_membership(
             .map(|event| event.content.sticky_key.clone())
             .collect();
         current.extend(
-            to_core_state_memberships(room_id, legacy_state_events)
+            to_core_state_memberships_at(room_id, legacy_state_events, now_ms)
                 .into_iter()
                 .filter(|event| !seen.contains(&event.content.sticky_key)),
         );
@@ -371,6 +389,46 @@ pub fn parse_legacy_key(
 /// [`to_core_member_event`] (strict in MSC, normalised in room-state), the
 /// pre-sticky membership state in [`MembershipFormat::RoomState`], and each
 /// format's own media key body.
+// Bound timer sleeps while an absolute wire deadline is live. The default
+// epoch estimate and the timer both advance by monotonic elapsed time.
+fn expiry_recheck_delay(deadline_ms: u64, epoch_now_ms: u64) -> std::time::Duration {
+    const MAX_RECHECK_MS: u64 = 30_000;
+    std::time::Duration::from_millis(deadline_ms.saturating_sub(epoch_now_ms).min(MAX_RECHECK_MS))
+}
+
+fn legacy_expiry_in_at(state: &[EventIn], now_ms: u64) -> Option<std::time::Duration> {
+    let events: Vec<_> = state.iter().filter_map(|event| Some(room_state::StateMemberEvent {
+        event_id: Some(event.event_id.clone()),
+        sender: event.sender.clone(),
+        state_key: event.state_key.clone()?,
+        origin_server_ts: event.origin_server_ts,
+        content: event.content.clone(),
+    })).collect();
+    room_state::next_expiry_ms(&events, now_ms).map(|at| expiry_recheck_delay(at, now_ms))
+}
+
+fn membership_snapshot_at(
+    format: MembershipFormat,
+    room_id: &str,
+    sticky: Vec<EventIn>,
+    state: Vec<EventIn>,
+    now_ms: u64,
+) -> (Vec<RawStickyEvent>, Option<std::time::Duration>) {
+    let expiry = if format.reads_state_membership() {
+        legacy_expiry_in_at(&state, now_ms)
+    } else {
+        None
+    };
+    let current = merge_current_membership_at(
+        format,
+        room_id,
+        sticky.into_iter().map(to_member_event_in).collect(),
+        state.into_iter().filter_map(to_legacy_state_member_event_in).collect(),
+        now_ms,
+    );
+    (current, expiry)
+}
+
 impl IngestDialect for MembershipFormat {
     fn membership_state_event_types(&self) -> Vec<String> {
         if self.reads_state_membership() {
@@ -402,11 +460,41 @@ impl IngestDialect for MembershipFormat {
         )
     }
 
+    fn membership_expiry_in(&self, state: &[EventIn]) -> Option<std::time::Duration> {
+        if !self.reads_state_membership() {
+            return None;
+        }
+        legacy_expiry_in_at(state, crate::own_membership::now_ms())
+    }
+
+    fn current_membership_with_expiry(
+        &self,
+        room_id: &str,
+        sticky: Vec<EventIn>,
+        state: Vec<EventIn>,
+    ) -> (Vec<RawStickyEvent>, Option<std::time::Duration>) {
+        membership_snapshot_at(*self, room_id, sticky, state, crate::own_membership::now_ms())
+    }
+
+    fn current_membership_with_expiry_at(
+        &self,
+        room_id: &str,
+        sticky: Vec<EventIn>,
+        state: Vec<EventIn>,
+        now_ms: u64,
+    ) -> (Vec<RawStickyEvent>, Option<std::time::Duration>) {
+        membership_snapshot_at(*self, room_id, sticky, state, now_ms)
+    }
+
     /// MSC rooms read MSC4143's key body and room-state rooms Element Call's,
     /// never the other: both travel under the same type (spec 038 R14, R35).
     fn parse_key(&self, message: &ToDeviceMessageIn) -> Option<ReceivedEncryptionKey> {
         if *self == MembershipFormat::Msc {
             return crate::feeder::parse_msc_key(message);
+        }
+        if !crate::feeder::key_message_fits_queue(message) {
+            log::warn!("Ignoring oversized legacy media key envelope");
+            return None;
         }
         let key = parse_legacy_key(
             *self,
@@ -420,7 +508,7 @@ impl IngestDialect for MembershipFormat {
             member_id: key.member_id,
             key_b64: key.key_b64,
             key_index: key.key_index,
-        })
+        }).filter(crate::encryption::inbound_key_fits_budget)
     }
 }
 
@@ -449,6 +537,66 @@ fn to_legacy_state_member_event_in(event: EventIn) -> Option<LegacyStateMemberEv
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expiry_recheck_is_bounded_and_handles_elapsed_deadlines() {
+        use std::time::Duration;
+        assert_eq!(expiry_recheck_delay(u64::MAX, 1), Duration::from_secs(30));
+        assert_eq!(expiry_recheck_delay(60_000, 59_999), Duration::from_millis(1));
+        assert_eq!(expiry_recheck_delay(60_000, 60_001), Duration::ZERO);
+    }
+
+    #[test]
+    fn membership_snapshot_uses_one_clock_at_expiry_boundary() {
+        let event = EventIn {
+            event_id: "$member".to_owned(),
+            sender: "@alice:example.org".to_owned(),
+            state_key: Some("_@alice:example.org_ALICEDEVICE_m.call".to_owned()),
+            origin_server_ts: 1_000,
+            event_type: STATE_MEMBER_EVENT_TYPE.to_owned(),
+            encryption: crate::EventEncryption::Cleartext,
+            content: serde_json::json!({
+                "application": "m.call",
+                "device_id": "ALICEDEVICE",
+                "expires": 1000_u64,
+            }),
+        };
+        let (members, delay) = membership_snapshot_at(
+            MembershipFormat::RoomState, "!room:example.org", vec![], vec![event.clone()], 1_999,
+        );
+        assert_eq!(members.len(), 1);
+        assert_eq!(delay, Some(std::time::Duration::from_millis(1)));
+        let (members, delay) = membership_snapshot_at(
+            MembershipFormat::RoomState, "!room:example.org", vec![], vec![event], 2_000,
+        );
+        assert!(members.is_empty());
+        assert_eq!(delay, None);
+    }
+
+    #[test]
+    fn default_legacy_conversion_and_expiry_share_the_process_epoch() {
+        let now = crate::own_membership::now_ms();
+        let room = "!room:example.org";
+        let event = EventIn {
+            event_id: "$member".to_owned(),
+            sender: "@alice:example.org".to_owned(),
+            state_key: Some("_@alice:example.org_ALICEDEVICE_m.call".to_owned()),
+            origin_server_ts: now.saturating_sub(60_000),
+            event_type: STATE_MEMBER_EVENT_TYPE.to_owned(),
+            encryption: crate::EventEncryption::Cleartext,
+            content: serde_json::json!({
+                "application": "m.call", "device_id": "ALICEDEVICE", "expires": 30_000_u64,
+            }),
+        };
+        let dialect = MembershipFormat::RoomState;
+        for _ in 0..2 {
+            assert!(dialect.current_membership(room, vec![], vec![event.clone()]).is_empty());
+            assert_eq!(dialect.membership_expiry_in(&[event.clone()]), None);
+            let (members, expiry) = dialect.current_membership_with_expiry(room, vec![], vec![event.clone()]);
+            assert!(members.is_empty());
+            assert_eq!(expiry, None);
+        }
+    }
 
     fn raw(content: serde_json::Value) -> RawMemberEventIn {
         RawMemberEventIn {
@@ -614,7 +762,7 @@ mod tests {
 
     #[test]
     fn translates_pre_sticky_room_state() {
-        let now = room_state::now_ms();
+        let now = crate::own_membership::now_ms();
         let events = vec![LegacyStateMemberEventIn {
             event_id: None,
             sender: "@alice:example.org".to_owned(),
@@ -671,7 +819,7 @@ mod tests {
     /// two key exchanges for one peer.
     #[test]
     fn a_sticky_membership_wins_over_the_state_one_with_the_same_key() {
-        let now = room_state::now_ms();
+        let now = crate::own_membership::now_ms();
         let sticky = raw(serde_json::json!({
             "slot_id": "m.call#room",
             "msc4354_sticky_key": "@alice:example.org:ALICEDEVICE",

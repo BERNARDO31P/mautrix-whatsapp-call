@@ -124,10 +124,10 @@ impl TransportConnection for FakeConnection {
         Some(Box::new(self.key.clone()))
     }
 
-    fn take_over(&self, handover: Box<dyn std::any::Any>) -> Result<(), TransportError> {
+    fn take_over(&self, handover: Box<dyn std::any::Any>) -> Result<Option<tokio::sync::oneshot::Receiver<Result<(), TransportError>>>, TransportError> {
         let key = handover.downcast::<String>().expect("a fake's handover");
         self.own.takeovers.lock().unwrap().push(*key);
-        Ok(())
+        Ok(None)
     }
 
     async fn close(&self) -> Result<(), TransportError> {

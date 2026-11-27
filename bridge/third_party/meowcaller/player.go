@@ -23,10 +23,12 @@ const (
 // io.EOF the player returns to PlayerIdle and fires OnFinish (queue the next source
 // there for gapless playback).
 type Player struct {
-	mu       sync.Mutex
-	src      AudioSource
-	state    PlayerState
-	onFinish func()
+	mu               sync.Mutex
+	src              AudioSource
+	state            PlayerState
+	onFinish         func()
+	sourceGeneration uint64
+	stateGeneration  uint64
 }
 
 // NewPlayer returns an idle Player.
@@ -40,6 +42,8 @@ func (p *Player) Play(src AudioSource) {
 	p.mu.Lock()
 	old := p.src
 	p.src = src
+	p.sourceGeneration++
+	p.stateGeneration++
 	p.state = PlayerPlaying
 	p.mu.Unlock()
 	if old != nil {
@@ -52,6 +56,7 @@ func (p *Player) Pause() {
 	p.mu.Lock()
 	if p.state == PlayerPlaying {
 		p.state = PlayerPaused
+		p.stateGeneration++
 	}
 	p.mu.Unlock()
 }
@@ -61,6 +66,7 @@ func (p *Player) Resume() {
 	p.mu.Lock()
 	if p.state == PlayerPaused {
 		p.state = PlayerPlaying
+		p.stateGeneration++
 	}
 	p.mu.Unlock()
 }
@@ -70,6 +76,8 @@ func (p *Player) Stop() {
 	p.mu.Lock()
 	old := p.src
 	p.src = nil
+	p.sourceGeneration++
+	p.stateGeneration++
 	p.state = PlayerIdle
 	p.mu.Unlock()
 	if old != nil {
@@ -102,27 +110,37 @@ func (p *Player) nextFrame() []float32 {
 		return nil
 	}
 	src := p.src
+	sourceGeneration, stateGeneration := p.sourceGeneration, p.stateGeneration
 	p.mu.Unlock()
 
 	frame, err := src.ReadFrame()
-	if err == nil {
-		return frame
-	}
-	// Source exhausted (or errored): go idle, close it, and fire OnFinish once.
 	p.mu.Lock()
-	var finish func()
-	if p.src == src { // still the active source (not replaced concurrently)
-		p.src = nil
-		p.state = PlayerIdle
-		finish = p.onFinish
+	if p.sourceGeneration != sourceGeneration {
+		// Play or Stop already released ownership of this source. Neither its
+		// late frame nor its EOF belongs to the new playback generation.
+		p.mu.Unlock()
+		return nil
 	}
+	admitFrame := p.state == PlayerPlaying && p.stateGeneration == stateGeneration
+	if err == nil {
+		p.mu.Unlock()
+		if admitFrame {
+			return frame
+		}
+		return nil
+	}
+	// Only the owner closes an exhausted source and invokes OnFinish.
+	p.src = nil
+	p.sourceGeneration++
+	p.stateGeneration++
+	p.state = PlayerIdle
+	finish := p.onFinish
 	p.mu.Unlock()
 	_ = src.Close()
 	if finish != nil {
 		finish()
 	}
-	if err != io.EOF {
-		// A decode error still ends playback; the frame (if any) is dropped.
+	if err != io.EOF || !admitFrame {
 		return nil
 	}
 	return frame // may be a final padded frame or nil

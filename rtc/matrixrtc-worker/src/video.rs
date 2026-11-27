@@ -119,6 +119,8 @@ mod rtc {
         let status = tokio::time::timeout(
             Duration::from_secs(8),
             Command::new(ffmpeg_binary())
+                // The setup deadline can cancel this probe before its own timeout.
+                .kill_on_drop(true)
                 .args([
                     "-v", "error",
                     "-f", "lavfi",
@@ -299,6 +301,7 @@ mod rtc {
             writer: Writer,
             call_id: String,
             active: Arc<AtomicBool>,
+            source_generation: u64,
         ) -> io::Result<Self> {
             if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "Matrix video dimensions must be non-zero and even"));
@@ -348,6 +351,7 @@ mod rtc {
                         });
                         if active.load(Ordering::Acquire) {
                             let mut message = Message::new("matrix_video", &call_id);
+                        message.generation = source_generation;
                             message.duration_us = frame_meta.duration_us;
                             message.orientation = frame_meta.orientation;
                             message.data = access_unit;
@@ -362,6 +366,7 @@ mod rtc {
                     });
                     if active.load(Ordering::Acquire) {
                         let mut message = Message::new("matrix_video", &call_id);
+                        message.generation = source_generation;
                         message.duration_us = frame_meta.duration_us;
                         message.orientation = frame_meta.orientation;
                         message.data = access_unit;
@@ -413,6 +418,7 @@ mod rtc {
         call_id: String,
         active: Arc<AtomicBool>,
         keyframe_generation: Arc<AtomicU64>,
+        source_generation: u64,
     ) -> io::Result<()> {
         let mut encoder: Option<EncoderProcess> = None;
         let mut seen_keyframe_generation = keyframe_generation.load(Ordering::Acquire);
@@ -442,6 +448,7 @@ mod rtc {
                     writer.clone(),
                     call_id.clone(),
                     active.clone(),
+                    source_generation,
                 ) {
                     Ok(created) => encoder = Some(created),
                     Err(error) => return Err(error),
@@ -532,7 +539,7 @@ mod rtc {
             let (_,writer)=tokio::io::split(worker);
             let writer=Writer::new(writer);
             for size in [16u32,32,32] {
-                let mut process=EncoderProcess::spawn(size,size,writer.clone(),"test".into(),Arc::new(AtomicBool::new(true))).unwrap();
+                let mut process=EncoderProcess::spawn(size,size,writer.clone(),"test".into(),Arc::new(AtomicBool::new(true)),1).unwrap();
                 let n=(size*size) as usize;
                 let frame=VideoFrame{buffer:I420Buffer{width:size,height:size,data_y:vec![16;n],data_u:vec![128;n/4],data_v:vec![128;n/4],stride_y:size,stride_u:size/2,stride_v:size/2},rotation:VideoRotation::Deg0,timestamp_us:100000};
                 process.write_frame(&frame,33_333).await.unwrap();

@@ -5,7 +5,7 @@ Uses an appservice token only to request a scoped device token. Requires the
 existing mautrix-whatsapp application-service namespace and a registered ghost.
 Tokens never appear in command-line arguments or console output.
 """
-from session_files import identity_lock, ensure_session, mark_ready
+from session_files import identity_lock, ensure_session, prepare_ready
 import argparse
 import hashlib
 import json
@@ -59,12 +59,12 @@ os.umask(0o077)
 with identity_lock(state):
     session = ensure_session(state, args.ghost_mxid, login)
     if args.compose_overlay:
-        overlay = args.compose_overlay.resolve()
-        subprocess.run([
-            "docker", "compose", "-f", str(overlay.parents[1] / "docker-compose.yml"),
-            "-f", str(overlay), "run", "--rm", "--no-deps",
-            "-e", "RTC_GHOST_MXID=" + args.ghost_mxid, "-e", "RTC_ALLOW_INSECURE_HOMESERVER=1",
-            "matrixrtc-worker", "/usr/local/bin/matrixrtc-ghost-provision"
-        ], check=True)
-        mark_ready(state, args.ghost_mxid)
+        with prepare_ready(state, args.ghost_mxid):
+            overlay = args.compose_overlay.resolve()
+            subprocess.run([
+                "docker", "compose", "-f", str(overlay.parents[1] / "docker-compose.yml"),
+                "-f", str(overlay), "run", "--rm", "--no-deps",
+                "-e", "RTC_GHOST_MXID=" + args.ghost_mxid, "-e", "RTC_ALLOW_INSECURE_HOMESERVER=1",
+                "matrixrtc-worker", "/usr/local/bin/matrixrtc-ghost-provision"
+            ], check=True)
 print("Stored MatrixRTC device", session["device_id"], "under", state)

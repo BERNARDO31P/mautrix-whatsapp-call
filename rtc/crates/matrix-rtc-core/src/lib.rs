@@ -85,7 +85,7 @@ pub use wire::wire_event_type;
 #[cfg(feature = "testing")]
 pub mod testing {
     pub use crate::host::backend::{
-        MockBackend, MockCall, MockMethod, MockOutcome, MockRoomSubscription,
+        MockBackend, MockCall, MockDelayState, MockMethod, MockOutcome, MockRoomSubscription,
         MockToDeviceSubscription,
     };
 }
@@ -537,6 +537,44 @@ mod tests {
                 last >= Duration::from_millis(23_500) && last < Duration::from_secs(24),
                 "the deferred rotation went out at {last:?}, not at 23.5 s"
             );
+        }
+
+        /// A slow deferred rotation must not stall delayed-leave renewal, and
+        /// a leave while it is pending must end that join's retry admission.
+        #[tokio::test(start_paused = true)]
+        async fn a_slow_deferred_rotation_does_not_block_upkeep_or_survive_leave() {
+            let mock = alice_backend();
+            let (mut room, _outbox) = encrypted_room(&mock).await;
+            join_as(&mut room, "alice-a").await;
+            let bob = || peer("@bob:example.org", "BOBDEV", "bob-a");
+            let carol = || peer("@carol:example.org", "CAROLDEV", "carol-a");
+            room.set_current_sticky_state(vec![
+                bob(), carol(), peer("@dave:example.org", "DAVEDEV", "dave-a"),
+            ]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(13_500)).await;
+            room.set_current_sticky_state(vec![bob(), carol()]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            room.set_current_sticky_state(vec![bob()]).await.unwrap();
+
+            // The same deferred rotation as the deadline test above, but the
+            // backend takes 20 seconds instead of returning immediately.
+            mock.script(MockMethod::ToDevice, [MockOutcome::After(
+                Duration::from_secs(20), Box::new(MockOutcome::Ok),
+            )]);
+            tokio::time::sleep(Duration::from_secs(17)).await;
+            let sends = mock.calls_to(MockMethod::ToDevice);
+            assert!(sends.last().is_some_and(|at| *at >= Duration::from_millis(23_500)));
+            assert_eq!(indices_to(&mock, "@bob:example.org", "BOBDEV"), [0, 1]);
+            assert!(mock.calls_to(MockMethod::RestartDelayedEvent).iter().any(|at| {
+                *at >= Duration::from_secs(30) && *at <= Duration::from_secs(32)
+            }), "keep-alive must proceed while rotation is pending");
+
+            leave_call(&mut room).await;
+            let before = mock.calls_to(MockMethod::ToDevice).len();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            assert_eq!(mock.calls_to(MockMethod::ToDevice).len(), before);
+            assert!(room.own_member_id("m.call#room").is_none());
+            assert!(room_undelivered(&room).is_empty());
         }
 
         fn room_undelivered(room: &BaseRtcRoom<MockBackend>) -> Vec<String> {
@@ -2115,26 +2153,45 @@ mod tests {
     const TICK: std::time::Duration =
         std::time::Duration::from_millis(DEFAULT_KEEP_ALIVE_INTERVAL_MS);
 
+    // The first restart is immediate: the delayed leave was armed before
+    // publishing the join. Wait for the spawned upkeep without advancing the
+    // paused clock, then distinguish this renewal from periodic restarts.
+    pub(crate) async fn await_initial_restart(sender: &crate::host::backend::MockBackend) {
+        for _ in 0..32 {
+            if restarts(sender) != 0 { break; }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(restarts(sender), 1, "initial delayed leave renewal");
+        assert_eq!(restart_attempts(sender), 1);
+        assert_eq!(sender.delayed_events.lock().unwrap().len(), 1,
+            "renew the original delay, do not create another one");
+    }
+
+    pub(crate) fn restart_attempts(sender: &crate::host::backend::MockBackend) -> usize {
+        sender.calls_to(crate::host::backend::MockMethod::RestartDelayedEvent).len()
+    }
+
+    fn assert_restarts(sender: &crate::host::backend::MockBackend, expected: usize) {
+        assert_eq!(restarts(sender), expected, "successful delayed leave restarts");
+        assert_eq!(restart_attempts(sender), expected, "no hidden failed restart attempts");
+    }
+
     /// The core keeps a join alive by itself: nobody ticks it.
     #[tokio::test(start_paused = true)]
     async fn a_joined_slot_keeps_itself_alive_until_it_leaves() {
         let sender = alice_backend();
         let mut room = encrypted_call_room(sender.clone()).await;
         join_as(&mut room, "alice-a").await;
-        assert_eq!(
-            restarts(&sender),
-            0,
-            "the join itself armed the delayed leave"
-        );
+        await_initial_restart(&sender).await;
 
         tokio::time::sleep(TICK * 3 + std::time::Duration::from_millis(1)).await;
-        assert_eq!(restarts(&sender), 3, "one restart per interval");
+        assert_restarts(&sender, 4); // initial renewal plus three intervals
 
         room.leave("m.call#room", LeaveSessionParams::new())
             .await
             .expect("leave");
         tokio::time::sleep(TICK * 3).await;
-        assert_eq!(restarts(&sender), 3, "nothing restarted after the leave");
+        assert_restarts(&sender, 4);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2142,10 +2199,11 @@ mod tests {
         let sender = alice_backend();
         let mut room = encrypted_call_room(sender.clone()).await;
         join_as(&mut room, "alice-a").await;
+        await_initial_restart(&sender).await;
 
         drop(room);
         tokio::time::sleep(TICK * 3).await;
-        assert_eq!(restarts(&sender), 0);
+        assert_restarts(&sender, 1);
     }
 
     /// What lets an owner that drops a join without leaving stop its upkeep.
@@ -2154,12 +2212,13 @@ mod tests {
         let sender = alice_backend();
         let mut room = encrypted_call_room(sender.clone()).await;
         join_as(&mut room, "alice-a").await;
+        await_initial_restart(&sender).await;
 
         room.upkeep_abort_handle("m.call#room")
             .expect("an upkeep runs")
             .abort();
         tokio::time::sleep(TICK * 3).await;
-        assert_eq!(restarts(&sender), 0);
+        assert_restarts(&sender, 1);
         assert!(sender.cancelled_events.lock().unwrap().is_empty());
         assert!(room.own_member_id("m.call#room").is_some(), "still joined");
     }
@@ -2172,6 +2231,7 @@ mod tests {
         let sender = alice_backend();
         let mut room = encrypted_call_room(sender.clone()).await;
         join_as(&mut room, "alice-a").await;
+        await_initial_restart(&sender).await;
         let mut auto_leaves = room
             .subscribe_auto_leaves("m.call#room")
             .expect("joined session");
@@ -2188,7 +2248,7 @@ mod tests {
         assert_eq!(leave["leave_reason"]["code"], "slot_closed", "{leave}");
         assert_eq!(sender.cancelled_events.lock().unwrap().len(), 1);
         tokio::time::sleep(TICK * 3).await;
-        assert_eq!(restarts(&sender), 0, "nothing kept alive after the leave");
+        assert_restarts(&sender, 1);
     }
 
     /// Spec 038 R37: a join made in the clear leaves the moment the room's
@@ -2224,6 +2284,7 @@ mod tests {
         let sender = alice_backend();
         let mut room = encrypted_call_room(sender.clone()).await;
         join_as(&mut room, "alice-a").await;
+        await_initial_restart(&sender).await;
         let mut auto_leaves = room
             .subscribe_auto_leaves("m.call#room")
             .expect("joined session");
@@ -2244,7 +2305,7 @@ mod tests {
             "the delayed leave is left to fire"
         );
         tokio::time::sleep(TICK * 3).await;
-        assert_eq!(restarts(&sender), 0, "nothing kept alive after the leave");
+        assert_restarts(&sender, 1);
     }
 
     /// A host leave that fails to send is reported, but still ends our join:
@@ -2254,6 +2315,7 @@ mod tests {
         let sender = alice_backend();
         let mut room = encrypted_call_room(sender.clone()).await;
         join_as(&mut room, "alice-a").await;
+        await_initial_restart(&sender).await;
         *sender.sticky_event_error.lock().unwrap() = Some("offline".to_owned());
 
         let result = room.leave("m.call#room", LeaveSessionParams::new()).await;
@@ -2262,7 +2324,7 @@ mod tests {
         assert_eq!(room.own_member_id("m.call#room"), None);
         assert!(sender.cancelled_events.lock().unwrap().is_empty());
         tokio::time::sleep(TICK * 3).await;
-        assert_eq!(restarts(&sender), 0, "nothing kept alive after the leave");
+        assert_restarts(&sender, 1);
     }
 
     /// Only the leaves the session makes on its own are announced; a host that

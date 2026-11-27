@@ -27,7 +27,7 @@ thiserror.workspace = true
 async-trait.workspace = true
 log.workspace = true
 # `media` uses tokio timers (interval / timeout_at) on top of the workspace rt+sync.
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "macros"] }
 # The token POST. Version and TLS backend are the workspace's.
 reqwest.workspace = true
 # The LiveKit client; see the workspace manifest for its version and features

@@ -149,3 +149,16 @@ func normalizeCallLinkToken(raw string) (string, error) {
 	}
 	return parts[1], nil
 }
+
+// IsCallLinkAdmitted is true only for the exact current call after the
+// authoritative roster confirms this connected device. It does not require
+// another participant to have sent audio and is distinct from OnReady.
+func (c *Call) IsCallLinkAdmitted() bool {
+	if c == nil || c.eng == nil {
+		return false
+	}
+	c.eng.mu.Lock()
+	defer c.eng.mu.Unlock()
+	m := c.eng.calls[c.id]
+	return m != nil && m.call == c && m.linkCall && m.linkAdmitted && c.State() != CallPhaseEnded
+}

@@ -326,7 +326,8 @@ impl MediaSession {
     /// Cumulative receive-side RTP counters for a participant's stream.
     ///
     /// `null` while that stream is not subscribed, or before the first RTCP
-    /// report has arrived. This is the only way to tell "no RTP arriving" from
+    /// report has arrived, or if the sample times out after five seconds or
+    /// the track is replaced before collection completes. This is the only way to tell "no RTP arriving" from
     /// "RTP arriving that does not decode": the receive path fabricates frames
     /// at a fixed cadence either way. See [`FfiReceiveStats`] for how to read
     /// the counters — they are totals, so sample twice and compare.

@@ -175,6 +175,31 @@ async fn pre_sticky_state_membership_is_funnelled() {
     }
 }
 
+#[tokio::test]
+async fn legacy_member_expires_without_another_snapshot() {
+    let harness = Harness::attach(MembershipFormat::RoomState).await;
+    let sink = harness.sink();
+    sink.on_encryption(false);
+    sink.on_joined_members(vec![ME.to_owned(), BOB.to_owned()]);
+    let now = crate::compat::room_state::now_ms();
+    sink.on_state_events(STATE_MEMBER_EVENT_TYPE.to_owned(), vec![EventIn {
+        event_id: "$expiry".to_owned(),
+        sender: BOB.to_owned(),
+        event_type: STATE_MEMBER_EVENT_TYPE.to_owned(),
+        state_key: Some(BOB.to_owned()),
+        origin_server_ts: now,
+        content: json!({
+            "application": "m.call", "call_id": "ROOM", "scope": "m.room",
+            "device_id": "BOBDEVICE", "created_ts": now, "expires": 750,
+        }),
+        encryption: EventEncryption::Cleartext,
+    }]);
+    tokio::time::timeout(Duration::from_secs(2), harness.attachment.seeded())
+        .await.expect("legacy membership seeded");
+    assert_eq!(harness.member_count().await, Some(1));
+    harness.wait_until(|| async { harness.member_count().await.unwrap_or(0) == 0 }).await;
+}
+
 /// Spec 038 R5: Element Call's 2025 sticky shape is not a member in MSC. Fed
 /// beside a spec-shaped member, only the latter is joined.
 #[tokio::test]

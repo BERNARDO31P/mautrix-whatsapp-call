@@ -6,6 +6,8 @@ RUN apt-get update \
 
 COPY mautrix-whatsapp-call-worker /usr/local/bin/mautrix-whatsapp-call-worker
 COPY mautrix-whatsapp-call-provision /usr/local/bin/mautrix-whatsapp-call-provision
+COPY portal_kind.py /usr/local/lib/mautrix-whatsapp-call/portal_kind.py
+COPY ghost_namespace.py /usr/local/lib/mautrix-whatsapp-call/ghost_namespace.py
 COPY session_files.py /usr/local/lib/mautrix-whatsapp-call/session_files.py
 COPY provision-ghost.py /usr/local/lib/mautrix-whatsapp-call/provision-ghost.py
 COPY auto-provision-whatsapp-ghosts.py /usr/local/lib/mautrix-whatsapp-call/auto-provision-whatsapp-ghosts.py

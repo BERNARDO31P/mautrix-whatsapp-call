@@ -81,6 +81,7 @@ pub struct Call {
 /// homeserver echoes it.
 pub async fn start(peers: &[Peer], own_sfu_down: bool, sfu_fallback: bool) -> Call {
     let mock = Arc::new(MockBackend::new());
+    mock.enable_delayed_model();
     *mock.transports.lock().unwrap() = Ok(json!([{ "type": "m.livekit", "url": SFU_A }]));
     // Every deadline of the join is read from this clock: paused time moves it.
     let origin = tokio::time::Instant::now();

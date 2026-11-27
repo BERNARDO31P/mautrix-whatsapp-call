@@ -1,14 +1,19 @@
 //! WhatsApp <-> MatrixRTC sidecar. Calls remain explicitly opt-in at runtime.
 mod audio;
 mod protocol;
+mod participant_epoch;
 mod replay;
 mod video;
+mod file_lock;
+use file_lock::{lock_file as lock_worker_file, same_inode};
 #[cfg(feature = "rtc")]
 mod rtc;
+#[cfg(feature = "rtc")]
+mod legacy_leave;
 
 use protocol::Message;
 use replay::ReplayGuard;
-use std::{io, os::unix::fs::FileTypeExt, path::{Path, PathBuf}, sync::Arc};
+use std::{io, os::unix::fs::{FileTypeExt}, path::{Path, PathBuf}, sync::Arc};
 use tokio::{io::{AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf}, net::{UnixListener, UnixStream}, sync::{mpsc, oneshot}};
 
 // A media producer may be aborted during mute/unpublish or call teardown.
@@ -16,24 +21,40 @@ use tokio::{io::{AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf}, net::{UnixList
 // bounded writer task completes the frame independently of its producer.
 #[derive(Clone)]
 struct Writer {
-    queue: mpsc::Sender<(Message, oneshot::Sender<io::Result<()>>)>,
+    queue: mpsc::Sender<WriteRequest>,
+}
+
+type WriteRequest = (Vec<u8>, oneshot::Sender<io::Result<()>>, tokio::time::Instant);
+const WIRE_SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn write_timeout() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "RTC send deadline exceeded")
 }
 
 impl Writer {
     fn new<W: AsyncWrite + Unpin + Send + 'static>(mut sink: W) -> Self {
-        let (queue, mut receiver) = mpsc::channel::<(Message, oneshot::Sender<io::Result<()>>)>(8);
+        let (queue, mut receiver) = mpsc::channel::<WriteRequest>(8);
         tokio::spawn(async move {
-            while let Some((message, reply)) = receiver.recv().await {
+            while let Some((bytes, reply, deadline)) = receiver.recv().await {
                 // No bytes have been written for this request yet.
                 if reply.is_closed() { continue; }
-                let result = protocol::write(&mut sink, &message).await;
+                if tokio::time::Instant::now() >= deadline {
+                    let _ = reply.send(Err(write_timeout()));
+                    continue;
+                }
+                // The same deadline bounds admission, queue residence and
+                // the complete socket write. Never restart it at dequeue.
+                let result = tokio::time::timeout_at(deadline, protocol::write_encoded(&mut sink, &bytes))
+                    .await.unwrap_or_else(|_| Err(write_timeout()));
                 let failed = result.is_err();
                 let _ = reply.send(result);
                 // A failed write may already have put a length or partial
                 // body on the wire. No subsequent frame may use this stream.
                 if failed { break; }
             }
-            let _ = sink.shutdown().await;
+            // Release queued producers immediately, not after shutdown.
+            drop(receiver);
+            let _ = tokio::time::timeout(WIRE_SEND_BUDGET, sink.shutdown()).await;
         });
         Self { queue }
     }
@@ -145,11 +166,7 @@ async fn main() -> io::Result<()> {
     if !PathBuf::from(&socket).is_absolute() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "socket path must be absolute"));
     }
-    let replay = Arc::new(ReplayGuard::open(&state_dir.join("seen-calls"))?);
-    #[cfg(feature = "rtc")]
-    let accounts = Arc::new(rtc::Accounts::new(state_dir.join("identities")));
     let socket_path = PathBuf::from(&socket);
-    let listener = bind_worker_socket(&socket_path).await?;
     use std::os::unix::fs::PermissionsExt;
     let socket_mode = match std::env::var("RTC_WORKER_SOCKET_MODE").as_deref() {
         Err(_) | Ok("0600") | Ok("600") => 0o600,
@@ -161,8 +178,19 @@ async fn main() -> io::Result<()> {
             ));
         }
     };
+    // Keep both locks alive until after socket cleanup. A second daemon using
+    // either the same state or the same socket must fail before mutating it.
+    std::fs::create_dir_all(&state_dir)?;
+    let _state_owner = lock_worker_file(&state_dir.join("worker-owner.lock"))?;
+    let mut socket_lock_path = socket_path.as_os_str().to_os_string();
+    socket_lock_path.push(".lock");
+    let _socket_owner = lock_worker_file(Path::new(&socket_lock_path))?;
+    let replay = Arc::new(ReplayGuard::open(&state_dir.join("seen-calls"))?);
+    #[cfg(feature = "rtc")]
+    let accounts = Arc::new(rtc::Accounts::new(state_dir.join("identities")));
+    let listener = bind_worker_socket(&socket_path).await?;
+    let _cleanup = SocketCleanup::new(socket_path.clone())?;
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(socket_mode))?;
-    let _cleanup = SocketCleanup(socket_path.clone());
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     eprintln!("MatrixRTC sidecar listening on {socket} (mode {socket_mode:04o})");
     let (shutdown, _) = tokio::sync::watch::channel(false);
@@ -177,17 +205,17 @@ async fn main() -> io::Result<()> {
             }
         })
     };
-    loop {
+    let serve_result = loop {
         tokio::select! {
             Some(_) = jobs.join_next(), if !jobs.is_empty() => {}
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                let (stream, _) = match accepted { Ok(value) => value, Err(err) => break Err(err) };
                 let replay = replay.clone();
                 #[cfg(feature = "rtc")]
                 let accounts = accounts.clone();
-                let raw=stream.into_std()?;
-                let closer=raw.try_clone()?;
-                let stream=UnixStream::from_std(raw)?;
+                let raw=match stream.into_std() { Ok(value) => value, Err(err) => break Err(err) };
+                let closer=match raw.try_clone() { Ok(value) => value, Err(err) => break Err(err) };
+                let stream=match UnixStream::from_std(raw) { Ok(value) => value, Err(err) => break Err(err) };
                 let mut stopping=shutdown.subscribe();
                 jobs.spawn(async move {
                     let session=serve(stream,replay,#[cfg(feature="rtc")] accounts);
@@ -201,24 +229,43 @@ async fn main() -> io::Result<()> {
                     }
                 });
             }
-            _ = tokio::signal::ctrl_c() => break,
-            _ = terminate.recv() => break,
+            result = tokio::signal::ctrl_c() => break result,
+            _ = terminate.recv() => break Ok(()),
         }
-    }
+    };
     drop(listener);
     let _ = shutdown.send(true);
     #[cfg(feature = "rtc")]
-    recovery.abort();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(45),async {
+    {
+        recovery.abort();
+        let _ = recovery.await;
+    }
+    if tokio::time::timeout(std::time::Duration::from_secs(45),async {
         while jobs.join_next().await.is_some() {}
-    }).await;
-    Ok(())
+    }).await.is_err() {
+        jobs.abort_all();
+        while jobs.join_next().await.is_some() {}
+    }
+    serve_result
 }
 
-struct SocketCleanup(PathBuf);
+struct SocketCleanup { path: PathBuf, metadata: std::fs::Metadata }
+impl SocketCleanup {
+    fn new(path: PathBuf) -> io::Result<Self> {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_socket() {
+            return Err(io::Error::other("bound worker socket path changed"));
+        }
+        Ok(Self { path, metadata })
+    }
+}
 impl Drop for SocketCleanup {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        if let Ok(current) = std::fs::symlink_metadata(&self.path) {
+            if current.file_type().is_socket() && same_inode(&self.metadata, &current) {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
     }
 }
 
@@ -240,7 +287,12 @@ async fn bind_worker_socket(path: &Path) -> io::Result<UnixListener> {
                     ));
                 }
                 Ok(Err(err)) if matches!(err.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound) => {
-                    std::fs::remove_file(path)?;
+                    match std::fs::symlink_metadata(path) {
+                        Ok(current) if current.file_type().is_socket() && same_inode(&metadata, &current) => std::fs::remove_file(path)?,
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {},
+                        Ok(_) => return Err(io::Error::other("worker socket path changed during probe")),
+                        Err(err) => return Err(err),
+                    }
                 }
                 Ok(Err(err)) => return Err(err),
                 Err(_) => {
@@ -258,10 +310,20 @@ async fn bind_worker_socket(path: &Path) -> io::Result<UnixListener> {
 }
 
 async fn send(writer: &Writer, msg: &Message) -> io::Result<()> {
-    let (reply, completion) = oneshot::channel();
-    writer.queue.send((msg.clone(), reply)).await
+    // Reserve bounded queue capacity before allocating the encoded frame.
+    // Dropping the permit on local validation failure leaves the socket intact.
+    let deadline = tokio::time::Instant::now() + WIRE_SEND_BUDGET;
+    let permit = tokio::time::timeout_at(deadline, writer.queue.reserve()).await
+        .map_err(|_| write_timeout())?
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "RTC writer stopped"))?;
-    completion.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "RTC writer stopped"))?
+    if tokio::time::Instant::now() >= deadline { return Err(write_timeout()); }
+    let bytes = protocol::encode_frame(msg)?;
+    if tokio::time::Instant::now() >= deadline { return Err(write_timeout()); }
+    let (reply, completion) = oneshot::channel();
+    permit.send((bytes, reply, deadline));
+    // Prefer an already delivered outcome to a simultaneous timer expiry.
+    // The writer retains the exact deadline even if this producer is dropped.
+    tokio::time::timeout_at(deadline, completion).await.map_err(|_| write_timeout())?.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "RTC writer stopped"))?
 }
 
 async fn serve(stream: UnixStream, replay: Arc<ReplayGuard>, #[cfg(feature = "rtc")] accounts: Arc<rtc::Accounts>) -> io::Result<()> {
@@ -274,7 +336,7 @@ async fn serve(stream: UnixStream, replay: Arc<ReplayGuard>, #[cfg(feature = "rt
         || !incoming.room_id.starts_with('!') || !incoming.ghost_mxid.starts_with('@')
         || !incoming.expected_user_mxid.starts_with('@') || incoming.expected_user_mxid == incoming.ghost_mxid
         || incoming.slot_id.is_empty() || !matches!(incoming.membership_format.as_str(), "msc" | "room_state")
-        || (incoming.kind=="outgoing" && incoming.expected_device.is_empty()) || incoming.peer.is_empty() || !incoming.data.is_empty()
+        || (incoming.kind=="outgoing" && (incoming.expected_device.is_empty() || !protocol::valid_device_key(&incoming.expected_signing_key) || !protocol::valid_device_key(&incoming.expected_identity_key))) || incoming.peer.is_empty() || !incoming.data.is_empty()
         || (incoming.group && (!incoming.group_jid.ends_with("@g.us") || incoming.group_jid.len() < 6 || incoming.peer!=incoming.group_jid))
         || (!incoming.group && !incoming.group_jid.is_empty()) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid first message: incoming/outgoing call with room, slot, membership format, RTC identity, expected human and valid direct/group target required"));
@@ -282,7 +344,7 @@ async fn serve(stream: UnixStream, replay: Arc<ReplayGuard>, #[cfg(feature = "rt
     #[cfg(feature = "rtc")]
     {
         if std::env::var("RTC_WORKER_ENABLE_CALLS").as_deref() != Ok("1") {
-            let mut reject = Message::new("reject", &incoming.call_id);
+            let mut reject = Message::new("error", &incoming.call_id);
             reject.reason = "RTC calls disabled by configuration".to_owned();
             return send(&writer, &reject).await;
         }
@@ -291,7 +353,7 @@ async fn serve(stream: UnixStream, replay: Arc<ReplayGuard>, #[cfg(feature = "rt
     #[cfg(not(feature = "rtc"))]
     {
         let _ = replay;
-        let mut reject = Message::new("reject", &incoming.call_id);
+        let mut reject = Message::new("error", &incoming.call_id);
         reject.reason = "worker was built without encrypted MatrixRTC media support".to_owned();
         send(&writer, &reject).await
     }
@@ -300,6 +362,35 @@ async fn serve(stream: UnixStream, replay: Arc<ReplayGuard>, #[cfg(feature = "rt
 #[cfg(all(test, not(feature = "rtc")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_lock_is_exclusive_and_persistent() {
+        let dir = std::env::temp_dir().join(format!("matrixrtc-worker-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("owner.lock");
+        let owner = lock_worker_file(&path).unwrap();
+        assert!(lock_worker_file(&path).is_err());
+        drop(owner);
+        assert!(path.is_file());
+        let owner = lock_worker_file(&path).unwrap();
+        drop(owner);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn socket_cleanup_preserves_replacement_file() {
+        let dir = std::env::temp_dir().join(format!("matrixrtc-worker-cleanup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("worker.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let cleanup = SocketCleanup::new(path.clone()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        drop(cleanup);
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        drop(listener);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn recovers_stale_socket_but_never_replaces_live_listener() {
@@ -343,7 +434,7 @@ mod tests {
             let job = tokio::spawn(async move { serve(worker, guard).await });
             protocol::write(&mut peer, &call).await.unwrap();
             let response = protocol::read(&mut peer).await.unwrap();
-            assert_eq!(response.kind, "reject");
+            assert_eq!(response.kind, "error");
             assert_eq!(response.call_id, call.call_id);
             assert_eq!(response.reason, expected);
             drop(peer);
@@ -380,6 +471,58 @@ mod writer_tests {
         assert_eq!(serde_json::from_slice::<Message>(&body).unwrap(), first);
         assert_eq!(protocol::read(&mut peer).await.unwrap(), second);
         next.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_rejection_does_not_close_writer_or_emit_bytes() {
+        let (sink, mut peer) = tokio::io::duplex(8192);
+        let writer = Writer::new(sink);
+        let mut invalid = Message::new("error", "call");
+        invalid.reason = "x".repeat(4097);
+        assert_eq!(send(&writer, &invalid).await.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let mut oversized = Message::new("matrix_video", "call");
+        oversized.data = vec![0; protocol::MAX_PAYLOAD];
+        oversized.data[2] = 1;
+        assert_eq!(send(&writer, &oversized).await.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let valid = Message::new("hangup", "call");
+        send(&writer, &valid).await.unwrap();
+        assert_eq!(protocol::read(&mut peer).await.unwrap(), valid);
+        drop(writer);
+        let mut rest = Vec::new();
+        peer.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_queued_frame_is_skipped_without_poisoning_stream() {
+        let (sink, mut peer) = tokio::io::duplex(8192);
+        let writer = Writer::new(sink);
+        let stale = Message::new("error", "stale");
+        let (reply, completion) = oneshot::channel();
+        writer.queue.send((protocol::encode_frame(&stale).unwrap(), reply,
+            tokio::time::Instant::now())).await.unwrap();
+        assert_eq!(completion.await.unwrap().unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let fresh = Message::new("hangup", "fresh");
+        send(&writer, &fresh).await.unwrap();
+        assert_eq!(protocol::read(&mut peer).await.unwrap(), fresh);
+    }
+
+    #[tokio::test]
+    async fn queue_admission_and_residence_share_one_budget() {
+        // Deliberately withhold the writer. Admission can never wait forever,
+        // nor can a frame acquire a new deadline when eventually dequeued.
+        let (queue, mut receiver) = mpsc::channel::<WriteRequest>(1);
+        let writer = Writer { queue };
+        let stale_writer = writer.clone();
+        let first = tokio::spawn(async move { send(&stale_writer, &Message::new("error", "stale")).await });
+        while writer.queue.capacity() != 0 { tokio::task::yield_now().await; }
+        let second = send(&writer, &Message::new("hangup", "blocked")).await;
+        assert_eq!(second.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(first.await.unwrap().unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let (_, reply, deadline) = receiver.recv().await.unwrap();
+        assert!(reply.is_closed());
+        assert!(tokio::time::Instant::now() >= deadline);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]

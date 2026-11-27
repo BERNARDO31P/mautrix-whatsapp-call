@@ -53,7 +53,7 @@ use std::time::Duration;
 
 use matrix_rtc_core::executor as rt;
 use matrix_rtc_core::{JoinedMembership, LiveKitAuthFlow, RtcTransport};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     ConnectionContext, ConnectionEvent, ConnectionState, FrameEncryptionState, MediaConstraints,
@@ -114,6 +114,14 @@ struct PooledTrack {
 /// Tracks whose transport identity has no membership yet, buffered per
 /// identity until the membership lands.
 type PendingTracks = HashMap<String, Vec<(MediaStreamKind, PooledTrack)>>;
+
+/// Bound retained media handles while membership propagation catches up.
+const MAX_PENDING_TRACKS: usize = 512;
+/// Cap unmatched key notifications (not the cryptographic key store).
+const MAX_PENDING_KEY_IDENTITIES: usize = 512;
+const MAX_PENDING_KEY_NOTIFICATIONS: usize = 4096;
+/// Bound unmatched identity bytes even for direct transport callers.
+const MAX_PENDING_KEY_IDENTITY_BYTES: usize = 16 * 1024;
 
 /// What [`MediaTransport::connect`] resolves to, as carried in the inbox.
 type ConnectOutcome = Result<
@@ -250,17 +258,20 @@ enum Message {
     /// A [`MediaTransport::connect`] attempt resolved.
     ConnectFinished {
         connection_key: String,
+        incarnation: u64,
         attempt: u32,
         result: ConnectOutcome,
     },
     /// A backoff timer elapsed; try connecting again.
     RetryConnect {
         connection_key: String,
+        incarnation: u64,
         attempt: u32,
     },
     /// An idle grace timer elapsed; close the connection if still unneeded.
     CloseIfIdle {
         connection_key: String,
+        incarnation: u64,
         idle_generation: u64,
     },
     /// A constraints debounce timer elapsed; apply if still current.
@@ -271,11 +282,12 @@ enum Message {
     },
     /// An own-focus (re)connect attempt resolved.
     OwnConnectFinished {
+        epoch: u64,
         attempt: u32,
         result: Result<mpsc::UnboundedReceiver<ConnectionEvent>, TransportError>,
     },
     /// An own-focus backoff timer elapsed.
-    OwnRetry { attempt: u32 },
+    OwnRetry { epoch: u64, attempt: u32 },
     /// The reconnect budget of the loss numbered `epoch` ran out.
     OwnBudget { epoch: u64 },
     /// The attempt made at the end of the loss numbered `epoch`'s budget did
@@ -283,6 +295,11 @@ enum Message {
     OwnFinalAttemptExpired { epoch: u64 },
     /// The loss numbered `epoch` has lasted [`FALLBACK_GRACE`].
     OwnFallback { epoch: u64 },
+    OwnHandoverFinished {
+        epoch: u64,
+        generation: u64,
+        result: Result<(), TransportError>,
+    },
 }
 
 /// Our own focus while it is being recovered (034 R24): the handle every
@@ -349,6 +366,8 @@ struct ManagedConnection {
     /// Whether this is the focus we publish on.
     is_own: bool,
     state: ConnState,
+    /// Unique for this pool entry, including while no connection is up.
+    incarnation: u64,
     /// Bumped every time a live connection is installed; events carrying an
     /// older generation belong to a replaced connection and are dropped.
     generation: u64,
@@ -384,6 +403,9 @@ pub struct MediaPool {
     members_snapshot: Vec<JoinedMembership>,
     /// Every `member_id` of the latest snapshot, mapped or not.
     known_members: HashSet<String>,
+    // Provenance of buffered media across a signalling lapse. Never assume a
+    // reused legacy member ID represents the same participation.
+    lapsed_members: HashMap<String, (JoinedMembership, String)>,
     /// SFU URLs already reported as reached through both token flows.
     split_flow_sfus: HashSet<String>,
     /// Transport identity → `member_id`.
@@ -398,7 +420,7 @@ pub struct MediaPool {
     pending_tracks: PendingTracks,
     /// Transport identities that published a track declared unencrypted,
     /// until they leave the SFU; reported again whenever they map.
-    sent_in_clear: HashSet<String>,
+    sent_in_clear: HashSet<(String, String)>,
     /// Imported key indices awaiting their membership, in arrival order.
     ///
     /// A `Vec`, not a single index: at join a member can be handed more than one
@@ -431,6 +453,12 @@ pub struct MediaPool {
     /// The peer focus our media moves to once its connection is up, while
     /// our own is still down past the grace.
     fallback_target: Option<String>,
+    // The handle is installed on the new focus, but the advertised focus and
+    // health remain unchanged until its local publications are restored.
+    pending_focus_move: Option<RtcTransport>,
+    pending_handover: Option<oneshot::Sender<()>>,
+    own_attempt: Option<rt::JoinHandle<()>>,
+    handover_network_down: bool,
     /// Events produced by the call in progress, handed back when it returns.
     out: Vec<PoolEvent>,
 }
@@ -452,6 +480,7 @@ impl MediaPool {
             tracks,
             members_snapshot: Vec::new(),
             known_members: HashSet::new(),
+            lapsed_members: HashMap::new(),
             split_flow_sfus: HashSet::new(),
             identity_map: HashMap::new(),
             member_identities: HashMap::new(),
@@ -470,6 +499,10 @@ impl MediaPool {
             sfu_fallback: config.sfu_fallback,
             signalling_reachable: true,
             fallback_target: None,
+            pending_focus_move: None,
+            pending_handover: None,
+            own_attempt: None,
+            handover_network_down: false,
             out: Vec::new(),
         };
         (pool, messages_rx)
@@ -537,6 +570,7 @@ impl MediaPool {
 
     /// The own-focus connection, while it is up.
     pub fn own_connection(&self) -> Option<Arc<dyn TransportConnection>> {
+        if self.pending_focus_move.is_some() { return None; }
         self.pool
             .values()
             .find(|entry| entry.is_own)
@@ -544,6 +578,15 @@ impl MediaPool {
                 ConnState::Up { connection } => Some(connection.clone()),
                 _ => None,
             })
+    }
+
+    /// A member id can be reused by the legacy dialect. Compare the pinned
+    /// participation timestamp, not the latest event id or event timestamp.
+    pub fn membership_replaced(&self, member: &JoinedMembership) -> bool {
+        self.members_snapshot.iter().any(|previous| {
+            previous.member_id == member.member_id
+                && !previous.same_participation(member)
+        })
     }
 
     /// Apply the latest membership snapshot: map the members that joined
@@ -556,16 +599,54 @@ impl MediaPool {
             .collect();
         // Departures first, so a member_id rejoining in the same snapshot
         // (new membership, same key space) starts clean.
-        let departed: Vec<String> = self.known_members.difference(&current).cloned().collect();
+        let replaced: HashSet<String> = snapshot.iter()
+            .filter(|member| self.membership_replaced(member))
+            .map(|member| member.member_id.clone())
+            .collect();
+        let departed: Vec<String> = self.known_members.difference(&current)
+            .chain(replaced.iter()).cloned().collect();
         for member_id in departed {
-            self.forget_member(&member_id);
+            self.forget_member(&member_id, replaced.contains(&member_id));
         }
+        // Unlike a coalesced replacement, a visible lapse may have parked
+        // tracks on the old transport identity. Restore only a proven refresh.
+        for member in snapshot {
+            if let Some((previous, identity)) = self.lapsed_members.remove(&member.member_id) {
+                if !previous.same_participation(member) {
+                    self.pending_tracks.remove(&identity);
+                    self.pending_keys.remove(&identity);
+                    self.sent_in_clear.retain(|(id, _)| id != &identity);
+                }
+            }
+        }
+        // A changed focus is not a new join, but the old focus may no longer
+        // supply any of this member's media. Keep the membership constraints.
+        let moved: HashSet<String> = snapshot.iter().filter(|member| {
+            self.members_snapshot.iter().find(|old| old.member_id == member.member_id)
+                .is_some_and(|old| self.selected_focus(old) != self.selected_focus(member))
+        }).map(|member| member.member_id.clone()).collect();
+        self.members_snapshot = snapshot.to_vec();
         for member in snapshot {
             if self.known_members.insert(member.member_id.clone()) {
                 self.map_member(member);
+            } else if moved.contains(&member.member_id) {
+                let mut obsolete: Vec<_> = self.tracks.lock().expect("track map mutex poisoned")
+                    .iter().filter(|((id, _), pooled)| id == &member.member_id
+                        && self.selected_focus(member).as_deref() != Some(pooled.connection_key.as_str()))
+                    .map(|((_, kind), pooled)| (*kind, pooled.connection_key.clone())).collect();
+                obsolete.sort_by_key(|(kind, _)| *kind);
+                for (kind, key) in obsolete {
+                    self.remove_track(&member.member_id, kind, &key);
+                }
+                if let Some(identity) = self.member_identities.remove(&member.member_id) {
+                    self.identity_map.retain(|_, id| id != &member.member_id);
+                    let focus = self.selected_focus(member);
+                    self.sent_in_clear.retain(|(id, key)| id != &identity
+                        || focus.as_deref() == Some(key.as_str()));
+                }
+                self.map_member(member);
             }
         }
-        self.members_snapshot = snapshot.to_vec();
         self.reconcile_pool();
         std::mem::take(&mut self.out)
     }
@@ -599,6 +680,7 @@ impl MediaPool {
                 members,
                 is_own: true,
                 state: ConnState::Up { connection },
+                incarnation: generation,
                 generation,
                 idle_generation: 0,
             },
@@ -623,6 +705,7 @@ impl MediaPool {
             ever_up: false,
             budget_spent: false,
         });
+        self.connection_generation += 1;
         self.pool.insert(
             key.clone(),
             ManagedConnection {
@@ -630,6 +713,7 @@ impl MediaPool {
                 members,
                 is_own: true,
                 state: ConnState::Connecting { attempt: 0 },
+                incarnation: self.connection_generation,
                 generation: 0,
                 idle_generation: 0,
             },
@@ -650,6 +734,9 @@ impl MediaPool {
     /// Reported against its member at once, or once their membership lands
     /// (to-device keys regularly beat sticky memberships).
     pub fn key_imported(&mut self, identity: String, key_index: u8) -> Vec<PoolEvent> {
+        if self.closed {
+            return Vec::new();
+        }
         match self.identity_map.get(&identity) {
             Some(member_id) => vec![PoolEvent::KeyImported {
                 member_id: member_id.clone(),
@@ -657,10 +744,21 @@ impl MediaPool {
                 key_index,
             }],
             None => {
-                let pending = self.pending_keys.entry(identity).or_default();
-                if !pending.contains(&key_index) {
-                    pending.push(key_index);
+                if identity.len() > MAX_PENDING_KEY_IDENTITY_BYTES {
+                    log::debug!("Oversized unmatched key identity; dropping notification");
+                    return Vec::new();
                 }
+                if self.pending_keys.get(&identity).is_some_and(|pending| pending.contains(&key_index)) {
+                    return Vec::new();
+                }
+                if (!self.pending_keys.contains_key(&identity)
+                    && self.pending_keys.len() >= MAX_PENDING_KEY_IDENTITIES)
+                    || self.pending_keys.values().map(Vec::len).sum::<usize>() >= MAX_PENDING_KEY_NOTIFICATIONS
+                {
+                    log::debug!("pending key notification capacity reached; dropping unmatched notification");
+                    return Vec::new();
+                }
+                self.pending_keys.entry(identity.into_boxed_str().into_string()).or_default().push(key_index);
                 Vec::new()
             }
         }
@@ -700,6 +798,7 @@ impl MediaPool {
     pub fn set_signalling_reachable(&mut self, reachable: bool) -> Vec<PoolEvent> {
         self.signalling_reachable = reachable;
         if reachable {
+            self.finish_focus_move();
             self.try_fallback();
         }
         std::mem::take(&mut self.out)
@@ -712,6 +811,13 @@ impl MediaPool {
         // Our own focus's recovery stops: its budget no longer runs, and a
         // connect still in flight is closed when it lands.
         self.closed = true;
+        self.cancel_own_attempt();
+        self.pending_handover = None;
+        self.pending_focus_move = None;
+        self.pending_keys.clear();
+        self.pending_tracks.clear();
+        self.lapsed_members.clear();
+        self.sent_in_clear.clear();
         if let Some(own) = self.own.as_mut() {
             own.epoch += 1;
             own.lost_since = None;
@@ -752,17 +858,20 @@ impl MediaPool {
             }
             Message::ConnectFinished {
                 connection_key,
+                incarnation,
                 attempt,
                 result,
-            } => self.connect_finished(&connection_key, attempt, result),
+            } => self.connect_finished(&connection_key, incarnation, attempt, result),
             Message::RetryConnect {
                 connection_key,
+                incarnation,
                 attempt,
-            } => self.retry_connect(&connection_key, attempt),
+            } => self.retry_connect(&connection_key, incarnation, attempt),
             Message::CloseIfIdle {
                 connection_key,
+                incarnation,
                 idle_generation,
-            } => self.close_if_idle(&connection_key, idle_generation),
+            } => self.close_if_idle(&connection_key, incarnation, idle_generation),
             Message::ApplyConstraints {
                 member_id,
                 kind,
@@ -777,10 +886,10 @@ impl MediaPool {
                     self.apply_constraints_now(&member_id, kind);
                 }
             }
-            Message::OwnConnectFinished { attempt, result } => {
-                self.own_connect_finished(attempt, result);
+            Message::OwnConnectFinished { epoch, attempt, result } => {
+                self.own_connect_finished(epoch, attempt, result);
             }
-            Message::OwnRetry { attempt } => self.own_retry(attempt),
+            Message::OwnRetry { epoch, attempt } => self.own_retry(epoch, attempt),
             Message::OwnBudget { epoch } => self.own_budget(epoch),
             Message::OwnFinalAttemptExpired { epoch } => {
                 if self.own.as_ref().is_some_and(|own| {
@@ -794,20 +903,35 @@ impl MediaPool {
                     self.try_fallback();
                 }
             }
+            Message::OwnHandoverFinished { epoch, generation, result } => {
+                self.own_handover_finished(epoch, generation, result);
+            }
         }
         std::mem::take(&mut self.out)
     }
 
     // ---- members ------------------------------------------------------
 
+    fn selected_focus(&self, member: &JoinedMembership) -> Option<String> {
+        select_transport(&self.transports, member).map(|(_, key)| key)
+    }
+
+    fn member_on_focus(&self, identity: &str, connection_key: &str) -> Option<String> {
+        let member_id = self.identity_map.get(identity)?;
+        let member = self.members_snapshot.iter().find(|member| &member.member_id == member_id)?;
+        (self.selected_focus(member).as_deref() == Some(connection_key)).then(|| member_id.clone())
+    }
+
     fn map_member(&mut self, member: &JoinedMembership) {
-        let identity = self
-            .transports
-            .iter()
-            .find_map(|backend| backend.remote_identity(member));
+        let selected = select_transport(&self.transports, member);
+        let identity = match &selected {
+            Some((backend, _)) => backend.remote_identity(member),
+            // Keep key notifications independent of media reachability.
+            None => self.transports.iter().find_map(|backend| backend.remote_identity(member)),
+        };
         let Some(identity) = identity else {
             // Their media arrives under an identity nothing maps back, so it
-            // will be buffered forever rather than surfacing as their stream.
+            // may be buffered rather than surfacing as their stream.
             log::warn!(
                 "member {} ({}) has no transport identity; their media cannot be attributed",
                 member.member_id,
@@ -834,10 +958,14 @@ impl MediaPool {
                 member.member_id,
             );
             for (kind, pooled) in pending {
-                self.add_track(&member.member_id, kind, pooled);
+                if selected.as_ref().is_some_and(|(_, key)| key == &pooled.connection_key) {
+                    self.add_track(&member.member_id, kind, pooled);
+                }
             }
         }
-        if self.sent_in_clear.contains(&identity) {
+        self.sent_in_clear.retain(|(id, key)| id != &identity
+            || selected.as_ref().is_some_and(|(_, selected_key)| selected_key == key));
+        if selected.as_ref().is_some_and(|(_, key)| self.sent_in_clear.contains(&(identity.clone(), key.clone()))) {
             self.out.push(PoolEvent::SentInClear {
                 member_id: member.member_id.clone(),
             });
@@ -851,7 +979,7 @@ impl MediaPool {
         }
     }
 
-    fn forget_member(&mut self, member_id: &str) {
+    fn forget_member(&mut self, member_id: &str, replaced: bool) {
         self.known_members.remove(member_id);
         let identity = self.member_identities.remove(member_id);
         // A stale key index could otherwise resurface against the identity.
@@ -859,8 +987,8 @@ impl MediaPool {
             self.pending_keys.remove(identity);
         }
         self.identity_map.retain(|_, mapped| mapped != member_id);
-        // A rejoining member gets a fresh member_id, so their constraints
-        // die with the membership.
+        // Constraints belong to the departed participation, even when the
+        // legacy dialect reuses its member id.
         self.constraints
             .retain(|(member, _), _| member != member_id);
         // Their tracks go back to the buffer, not away: the same participation
@@ -884,18 +1012,71 @@ impl MediaPool {
                 })
                 .collect()
         };
-        if let Some(identity) = identity
-            && !departed.is_empty()
-        {
-            self.pending_tracks
-                .entry(identity)
-                .or_default()
-                .extend(departed);
+        if let Some(identity) = identity {
+            if replaced {
+                // A different participation is not a temporary lapse. Do not
+                // transfer its predecessor's media handles or diagnostics.
+                self.pending_tracks.remove(&identity);
+                self.sent_in_clear.retain(|(id, _)| id != &identity);
+                for (kind, _) in departed {
+                    self.out.push(PoolEvent::StreamRemoved {
+                        member_id: member_id.to_owned(),
+                        kind,
+                    });
+                }
+            } else if let Some(previous) = self.members_snapshot.iter().find(|m| m.member_id == member_id).cloned() {
+                // Bound provenance as well as the tracks. Eviction discards
+                // every parked item whose ownership would otherwise be lost.
+                if self.lapsed_members.len() >= MAX_PENDING_TRACKS {
+                    for (_, (_, id)) in self.lapsed_members.drain() {
+                        self.pending_tracks.remove(&id);
+                        self.pending_keys.remove(&id);
+                        self.sent_in_clear.retain(|(candidate, _)| candidate != &id);
+                    }
+                }
+                self.lapsed_members.insert(member_id.to_owned(), (previous, identity.clone()));
+                for (kind, pooled) in departed {
+                    self.buffer_track(identity.clone(), kind, pooled);
+                }
+            }
+        }
+    }
+
+    /// Keep just the latest publication for an identity, kind and connection.
+    /// Replacements remain admissible at capacity and move to the end so
+    /// flushing preserves the order of the surviving publications.
+    fn buffer_track(&mut self, identity: String, kind: MediaStreamKind, pooled: PooledTrack) {
+        if let Some(pending) = self.pending_tracks.get_mut(&identity) {
+            if let Some(index) = pending.iter().position(|(k, previous)| {
+                *k == kind && previous.connection_key == pooled.connection_key
+            }) {
+                pending.remove(index);
+                pending.push((kind, pooled));
+                return;
+            }
+        }
+        if self.pending_tracks.values().map(Vec::len).sum::<usize>() >= MAX_PENDING_TRACKS {
+            log::debug!("pending media capacity reached; dropping an unmatched track");
+            return;
+        }
+        self.pending_tracks.entry(identity).or_default().push((kind, pooled));
+    }
+
+    fn remove_pending_track(&mut self, identity: &str, connection_key: &str, kind: Option<MediaStreamKind>) {
+        let empty = self.pending_tracks.get_mut(identity).is_some_and(|pending| {
+            pending.retain(|(pending_kind, pooled)| {
+                pooled.connection_key != connection_key || kind.is_some_and(|k| k != *pending_kind)
+            });
+            pending.is_empty()
+        });
+        if empty {
+            self.pending_tracks.remove(identity);
         }
     }
 
     /// Media buffered from `key` is gone with its connection.
     fn drop_pending_from(&mut self, key: &str) {
+        self.sent_in_clear.retain(|(_, focus)| focus != key);
         self.pending_tracks.retain(|_, pending| {
             pending.retain(|(_, pooled)| pooled.connection_key != key);
             !pending.is_empty()
@@ -1042,19 +1223,25 @@ impl MediaPool {
         );
 
         for (key, entry) in &mut self.pool {
-            entry.members = desired.remove(key).map(|(_, m)| m).unwrap_or_default();
+            let members = desired.remove(key).map(|(_, m)| m).unwrap_or_default();
+            if entry.members == members {
+                continue;
+            }
+            entry.members = members;
             // Any member-set change invalidates pending idle timers; an empty
             // set (re)arms one.
             entry.idle_generation += 1;
             if entry.members.is_empty() && !entry.is_own {
                 log::debug!("peer focus {key} has no members left; arming the idle timer");
                 let idle_generation = entry.idle_generation;
+                let incarnation = entry.incarnation;
                 let messages = self.messages_tx.clone();
                 let key = key.clone();
                 rt::spawn(async move {
                     rt::sleep(IDLE_GRACE).await;
                     let _ = messages.send(PoolMessage(Message::CloseIfIdle {
                         connection_key: key,
+                        incarnation,
                         idle_generation,
                     }));
                 });
@@ -1071,10 +1258,12 @@ impl MediaPool {
                 "connecting to peer focus {key} for {} member(s)",
                 members.len(),
             );
+            self.connection_generation += 1;
             self.pool.insert(
                 key.clone(),
                 ManagedConnection {
                     backend: Some(backend),
+                    incarnation: self.connection_generation,
                     members,
                     is_own: false,
                     state: ConnState::Connecting { attempt: 0 },
@@ -1125,6 +1314,7 @@ impl MediaPool {
             return;
         };
         entry.state = ConnState::Connecting { attempt };
+        let incarnation = entry.incarnation;
 
         let ctx = self.ctx.clone();
         let messages = self.messages_tx.clone();
@@ -1133,17 +1323,20 @@ impl MediaPool {
             let result = backend.connect(&key, &ctx).await;
             let _ = messages.send(PoolMessage(Message::ConnectFinished {
                 connection_key: key,
+                incarnation,
                 attempt,
                 result,
             }));
         });
     }
 
-    fn retry_connect(&mut self, key: &str, attempt: u32) {
+    fn retry_connect(&mut self, key: &str, incarnation: u64, attempt: u32) {
         let Some(entry) = self.pool.get(key) else {
             return;
         };
-        if !matches!(entry.state, ConnState::Backoff { attempt: a } if a == attempt) {
+        if entry.incarnation != incarnation
+            || !matches!(entry.state, ConnState::Backoff { attempt: a } if a == attempt)
+        {
             return;
         }
         if entry.members.is_empty() && !entry.is_own {
@@ -1154,11 +1347,15 @@ impl MediaPool {
         self.start_connect(key, attempt);
     }
 
-    fn close_if_idle(&mut self, key: &str, idle_generation: u64) {
+    fn close_if_idle(&mut self, key: &str, incarnation: u64, idle_generation: u64) {
         let Some(entry) = self.pool.get(key) else {
             return;
         };
-        if entry.idle_generation != idle_generation || !entry.members.is_empty() || entry.is_own {
+        if entry.incarnation != incarnation
+            || entry.idle_generation != idle_generation
+            || !entry.members.is_empty()
+            || entry.is_own
+        {
             return;
         }
         log::debug!("closing idle connection {key}");
@@ -1176,7 +1373,7 @@ impl MediaPool {
         self.clear_degraded(key);
     }
 
-    fn connect_finished(&mut self, key: &str, attempt: u32, result: ConnectOutcome) {
+    fn connect_finished(&mut self, key: &str, incarnation: u64, attempt: u32, result: ConnectOutcome) {
         let close_stray = |result: ConnectOutcome| {
             if let Ok((connection, _events)) = result {
                 rt::spawn(async move {
@@ -1190,7 +1387,9 @@ impl MediaPool {
             None => (false, false),
             Some(entry) => (
                 !entry.members.is_empty() || entry.is_own,
-                matches!(entry.state, ConnState::Connecting { attempt: a } if a == attempt),
+                entry.incarnation == incarnation
+                    && !entry.is_own
+                    && matches!(entry.state, ConnState::Connecting { attempt: a } if a == attempt),
             ),
         };
         if !matches_attempt {
@@ -1236,12 +1435,16 @@ impl MediaPool {
     }
 
     fn schedule_retry(&self, key: &str, attempt: u32, delay: Duration) {
+        let Some(incarnation) = self.pool.get(key).map(|entry| entry.incarnation) else {
+            return;
+        };
         let messages = self.messages_tx.clone();
         let key = key.to_owned();
         rt::spawn(async move {
             rt::sleep(delay).await;
             let _ = messages.send(PoolMessage(Message::RetryConnect {
                 connection_key: key,
+                incarnation,
                 attempt,
             }));
         });
@@ -1290,6 +1493,8 @@ impl MediaPool {
         if is_own {
             // The transport gave up; we have not. At once, then on backoff,
             // within the budget that started at the loss (034 R24).
+            self.pending_handover = None; // cancel restoration of the lost room
+            self.handover_network_down = true;
             self.start_own_loss();
             self.spawn_own_attempt(0);
             return;
@@ -1362,16 +1567,21 @@ impl MediaPool {
                 // Membership is the truth; a transport-level leave on its own
                 // changes nothing for a member (tracks get their own events),
                 // only for a participant we could not map.
-                self.unmapped.remove(&identity);
-                self.sent_in_clear.remove(&identity);
+                if self.unmapped.get(&identity).is_some_and(|key| key == connection_key) {
+                    self.unmapped.remove(&identity);
+                }
+                self.sent_in_clear.remove(&(identity.clone(), connection_key.to_owned()));
+                self.remove_pending_track(&identity, connection_key, None);
             }
             ConnectionEvent::TrackNotEncrypted { identity, kind } => {
                 log::warn!(
                     "refused a {kind:?} track declared unencrypted from {identity} on {connection_key}"
                 );
-                self.sent_in_clear.insert(identity.clone());
-                if let Some(member_id) = self.identity_map.get(&identity).cloned() {
+                if let Some(member_id) = self.member_on_focus(&identity, connection_key) {
+                    self.sent_in_clear.insert((identity, connection_key.to_owned()));
                     self.out.push(PoolEvent::SentInClear { member_id });
+                } else if !self.identity_map.contains_key(&identity) {
+                    self.sent_in_clear.insert((identity, connection_key.to_owned()));
                 }
             }
             ConnectionEvent::TrackAdded {
@@ -1383,41 +1593,34 @@ impl MediaPool {
                     connection_key: connection_key.to_owned(),
                     track,
                 };
-                match self.identity_map.get(&identity).cloned() {
+                match self.member_on_focus(&identity, connection_key) {
                     Some(member_id) => self.add_track(&member_id, kind, pooled),
-                    None => {
+                    None if !self.identity_map.contains_key(&identity) => {
                         log::debug!(
                             "buffering {kind:?} track of unknown identity {identity} on {connection_key}"
                         );
-                        self.pending_tracks
-                            .entry(identity)
-                            .or_default()
-                            .push((kind, pooled));
+                        self.buffer_track(identity, kind, pooled);
                     }
+                    None => log::debug!("dropping track from a non-selected focus"),
                 }
             }
             ConnectionEvent::TrackRemoved { identity, kind } => {
                 match self.identity_map.get(&identity).cloned() {
                     Some(member_id) => self.remove_track(&member_id, kind, connection_key),
                     None => {
-                        if let Some(pending) = self.pending_tracks.get_mut(&identity) {
-                            pending.retain(|(pending_kind, pooled)| {
-                                *pending_kind != kind || pooled.connection_key != connection_key
-                            });
-                        }
+                        self.remove_pending_track(&identity, connection_key, Some(kind));
                     }
                 }
             }
-            ConnectionEvent::TrackMuted { identity, kind } => self.muted(&identity, kind, true),
-            ConnectionEvent::TrackUnmuted { identity, kind } => self.muted(&identity, kind, false),
+            ConnectionEvent::TrackMuted { identity, kind } => self.muted(&identity, connection_key, kind, true),
+            ConnectionEvent::TrackUnmuted { identity, kind } => self.muted(&identity, connection_key, kind, false),
             ConnectionEvent::ActiveSpeakers { speakers } => {
                 let speakers = speakers
                     .into_iter()
                     .filter_map(|speaker| {
-                        self.identity_map
-                            .get(&speaker.identity)
+                        self.member_on_focus(&speaker.identity, connection_key)
                             .map(|member_id| ActiveSpeaker {
-                                member_id: member_id.clone(),
+                                member_id,
                                 level: speaker.level,
                             })
                     })
@@ -1425,7 +1628,7 @@ impl MediaPool {
                 self.out.push(PoolEvent::ActiveSpeakers { speakers });
             }
             ConnectionEvent::EncryptionStateChanged { identity, state } => {
-                match self.identity_map.get(&identity).cloned() {
+                match self.member_on_focus(&identity, connection_key) {
                     Some(member_id) => self
                         .out
                         .push(PoolEvent::EncryptionStateChanged { member_id, state }),
@@ -1441,11 +1644,18 @@ impl MediaPool {
             ConnectionEvent::Reconnecting => {
                 self.mark_degraded(connection_key);
                 if self.own_connection_key.as_deref() == Some(connection_key) {
+                    self.handover_network_down = true;
                     self.start_own_loss();
                 }
             }
             ConnectionEvent::Reconnected => {
                 if self.own_connection_key.as_deref() == Some(connection_key) {
+                    self.handover_network_down = false;
+                    if self.pending_focus_move.is_some() {
+                        self.finish_focus_move();
+                        self.reapply_connection_constraints(connection_key);
+                        return;
+                    }
                     self.end_own_loss();
                 }
                 self.clear_degraded(connection_key);
@@ -1522,13 +1732,21 @@ impl MediaPool {
         }
     }
 
+    fn cancel_own_attempt(&mut self) {
+        if let Some(task) = self.own_attempt.take() {
+            task.abort();
+        }
+    }
+
     fn spawn_own_attempt(&mut self, attempt: u32) {
+        self.cancel_own_attempt();
         let Some(key) = self.own_connection_key.clone() else {
             return;
         };
         let Some(own) = self.own.as_mut() else {
             return;
         };
+        let epoch = own.epoch;
         let fresh_token = std::mem::take(&mut own.refetch_next);
         let connection = own.connection.clone();
         if let Some(entry) = self.pool.get_mut(&key) {
@@ -1539,14 +1757,19 @@ impl MediaPool {
             if fresh_token { ", fresh token" } else { "" },
         );
         let messages = self.messages_tx.clone();
-        rt::spawn(async move {
-            let result = connection.reconnect(fresh_token).await;
-            let _ = messages.send(PoolMessage(Message::OwnConnectFinished { attempt, result }));
-        });
+        let reservation = connection.reserve_reconnect();
+        self.own_attempt = Some(rt::spawn(async move {
+            let result = match reservation {
+                Ok(reservation) => connection.reconnect_reserved(fresh_token, reservation).await,
+                Err(error) => Err(error),
+            };
+            let _ = messages.send(PoolMessage(Message::OwnConnectFinished { epoch, attempt, result }));
+        }));
     }
 
     fn own_connect_finished(
         &mut self,
+        epoch: u64,
         attempt: u32,
         result: Result<mpsc::UnboundedReceiver<ConnectionEvent>, TransportError>,
     ) {
@@ -1559,6 +1782,11 @@ impl MediaPool {
         let Some(own) = self.own.as_mut() else {
             return;
         };
+        // Attempt numbers restart after recovery. A late completion from
+        // a previous outage must never satisfy the new outage's attempt.
+        if own.epoch != epoch {
+            return;
+        }
         if !current {
             if self.closed && result.is_ok() {
                 let connection = own.connection.clone();
@@ -1568,6 +1796,7 @@ impl MediaPool {
             }
             return;
         }
+        self.own_attempt = None;
         match result {
             Ok(events) => {
                 own.ever_up = true;
@@ -1578,8 +1807,13 @@ impl MediaPool {
                 entry.generation = generation;
                 entry.state = ConnState::Up { connection };
                 self.spawn_forwarder(key.clone(), generation, events);
-                self.end_own_loss();
-                self.clear_degraded(&key);
+                self.handover_network_down = false;
+                if self.pending_focus_move.is_some() {
+                    self.finish_focus_move();
+                } else {
+                    self.end_own_loss();
+                    self.clear_degraded(&key);
+                }
                 self.reapply_connection_constraints(&key);
             }
             Err(TransportError::TokenEndpointUnsupported(message)) => {
@@ -1616,6 +1850,9 @@ impl MediaPool {
         let Some(key) = self.own_connection_key.clone() else {
             return;
         };
+        let Some(epoch) = self.own.as_ref().map(|own| own.epoch) else {
+            return;
+        };
         if let Some(entry) = self.pool.get_mut(&key) {
             entry.state = ConnState::Backoff { attempt };
         }
@@ -1630,11 +1867,14 @@ impl MediaPool {
         let messages = self.messages_tx.clone();
         rt::spawn(async move {
             rt::sleep(delay).await;
-            let _ = messages.send(PoolMessage(Message::OwnRetry { attempt }));
+            let _ = messages.send(PoolMessage(Message::OwnRetry { epoch, attempt }));
         });
     }
 
-    fn own_retry(&mut self, attempt: u32) {
+    fn own_retry(&mut self, epoch: u64, attempt: u32) {
+        if !self.own.as_ref().is_some_and(|own| own.epoch == epoch && own.lost_since.is_some()) {
+            return;
+        }
         // Each step re-checks the fallback: a peer connection coming back
         // mid-outage enables it (034 R25).
         self.try_fallback();
@@ -1715,6 +1955,9 @@ impl MediaPool {
         };
         log::warn!("giving up our own focus {key} ({reason:?}): {message}");
         self.fallback_target = None;
+        self.cancel_own_attempt();
+        self.pending_handover = None;
+        self.pending_focus_move = None;
         self.unmapped.retain(|_, on| *on != key);
         self.drop_pending_from(&key);
         self.pool.remove(&key);
@@ -1736,7 +1979,9 @@ impl MediaPool {
     /// a peer connection is up, the evidence that the network does. Its
     /// connection is taken over at once if up, else as soon as it is.
     fn try_fallback(&mut self) {
-        if !self.sfu_fallback || !self.signalling_reachable || self.closed {
+        if !self.sfu_fallback || !self.signalling_reachable || self.closed
+            || self.pending_focus_move.is_some()
+            || self.own.as_ref().is_some_and(|own| own.budget_spent) {
             return;
         }
         let Some(own_key) = self.own_connection_key.clone() else {
@@ -1823,17 +2068,31 @@ impl MediaPool {
                 "the peer connection cannot be handed over".into(),
             )),
         };
-        if let Err(error) = taken {
-            log::warn!("cannot fall back to {target}, keeping to our own focus: {error}");
-            self.sfu_fallback = false;
-            self.fallback_target = None;
-            return;
-        }
+        let completion = match taken {
+            Ok(completion) => completion,
+            Err(error) => {
+                log::warn!("cannot fall back to {target}, keeping to our own focus: {error}");
+                self.sfu_fallback = false;
+                self.fallback_target = None;
+                return;
+            }
+        };
         let connection = own.connection.clone();
-        log::info!("our media goes out through {target} now, our own focus {own_key} being down");
-        if let Some(own) = self.own.as_mut() {
-            own.ever_up = true;
-        }
+        self.cancel_own_attempt();
+        // Fence already-running old-focus attempts, without resetting the
+        // outage budget. The new focus uses the same absolute deadline.
+        let own = self.own.as_mut().expect("checked own above");
+        own.epoch += 1;
+        own.token_refetched = false;
+        own.refetch_next = false;
+        let epoch = own.epoch;
+        let remaining = self.own_reconnect_budget.saturating_sub(
+            own.lost_since.expect("fallback requires a loss").elapsed());
+        let messages = self.messages_tx.clone();
+        rt::spawn(async move {
+            rt::sleep(remaining).await;
+            let _ = messages.send(PoolMessage(Message::OwnBudget { epoch }));
+        });
 
         self.pool.remove(own_key);
         self.unmapped.retain(|_, on| on != own_key);
@@ -1842,22 +2101,65 @@ impl MediaPool {
         entry.is_own = true;
         entry.backend = None;
         entry.state = ConnState::Up { connection };
+        let generation = entry.generation;
         self.own_connection_key = Some(target.to_owned());
-        self.end_own_loss();
-        self.out.push(PoolEvent::OwnFocusMoved {
-            connection_key: target.to_owned(),
-            transport,
-        });
-        self.out.push(PoolEvent::ConnectionState {
-            connection_key: target.to_owned(),
-            state: ConnectionState::Connected,
-        });
+        self.pending_focus_move = Some(transport);
+        self.handover_network_down = false;
+        self.mark_degraded(target);
+        if let Some(completion) = completion {
+            let (cancel, cancelled) = oneshot::channel();
+            self.pending_handover = Some(cancel);
+            let messages = self.messages_tx.clone();
+            rt::spawn(async move {
+                let result = tokio::select! {
+                    biased;
+                    _ = cancelled => return,
+                    result = completion => result.unwrap_or_else(|_| Err(
+                        TransportError::Closed("handover completion dropped".into()))),
+                };
+                let _ = messages.send(PoolMessage(Message::OwnHandoverFinished { epoch, generation, result }));
+            });
+        } else {
+            self.finish_focus_move();
+        }
         // Whoever else publishes on the old focus is subscribed to as a
         // peer's, still reconnecting until that connection is up.
         self.reconcile_pool();
         if !self.pool.contains_key(own_key) {
             self.clear_degraded(own_key);
         }
+    }
+
+    fn own_handover_finished(&mut self, epoch: u64, generation: u64, result: Result<(), TransportError>) {
+        let Some(key) = self.own_connection_key.clone() else { return; };
+        if self.closed || self.pending_handover.is_none()
+            || !self.own.as_ref().is_some_and(|own| own.epoch == epoch)
+            || !self.pool.get(&key).is_some_and(|entry| entry.generation == generation
+                && matches!(entry.state, ConnState::Up { .. })) {
+            return;
+        }
+        self.pending_handover = None;
+        match result {
+            Ok(()) => self.finish_focus_move(),
+            Err(error) => self.connection_down(&key, generation, &error.to_string()),
+        }
+    }
+
+    /// Only report the focus and recovery after restoration has settled and
+    /// signaling can publish the new focus. A failed handover reconnects the
+    /// adopted focus within the original outage budget.
+    fn finish_focus_move(&mut self) {
+        if self.closed || self.pending_handover.is_some() || self.handover_network_down
+            || !self.signalling_reachable { return; }
+        let Some(key) = self.own_connection_key.clone() else { return; };
+        if !self.pool.get(&key).is_some_and(|entry| matches!(entry.state, ConnState::Up { .. })) {
+            return;
+        }
+        let Some(transport) = self.pending_focus_move.take() else { return; };
+        if let Some(own) = self.own.as_mut() { own.ever_up = true; }
+        self.end_own_loss();
+        self.out.push(PoolEvent::OwnFocusMoved { connection_key: key.clone(), transport });
+        self.clear_degraded(&key);
     }
 
     /// The transport a member publishes on that `key` serves.
@@ -1875,10 +2177,10 @@ impl MediaPool {
         })
     }
 
-    fn muted(&mut self, identity: &str, kind: MediaStreamKind, muted: bool) {
-        if let Some(member_id) = self.identity_map.get(identity) {
+    fn muted(&mut self, identity: &str, connection_key: &str, kind: MediaStreamKind, muted: bool) {
+        if let Some(member_id) = self.member_on_focus(identity, connection_key) {
             self.out.push(PoolEvent::StreamMuted {
-                member_id: member_id.clone(),
+                member_id,
                 kind,
                 muted,
             });

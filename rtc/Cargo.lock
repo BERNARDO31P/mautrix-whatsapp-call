@@ -2781,6 +2781,7 @@ dependencies = [
  "async-trait",
  "log",
  "matrix-rtc-core",
+ "matrix-rtc-transport",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -2909,6 +2910,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
+ "url",
 ]
 
 [[package]]

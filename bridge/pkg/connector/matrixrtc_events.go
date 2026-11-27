@@ -6,9 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/purpshell/meowcaller"
 	"go.mau.fi/whatsmeow"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"maunium.net/go/mautrix/bridgev2"
@@ -19,6 +19,7 @@ import (
 
 	"go.mau.fi/whatsmeow/types"
 
+	"go.mau.fi/mautrix-whatsapp/pkg/connector/voipbridge/rtcwire"
 	"go.mau.fi/mautrix-whatsapp/pkg/waid"
 )
 
@@ -36,8 +37,9 @@ const (
 	rtcDeclineWire        = "org.matrix.msc4310.rtc.decline"
 	rtcMaxLifetimeMS      = int64(120_000)
 	rtcClockSkew          = 30 * time.Second
-	rtcIntentWait         = 750 * time.Millisecond
-	rtcIntentLifetime     = 5 * time.Minute
+	rtcMemberLifetime     = 5 * time.Minute
+	rtcReferenceWait      = 5 * time.Second
+	rtcPendingInviteLimit = 64
 	matrixRTCSlotDefault  = "m.call#room"
 )
 
@@ -62,23 +64,70 @@ func matrixRTCCallStaticJIDAvailability(jid types.JID) (matrixRTCCallAvailabilit
 	return matrixRTCCallAvailabilityUnknown, ""
 }
 
+// Only known WhatsApp account device domains can establish a consumer or
+// hosted classification. Unknown domains never imply a consumer fallback.
 func classifyMatrixRTCCallDevices(devices []types.JID) (matrixRTCCallDeviceClass, string) {
 	if len(devices) == 0 {
 		return matrixRTCCallDeviceClassUnavailable, "devices:none"
 	}
-	hosted := 0
+	hosted := false
 	for _, device := range devices {
+		if device.User == "" || device.ToNonAD().IsBot() {
+			continue
+		}
 		switch device.Server {
 		case types.HostedServer, types.HostedLIDServer:
-			hosted++
-		default:
+			hosted = true
+		case types.DefaultUserServer, types.HiddenUserServer:
 			return matrixRTCCallDeviceClassConsumer, "devices:consumer"
 		}
 	}
-	if hosted == len(devices) {
+	if hosted {
 		return matrixRTCCallDeviceClassHosted, "devices:hosted"
 	}
 	return matrixRTCCallDeviceClassUnknown, "devices:unknown"
+}
+
+// A hosted device belongs to the corresponding PN or LID account. Do not
+// equate a PN and LID merely because their numeric user parts match.
+func matrixRTCCallAccount(jid types.JID) types.JID {
+	jid = jid.ToNonAD()
+	switch jid.Server {
+	case types.HostedServer:
+		jid.Server = types.DefaultUserServer
+	case types.HostedLIDServer:
+		jid.Server = types.HiddenUserServer
+	}
+	return jid
+}
+
+func matrixRTCMatchesCallAccount(jid types.JID, peers []types.JID) bool {
+	jid = matrixRTCCallAccount(jid)
+	if jid.User == "" || (jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer) {
+		return false
+	}
+	for _, peer := range peers {
+		if matrixRTCCallAccount(peer) == jid {
+			return true
+		}
+	}
+	return false
+}
+
+func classifyMatrixRTCCallPeerDevices(devices []types.JID, peers []types.JID) (matrixRTCCallDeviceClass, string) {
+	if len(devices) == 0 {
+		return classifyMatrixRTCCallDevices(devices)
+	}
+	matched := make([]types.JID, 0, len(devices))
+	for _, device := range devices {
+		if matrixRTCMatchesCallAccount(device, peers) {
+			matched = append(matched, device)
+		}
+	}
+	if len(matched) == 0 {
+		return matrixRTCCallDeviceClassUnknown, "devices:unattributed"
+	}
+	return classifyMatrixRTCCallDevices(matched)
 }
 
 func matrixRTCCallPortalServer(server string) bool {
@@ -102,56 +151,91 @@ func normalizeMatrixRTCCallOption(value string) string {
 	return strings.Trim(value, "_\"'")
 }
 
-func flattenMatrixRTCCallOptions(prefix string, value any, out map[string]string) {
-	switch typed := value.(type) {
-	case map[string]any:
-		for key, child := range typed {
-			normalizedKey := normalizeMatrixRTCCallOption(key)
-			if prefix != "" {
-				normalizedKey = prefix + "_" + normalizedKey
+// Keep every value: flat aliases, nested options and repeated profile nodes
+// can describe the same capability with contradictory values.
+type matrixRTCCallOptions map[string][]string
+
+func (options matrixRTCCallOptions) add(key, value string) {
+	key = normalizeMatrixRTCCallOption(key)
+	options[key] = append(options[key], value)
+}
+
+// Decode object members in wire order instead of using a map, which would
+// silently overwrite repeated JSON properties before precedence is applied.
+func flattenMatrixRTCCallJSON(prefix string, decoder *json.Decoder, out matrixRTCCallOptions) bool {
+	token, err := decoder.Token()
+	if err != nil {
+		return false
+	}
+	switch typed := token.(type) {
+	case json.Delim:
+		switch typed {
+		case '{':
+			for decoder.More() {
+				key, err := decoder.Token()
+				name, ok := key.(string)
+				if err != nil || !ok {
+					return false
+				}
+				normalizedKey := normalizeMatrixRTCCallOption(name)
+				if prefix != "" {
+					normalizedKey = prefix + "_" + normalizedKey
+				}
+				if !flattenMatrixRTCCallJSON(normalizedKey, decoder, out) {
+					return false
+				}
 			}
-			flattenMatrixRTCCallOptions(normalizedKey, child, out)
+		case '[':
+			// Arrays are not capability aliases. Consume them without
+			// interpreting any nested value as authoritative evidence.
+			for decoder.More() {
+				var ignored json.RawMessage
+				if decoder.Decode(&ignored) != nil {
+					return false
+				}
+			}
+		default:
+			return false
 		}
+		end, err := decoder.Token()
+		return err == nil && ((typed == '{' && end == json.Delim('}')) || (typed == '[' && end == json.Delim(']')))
 	case string:
-		out[prefix] = typed
+		out.add(prefix, typed)
 	case bool:
 		if typed {
-			out[prefix] = "true"
+			out.add(prefix, "true")
 		} else {
-			out[prefix] = "false"
+			out.add(prefix, "false")
 		}
 	case float64:
 		if typed == 0 {
-			out[prefix] = "0"
+			out.add(prefix, "0")
 		} else if typed == 1 {
-			out[prefix] = "1"
+			out.add(prefix, "1")
 		}
 	}
+	return true
 }
 
-func expandMatrixRTCCallOptions(options map[string]string) map[string]string {
-	expanded := make(map[string]string, len(options)*2)
-	for key, rawValue := range options {
-		normalizedKey := normalizeMatrixRTCCallOption(key)
-		expanded[normalizedKey] = strings.TrimSpace(rawValue)
-		trimmed := strings.TrimSpace(rawValue)
-		if strings.HasPrefix(trimmed, "{") {
-			var nested map[string]any
-			if json.Unmarshal([]byte(trimmed), &nested) == nil {
-				flattenMatrixRTCCallOptions(normalizedKey, nested, expanded)
+func expandMatrixRTCCallOptions(options matrixRTCCallOptions) matrixRTCCallOptions {
+	expanded := make(matrixRTCCallOptions, len(options)*2)
+	for key, rawValues := range options {
+		for _, rawValue := range rawValues {
+			normalizedKey := normalizeMatrixRTCCallOption(key)
+			trimmed := strings.TrimSpace(rawValue)
+			expanded.add(normalizedKey, trimmed)
+			if strings.HasPrefix(trimmed, "{") && json.Valid([]byte(trimmed)) {
+				// Commit only after the whole object has decoded successfully.
+				nested := make(matrixRTCCallOptions)
+				if flattenMatrixRTCCallJSON(normalizedKey, json.NewDecoder(strings.NewReader(trimmed)), nested) {
+					for nestedKey, values := range nested {
+						expanded[nestedKey] = append(expanded[nestedKey], values...)
+					}
+				}
 			}
 		}
 	}
 	return expanded
-}
-
-func matrixRTCCallOptionValue(options map[string]string, keys ...string) (string, string, bool) {
-	for _, key := range keys {
-		if value, ok := options[normalizeMatrixRTCCallOption(key)]; ok {
-			return normalizeMatrixRTCCallOption(value), key, true
-		}
-	}
-	return "", "", false
 }
 
 func matrixRTCCallBool(value string) (enabled bool, known bool) {
@@ -170,40 +254,65 @@ func matrixRTCCallBool(value string) (enabled bool, known bool) {
 // actually enabled, while call_icon_visibility can hide the chat call button
 // even though other WhatsApp call entry points may still work.
 func classifyWhatsAppBusinessCallOptions(options map[string]string) (matrixRTCCallAvailability, string) {
-	if len(options) == 0 {
-		return matrixRTCCallAvailabilityUnknown, ""
+	values := make(matrixRTCCallOptions, len(options))
+	for key, value := range options {
+		values.add(key, value)
 	}
+	return classifyWhatsAppBusinessCallValues(values)
+}
+
+func classifyWhatsAppBusinessCallValues(options matrixRTCCallOptions) (matrixRTCCallAvailability, string) {
 	expanded := expandMatrixRTCCallOptions(options)
-	if value, key, ok := matrixRTCCallOptionValue(expanded,
+	availability, source := matrixRTCCallAvailabilityUnknown, ""
+	// Explicit disabled > hidden > enabled > unknown. The enum ordering is
+	// not used as a policy: keep the precedence explicit. Within a category,
+	// choose a deterministic diagnostic even when map iteration is random.
+	rank := func(a matrixRTCCallAvailability) int {
+		switch a {
+		case matrixRTCCallAvailabilityDisabled:
+			return 3
+		case matrixRTCCallAvailabilityHidden:
+			return 2
+		case matrixRTCCallAvailabilityEnabled:
+			return 1
+		default:
+			return 0
+		}
+	}
+	consider := func(a matrixRTCCallAvailability, key, value string) {
+		candidate := "business_profile:" + key + "=" + value
+		if rank(a) > rank(availability) || (a == availability && candidate < source) {
+			availability, source = a, candidate
+		}
+	}
+	for _, key := range []string{
 		"business_calling_enabled",
 		"calling_status", "calling_status_status", "calling_calling_status",
 		"call_status", "calling_enabled", "call_enabled", "calls_enabled", "voice_call_enabled",
-	); ok {
-		if enabled, known := matrixRTCCallBool(value); known {
-			if !enabled {
-				return matrixRTCCallAvailabilityDisabled, "business_profile:" + key + "=" + value
+	} {
+		for _, rawValue := range expanded[key] {
+			value := normalizeMatrixRTCCallOption(rawValue)
+			if enabled, known := matrixRTCCallBool(value); known {
+				if enabled {
+					consider(matrixRTCCallAvailabilityEnabled, key, value)
+				} else {
+					consider(matrixRTCCallAvailabilityDisabled, key, value)
+				}
 			}
-			// Keep looking for a visibility override before returning enabled.
 		}
 	}
-	if value, key, ok := matrixRTCCallOptionValue(expanded,
+	for _, key := range []string{
 		"call_icon_visibility", "calling_call_icon_visibility", "calling_icon_visibility",
-	); ok {
-		switch value {
-		case "hide_in_chat", "disable_all", "hidden", "hide", "disabled":
-			return matrixRTCCallAvailabilityHidden, "business_profile:" + key + "=" + value
+	} {
+		for _, rawValue := range expanded[key] {
+			value := normalizeMatrixRTCCallOption(rawValue)
+			switch value {
+			case "hide_in_chat", "disable_all", "hidden", "hide", "disabled":
+				consider(matrixRTCCallAvailabilityHidden, key, value)
+			}
 		}
 	}
-	if value, key, ok := matrixRTCCallOptionValue(expanded,
-		"business_calling_enabled",
-		"calling_status", "calling_status_status", "calling_calling_status",
-		"call_status", "calling_enabled", "call_enabled", "calls_enabled", "voice_call_enabled",
-	); ok {
-		if enabled, known := matrixRTCCallBool(value); known && enabled {
-			return matrixRTCCallAvailabilityEnabled, "business_profile:" + key + "=" + value
-		}
-	}
-	return matrixRTCCallAvailabilityUnknown, ""
+	return availability, source
 }
 
 func (wa *WhatsAppClient) matrixRTCBusinessProfileJID(ctx context.Context, jid types.JID) types.JID {
@@ -255,8 +364,12 @@ func (wa *WhatsAppClient) matrixRTCCallAvailabilityKeys(ctx context.Context, jid
 }
 
 func (wa *WhatsAppClient) rememberMatrixRTCCallAvailabilityForPeer(ctx context.Context, jid types.JID, availability matrixRTCCallAvailability, source string, ttl time.Duration) matrixRTCCallAvailabilityCacheEntry {
+	keys := wa.matrixRTCCallAvailabilityKeys(ctx, jid)
+	if ctx.Err() != nil {
+		return matrixRTCCallAvailabilityCacheEntry{}
+	}
 	now := time.Now()
-	return matrixRTCCallAvailabilityCache.remember(wa.matrixRTCCallAvailabilityKeys(ctx, jid), matrixRTCCallAvailabilityCacheEntry{availability: availability, source: source, expires: now.Add(ttl)}, now)
+	return matrixRTCCallAvailabilityCache.rememberContext(ctx, keys, matrixRTCCallAvailabilityCacheEntry{availability: availability, source: source, expires: now.Add(ttl)}, now)
 }
 
 func matrixRTCNodeStringValue(value any) (string, bool) {
@@ -281,75 +394,112 @@ func matrixRTCNodeStringValue(value any) (string, bool) {
 }
 
 func matrixRTCVoIPFeatureValue(node waBinary.Node) (matrixRTCCallAvailability, string) {
-	for _, key := range []string{"enabled", "supported", "available", "status", "value"} {
-		if raw, ok := node.Attrs[key]; ok {
-			if value, ok := matrixRTCNodeStringValue(raw); ok {
-				if enabled, known := matrixRTCCallBool(value); known {
-					if enabled {
-						return matrixRTCCallAvailabilityEnabled, "usync:feature:voip:" + key + "=" + value
-					}
-					return matrixRTCCallAvailabilityDisabled, "usync:feature:voip:" + key + "=" + value
+	availability, source := matrixRTCCallAvailabilityUnknown, ""
+	seenValue := false
+	consider := func(raw any, prefix string) {
+		seenValue = true
+		if value, ok := matrixRTCNodeStringValue(raw); ok {
+			if enabled, known := matrixRTCCallBool(value); known {
+				if !enabled {
+					availability, source = matrixRTCCallAvailabilityDisabled, prefix+value
+				} else if availability == matrixRTCCallAvailabilityUnknown {
+					availability, source = matrixRTCCallAvailabilityEnabled, prefix+value
 				}
 			}
 		}
 	}
-	if value, ok := matrixRTCNodeStringValue(node.Content); ok && value != "" {
-		if enabled, known := matrixRTCCallBool(value); known {
-			if enabled {
-				return matrixRTCCallAvailabilityEnabled, "usync:feature:voip=" + value
-			}
-			return matrixRTCCallAvailabilityDisabled, "usync:feature:voip=" + value
+	for _, key := range []string{"enabled", "supported", "available", "status", "value"} {
+		if raw, ok := node.Attrs[key]; ok {
+			consider(raw, "usync:feature:voip:"+key+"=")
 		}
 	}
-	// Feature protocols represent support by returning the requested feature
-	// node. A present, valueless <voip/> therefore means supported.
-	return matrixRTCCallAvailabilityEnabled, "usync:feature:voip=present"
+	if node.Content != nil {
+		children, isList := node.Content.([]waBinary.Node)
+		if value, ok := matrixRTCNodeStringValue(node.Content); (!ok || value != "") && !(isList && len(children) == 0) {
+			consider(node.Content, "usync:feature:voip=")
+		}
+	}
+	if !seenValue {
+		return matrixRTCCallAvailabilityEnabled, "usync:feature:voip=present"
+	}
+	return availability, source
 }
 
-func findMatrixRTCFeatureNode(node waBinary.Node, tag string) (waBinary.Node, bool) {
-	if node.Tag == tag {
-		return node, true
-	}
+func matrixRTCFeatureNodes(node waBinary.Node, tag string) (matches []waBinary.Node) {
 	for _, child := range node.GetChildren() {
-		if found, ok := findMatrixRTCFeatureNode(child, tag); ok {
-			return found, true
+		if child.Tag == tag {
+			matches = append(matches, child)
+		} else {
+			matches = append(matches, matrixRTCFeatureNodes(child, tag)...)
 		}
 	}
-	return waBinary.Node{}, false
+	return
 }
 
-func classifyWhatsAppVoIPFeatureResponse(resp *waBinary.Node) (matrixRTCCallAvailability, string) {
-	if resp == nil {
+func classifyWhatsAppVoIPFeatureResponse(resp *waBinary.Node, peers ...types.JID) (matrixRTCCallAvailability, string) {
+	if resp == nil || resp.Tag != "iq" || len(peers) == 0 {
 		return matrixRTCCallAvailabilityUnknown, ""
 	}
-	list, ok := resp.GetOptionalChildByTag("usync", "list")
-	if !ok {
+	availability, source := matrixRTCCallAvailabilityUnknown, ""
+	matched := false
+	incomplete := false
+	for _, usync := range resp.GetChildrenByTag("usync") {
+		for _, list := range usync.GetChildrenByTag("list") {
+			for _, user := range list.GetChildrenByTag("user") {
+				jid, ok := user.Attrs["jid"].(types.JID)
+				if !ok || !matrixRTCMatchesCallAccount(jid, peers) {
+					continue
+				}
+				matched = true
+				features := user.GetChildrenByTag("feature")
+				if len(features) == 0 || len(user.GetChildrenByTag("error")) != 0 {
+					incomplete = true
+					continue
+				}
+				for _, feature := range features {
+					if len(matrixRTCFeatureNodes(feature, "error")) != 0 {
+						incomplete = true
+						continue
+					}
+					if feature.Content != nil {
+						if _, ok := feature.Content.([]waBinary.Node); !ok {
+							incomplete = true
+							continue
+						}
+					}
+					voips := matrixRTCFeatureNodes(feature, "voip")
+					if len(voips) == 0 {
+						return matrixRTCCallAvailabilityDisabled, "usync:feature:voip=absent"
+					}
+					for _, voip := range voips {
+						if len(voip.GetChildrenByTag("error")) != 0 {
+							incomplete = true
+							continue
+						}
+						a, detail := matrixRTCVoIPFeatureValue(voip)
+						if a == matrixRTCCallAvailabilityDisabled {
+							return a, detail
+						}
+						if a == matrixRTCCallAvailabilityUnknown {
+							incomplete = true
+						} else if availability == matrixRTCCallAvailabilityUnknown {
+							availability, source = a, detail
+						}
+					}
+				}
+			}
+		}
+	}
+	if !matched || incomplete {
 		return matrixRTCCallAvailabilityUnknown, ""
 	}
-	users := list.GetChildrenByTag("user")
-	if len(users) != 1 {
-		return matrixRTCCallAvailabilityUnknown, ""
-	}
-	feature, ok := findMatrixRTCFeatureNode(users[0], "feature")
-	if !ok {
-		return matrixRTCCallAvailabilityUnknown, ""
-	}
-	if _, hasError := findMatrixRTCFeatureNode(feature, "error"); hasError {
-		return matrixRTCCallAvailabilityUnknown, ""
-	}
-	if voip, ok := findMatrixRTCFeatureNode(feature, "voip"); ok {
-		return matrixRTCVoIPFeatureValue(voip)
-	}
-	// The request asks for only the voip feature. A valid feature response with
-	// no voip child is explicit negative capability, not a transport failure.
-	return matrixRTCCallAvailabilityDisabled, "usync:feature:voip=absent"
+	return availability, source
 }
 
-func (wa *WhatsAppClient) queryWhatsAppCallDevices(ctx context.Context, jid types.JID) (matrixRTCCallDeviceClass, string) {
+func (wa *WhatsAppClient) queryWhatsAppCallDevices(ctx context.Context, jid types.JID, peers []types.JID) (matrixRTCCallDeviceClass, string) {
 	if wa.Client == nil || !wa.Client.IsConnected() {
 		return matrixRTCCallDeviceClassUnknown, ""
 	}
-	jid = wa.matrixRTCBusinessProfileJID(ctx, jid)
 	if jid.IsEmpty() {
 		return matrixRTCCallDeviceClassUnknown, ""
 	}
@@ -361,17 +511,16 @@ func (wa *WhatsAppClient) queryWhatsAppCallDevices(ctx context.Context, jid type
 			Msg("WhatsApp device lookup unavailable; leaving MatrixRTC device class unknown")
 		return matrixRTCCallDeviceClassUnknown, ""
 	}
-	class, source := classifyMatrixRTCCallDevices(devices)
+	class, source := classifyMatrixRTCCallPeerDevices(devices, peers)
 	wa.UserLogin.Log.Debug().Stringer("peer", jid).Str("source", source).Int("devices", len(devices)).
 		Msg("WhatsApp MatrixRTC device class refreshed")
 	return class, source
 }
 
-func (wa *WhatsAppClient) queryWhatsAppVoIPFeature(ctx context.Context, jid types.JID) (matrixRTCCallAvailability, string) {
+func (wa *WhatsAppClient) queryWhatsAppVoIPFeature(ctx context.Context, jid types.JID, peers []types.JID) (matrixRTCCallAvailability, string) {
 	if wa.Client == nil || !wa.Client.IsConnected() {
 		return matrixRTCCallAvailabilityUnknown, ""
 	}
-	jid = wa.matrixRTCBusinessProfileJID(ctx, jid)
 	if jid.IsEmpty() {
 		return matrixRTCCallAvailabilityUnknown, ""
 	}
@@ -400,10 +549,23 @@ func (wa *WhatsAppClient) queryWhatsAppVoIPFeature(ctx context.Context, jid type
 		wa.UserLogin.Log.Debug().Err(err).Stringer("peer", jid).Msg("WhatsApp voip feature lookup unavailable; leaving MatrixRTC call availability unknown")
 		return matrixRTCCallAvailabilityUnknown, ""
 	}
-	return classifyWhatsAppVoIPFeatureResponse(resp)
+	return classifyWhatsAppVoIPFeatureResponse(resp, peers...)
 }
 
-func flattenMatrixRTCBusinessProfileNode(prefix string, node waBinary.Node, out map[string]string) {
+// Keep JSON-valued business options intact until expansion; the generic
+// node helper normalizes punctuation and is intended for scalar features.
+func matrixRTCProfileOptionValue(value any) (string, bool) {
+	switch typed := value.(type) {
+	case string:
+		return typed, true
+	case []byte:
+		return string(typed), true
+	default:
+		return matrixRTCNodeStringValue(value)
+	}
+}
+
+func flattenMatrixRTCBusinessProfileNode(prefix string, node waBinary.Node, out matrixRTCCallOptions) {
 	key := normalizeMatrixRTCCallOption(node.Tag)
 	if prefix != "" {
 		if key != "" {
@@ -413,38 +575,50 @@ func flattenMatrixRTCBusinessProfileNode(prefix string, node waBinary.Node, out 
 		}
 	}
 	for attrKey, attrValue := range node.Attrs {
-		if value, ok := matrixRTCNodeStringValue(attrValue); ok {
-			out[strings.Trim(key+"_"+normalizeMatrixRTCCallOption(attrKey), "_")] = value
+		if value, ok := matrixRTCProfileOptionValue(attrValue); ok {
+			out.add(strings.Trim(key+"_"+normalizeMatrixRTCCallOption(attrKey), "_"), value)
 		}
 	}
-	if value, ok := matrixRTCNodeStringValue(node.Content); ok && key != "" && value != "" {
-		out[key] = value
+	if value, ok := matrixRTCProfileOptionValue(node.Content); ok && key != "" && value != "" {
+		out.add(key, value)
 	}
 	for _, child := range node.GetChildren() {
 		flattenMatrixRTCBusinessProfileNode(key, child, out)
 	}
 }
 
-func classifyWhatsAppBusinessCallProfileResponse(resp *waBinary.Node) (matrixRTCCallAvailability, string) {
-	if resp == nil {
+// Collect repeated option containers only from profiles attributed to the
+// requested account. The pinned Whatsmeow profile parser requires a JID.
+func classifyWhatsAppBusinessCallProfileResponse(resp *waBinary.Node, peers ...types.JID) (matrixRTCCallAvailability, string) {
+	if resp == nil || resp.Tag != "iq" || len(peers) == 0 {
 		return matrixRTCCallAvailabilityUnknown, ""
 	}
-	profileOptions, ok := findMatrixRTCFeatureNode(*resp, "profile_options")
-	if !ok {
-		return matrixRTCCallAvailabilityUnknown, ""
+	options := make(matrixRTCCallOptions)
+	for _, container := range resp.GetChildren() {
+		if container.Tag != "business_profile" {
+			continue
+		}
+		for _, profile := range container.GetChildren() {
+			jid, ok := profile.Attrs["jid"].(types.JID)
+			if profile.Tag != "profile" || !ok || !matrixRTCMatchesCallAccount(jid, peers) {
+				continue
+			}
+			for _, child := range profile.GetChildren() {
+				if child.Tag == "profile_options" {
+					for _, option := range child.GetChildren() {
+						flattenMatrixRTCBusinessProfileNode("", option, options)
+					}
+				}
+			}
+		}
 	}
-	options := make(map[string]string)
-	for _, child := range profileOptions.GetChildren() {
-		flattenMatrixRTCBusinessProfileNode("", child, options)
-	}
-	return classifyWhatsAppBusinessCallOptions(options)
+	return classifyWhatsAppBusinessCallValues(options)
 }
 
-func (wa *WhatsAppClient) queryWhatsAppBusinessCallProfile(ctx context.Context, jid types.JID) (matrixRTCCallAvailability, string) {
+func (wa *WhatsAppClient) queryWhatsAppBusinessCallProfile(ctx context.Context, jid types.JID, peers []types.JID) (matrixRTCCallAvailability, string) {
 	if wa.Client == nil || !wa.Client.IsConnected() {
 		return matrixRTCCallAvailabilityUnknown, ""
 	}
-	jid = wa.matrixRTCBusinessProfileJID(ctx, jid)
 	if jid.IsEmpty() {
 		return matrixRTCCallAvailabilityUnknown, ""
 	}
@@ -468,7 +642,7 @@ func (wa *WhatsAppClient) queryWhatsAppBusinessCallProfile(ctx context.Context, 
 			Msg("WhatsApp business calling profile lookup unavailable; keeping MatrixRTC availability from voip feature query")
 		return matrixRTCCallAvailabilityUnknown, ""
 	}
-	availability, source := classifyWhatsAppBusinessCallProfileResponse(resp)
+	availability, source := classifyWhatsAppBusinessCallProfileResponse(resp, peers...)
 	if availability != matrixRTCCallAvailabilityUnknown {
 		wa.UserLogin.Log.Debug().Stringer("peer", jid).Str("source", source).
 			Msg("WhatsApp business calling profile classified for MatrixRTC")
@@ -535,6 +709,9 @@ func combineWhatsAppMatrixRTCCallAvailability(
 }
 
 func (wa *WhatsAppClient) matrixRTCCallAvailabilityForPeer(ctx context.Context, jid types.JID) (matrixRTCCallAvailability, string) {
+	if ctx.Err() != nil {
+		return matrixRTCCallAvailabilityUnknown, ""
+	}
 	jid = jid.ToNonAD()
 	if wa.IsOwnJID(jid) {
 		return matrixRTCCallAvailabilityDisabled, "note_to_self"
@@ -554,7 +731,20 @@ func (wa *WhatsAppClient) matrixRTCCallAvailabilityForPeer(ctx context.Context, 
 	// call button. Device discovery is important for Cloud API/coexistence numbers:
 	// WhatsApp marks hosted devices explicitly. Hosted-only destinations fail
 	// closed unless their business profile explicitly advertises calling enabled.
-	deviceClass, deviceSource := wa.queryWhatsAppCallDevices(ctx, jid)
+	lookup := matrixRTCCallAccount(jid)
+	peers := wa.matrixRTCCallCandidateJIDs(ctx, lookup)
+	if lookup.Server == types.HiddenUserServer {
+		for _, peer := range peers {
+			if peer.Server == types.DefaultUserServer && peer.User != "" {
+				lookup = peer
+				break
+			}
+		}
+	}
+	deviceClass, deviceSource := wa.queryWhatsAppCallDevices(ctx, lookup, peers)
+	if ctx.Err() != nil {
+		return matrixRTCCallAvailabilityUnknown, ""
+	}
 	if deviceClass == matrixRTCCallDeviceClassUnknown && (jid.Server == types.HostedServer || jid.Server == types.HostedLIDServer) {
 		deviceClass, deviceSource = matrixRTCCallDeviceClassHosted, "jid:hosted"
 	}
@@ -563,11 +753,14 @@ func (wa *WhatsAppClient) matrixRTCCallAvailabilityForPeer(ctx context.Context, 
 		return cached.availability, cached.source
 	}
 
-	featureAvailability, featureSource := wa.queryWhatsAppVoIPFeature(ctx, jid)
+	featureAvailability, featureSource := wa.queryWhatsAppVoIPFeature(ctx, lookup, peers)
+	if ctx.Err() != nil {
+		return matrixRTCCallAvailabilityUnknown, ""
+	}
 	profileAvailability := matrixRTCCallAvailabilityUnknown
 	profileSource := ""
 	if featureAvailability != matrixRTCCallAvailabilityDisabled {
-		profileAvailability, profileSource = wa.queryWhatsAppBusinessCallProfile(ctx, jid)
+		profileAvailability, profileSource = wa.queryWhatsAppBusinessCallProfile(ctx, lookup, peers)
 	}
 
 	availability, source := combineWhatsAppMatrixRTCCallAvailability(
@@ -589,11 +782,10 @@ func (wa *WhatsAppClient) matrixRTCCallAvailabilityForPeer(ctx context.Context, 
 	return availability, source
 }
 
-var rtcProbes sync.Map
-var rtcProbeSlots = make(chan struct{}, 4)
+var rtcProbes = newRTCProbeAdmission(64, 16, 4)
 
 // Chat creation may read the local cache, but capability probes run off the message path.
-func (wa *WhatsAppClient) rtcCachedRestriction(jid types.JID) bool {
+func (wa *WhatsAppClient) rtcCachedRestriction(ctx context.Context, jid types.JID) bool {
 	if wa.IsOwnJID(jid) {
 		return true
 	}
@@ -601,19 +793,34 @@ func (wa *WhatsAppClient) rtcCachedRestriction(jid types.JID) bool {
 		return true
 	}
 	key := matrixRTCCallAvailabilityCacheKey(string(wa.UserLogin.ID), jid.ToNonAD())
-	if entry, ok := matrixRTCCallAvailabilityCache.get([]string{key}, time.Now()); ok {
+	// Resolve only locally stored aliases, using the same lookup as the dial gate.
+	// Capability network queries remain asynchronous below.
+	aliasCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	keys := wa.matrixRTCCallAvailabilityKeys(aliasCtx, jid)
+	cancel()
+	if entry, ok := matrixRTCCallAvailabilityCache.get(keys, time.Now()); ok {
 		return entry.availability == matrixRTCCallAvailabilityDisabled || entry.availability == matrixRTCCallAvailabilityHidden
 	}
-	if wa.Client != nil && wa.Client.IsConnected() {
-		if _, loaded := rtcProbes.LoadOrStore(key, true); !loaded {
+	probeCtx := wa.rtcProbeLifetime.current()
+	if probeCtx != nil && probeCtx.Err() == nil && wa.Client != nil && wa.Client.IsConnected() {
+		if release, admitted := rtcProbes.admit(string(wa.UserLogin.ID), key); admitted {
 			go func() {
-				defer rtcProbes.Delete(key)
-				rtcProbeSlots <- struct{}{}
-				defer func() { <-rtcProbeSlots }()
-				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer release()
+				queueCtx, cancelQueue := context.WithTimeout(probeCtx, 20*time.Second)
+				defer cancelQueue()
+				if !rtcProbes.acquire(queueCtx) {
+					return
+				}
+				defer rtcProbes.releaseSlot()
+				if probeCtx.Err() != nil || wa.Client == nil || !wa.Client.IsConnected() {
+					return
+				}
+				ctx, cancel := context.WithTimeout(probeCtx, 20*time.Second)
 				defer cancel()
 				wa.matrixRTCCallAvailabilityForPeer(ctx, jid)
-				wa.refreshMatrixRTCCallPermissionForJID(ctx, jid)
+				if ctx.Err() == nil {
+					wa.refreshMatrixRTCCallPermissionForJID(ctx, jid)
+				}
 			}()
 		}
 	}
@@ -621,26 +828,40 @@ func (wa *WhatsAppClient) rtcCachedRestriction(jid types.JID) bool {
 }
 
 func (wa *WhatsAppClient) rtcPortalPower(ctx context.Context, jid types.JID, dm bool) func(*event.PowerLevelsEventContent) bool {
+	return wa.rtcPortalPowerForRoom(ctx, jid, dm, true)
+}
+
+func (wa *WhatsAppClient) rtcPortalPowerForRoom(ctx context.Context, jid types.JID, dm, allowInitial bool) func(*event.PowerLevelsEventContent) bool {
 	mx, ok := wa.Main.Bridge.Matrix.(*bridgev2matrix.Connector)
 	restrict := true
-	if ok && wa.Main.Config.ExperimentalWhatsAppVoIP && wa.Main.Config.RTCGatewaySocket != "" && mx.Config.Encryption.Allow {
+	initial := false
+	if ok {
 		row, err := wa.Main.Bridge.DB.Portal.GetByKey(ctx, wa.makeWAPortalKey(jid))
 		if err == nil {
-			encrypted := mx.Config.Encryption.Default
-			if row != nil && row.MXID != "" {
-				encrypted, err = mx.StateStore.IsEncrypted(ctx, row.MXID)
-			}
-			if encrypted && err == nil {
-				restrict = dm && wa.rtcCachedRestriction(jid)
+			initial = allowInitial && (row == nil || row.MXID == "")
+			if wa.Main.Config.ExperimentalWhatsAppVoIP && wa.Main.Config.RTCGatewaySocket != "" && mx.Config.Encryption.Allow {
+				encrypted := mx.Config.Encryption.Default
+				if row != nil && row.MXID != "" {
+					encrypted, err = mx.StateStore.IsEncrypted(ctx, row.MXID)
+				}
+				if encrypted && err == nil {
+					restrict = dm && wa.rtcCachedRestriction(ctx, jid)
+				}
 			}
 		}
 	}
-	return func(power *event.PowerLevelsEventContent) bool { return mergeRTCPortalPower(power, restrict) }
+	return func(power *event.PowerLevelsEventContent) bool {
+		return mergeRTCPortalPowerWithInitial(power, restrict, initial)
+	}
 }
 
 // Record the prior explicit rule together with each restriction in the same
 // state event. An administrator's later change takes precedence.
 func mergeRTCPortalPower(power *event.PowerLevelsEventContent, restrict bool) bool {
+	return mergeRTCPortalPowerWithInitial(power, restrict, false)
+}
+
+func mergeRTCPortalPowerWithInitial(power *event.PowerLevelsEventContent, restrict, initial bool) bool {
 	if power.Events == nil {
 		power.Events = make(map[string]int)
 	}
@@ -648,28 +869,45 @@ func mergeRTCPortalPower(power *event.PowerLevelsEventContent, restrict bool) bo
 	for typ := range matrixRTCPowerLevels(false, map[event.Type]int{}) {
 		key := typ.Type
 		marker := "org.mautrix.whatsapp.rtc.previous." + key
+		inheritedMarker := "org.mautrix.whatsapp.rtc.inherited." + key
 		old, exists := power.Events[key]
 		previous, managed := power.Events[marker]
-		if managed && (!exists || old != 100) {
+		_, inherited := power.Events[inheritedMarker]
+		if (managed || inherited) && (!exists || old != 100) {
 			delete(power.Events, marker)
-			managed = false
+			delete(power.Events, inheritedMarker)
+			managed, inherited = false, false
+			changed = true
+		}
+		// New bridge-owned rooms deliberately enable call state events at PL0.
+		// An existing room's missing rule, however, is an inherited admin rule.
+		if initial && !exists {
+			power.Events[key] = 0
+			old, exists = 0, true
 			changed = true
 		}
 		if restrict {
-			if !exists || old < 100 {
-				if !exists {
-					old = 0
+			effective := old
+			if !exists {
+				effective = power.GetEventLevel(typ)
+			}
+			if effective < 100 {
+				if exists {
+					power.Events[marker] = old
+				} else {
+					power.Events[inheritedMarker] = 0
 				}
-				power.Events[marker] = old
 				power.Events[key] = 100
 				changed = true
 			}
+		} else if inherited {
+			delete(power.Events, key)
+			delete(power.Events, inheritedMarker)
+			delete(power.Events, marker)
+			changed = true
 		} else if managed {
 			power.Events[key] = previous
 			delete(power.Events, marker)
-			changed = true
-		} else if !exists {
-			power.Events[key] = 0
 			changed = true
 		}
 	}
@@ -681,15 +919,57 @@ func (wa *WhatsAppClient) matrixRTCCallHardDisabled(ctx context.Context, jid typ
 	return availability == matrixRTCCallAvailabilityDisabled || availability == matrixRTCCallAvailabilityHidden, source
 }
 
+var rtcPermissionLocks rtcPermissionRefreshLocks
+
 func (wa *WhatsAppClient) refreshMatrixRTCCallPermission(ctx context.Context, portal *bridgev2.Portal) {
-	if portal == nil || portal.OtherUserID == "" {
+	if ctx.Err() != nil || portal == nil || portal.MXID == "" || portal.RoomType != database.RoomTypeDM || portal.OtherUserID == "" {
 		return
 	}
 	jid, err := waid.ParsePortalID(portal.ID)
 	if err != nil || !matrixRTCCallPortalServer(jid.Server) {
 		return
 	}
-	portal.UpdateInfo(ctx, wa.wrapDMInfo(ctx, jid), wa.UserLogin, nil, time.Time{})
+	mx, ok := portal.Bridge.Matrix.(*bridgev2matrix.Connector)
+	if !ok {
+		return
+	}
+	roomID := portal.MXID
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	release, ok := rtcPermissionLocks.acquire(ctx, string(roomID))
+	if !ok {
+		return
+	}
+	defer release()
+	currentRoom := func() bool { return portal.MXID == roomID }
+	err = reconcileRTCPermission(ctx, currentRoom, func() (func() error, error) {
+		// Recompute the policy for every attempt, including after an ambiguous
+		// send. The current power levels are never reused across attempts.
+		if ctx.Err() != nil || !currentRoom() {
+			return nil, ctx.Err()
+		}
+		var current event.PowerLevelsEventContent
+		if err := mx.Bot.StateEvent(ctx, roomID, event.StatePowerLevels, "", &current); err != nil {
+			return nil, fmt.Errorf("read MatrixRTC power levels: %w", err)
+		}
+		power := current.Clone()
+		// Observe the current alias-aware policy after the state read, not before
+		// a potentially slow homeserver response.
+		apply := wa.rtcPortalPowerForRoom(ctx, jid, true, false)
+		if ctx.Err() != nil || !currentRoom() {
+			return nil, ctx.Err()
+		}
+		if !apply(power) {
+			return nil, nil
+		}
+		return func() error {
+			_, err := portal.Bridge.Bot.SendState(ctx, roomID, event.StatePowerLevels, "", &event.Content{Parsed: power}, time.Time{})
+			return err
+		}, nil
+	})
+	if err != nil && ctx.Err() == nil {
+		wa.UserLogin.Log.Warn().Err(err).Stringer("room_id", roomID).Msg("Failed to refresh MatrixRTC call permission")
+	}
 }
 
 func (wa *WhatsAppClient) refreshMatrixRTCCallPermissionForJID(ctx context.Context, jid types.JID) {
@@ -710,19 +990,66 @@ func (wa *WhatsAppClient) refreshMatrixRTCCallPermissionForJID(ctx context.Conte
 	}
 }
 
-// Re-evaluate every existing 1:1 portal after WhatsApp reconnects. WhatsApp's
+// Only query capabilities for eligible encrypted call portals, and share the
+// same active network probe limit as opportunistic chat-view refreshes.
+func (wa *WhatsAppClient) refreshMatrixRTCPortalCapability(ctx context.Context, portal *bridgev2.Portal, jid types.JID) {
+	if ctx.Err() != nil || !wa.Main.Config.ExperimentalWhatsAppVoIP || wa.Main.Config.RTCGatewaySocket == "" {
+		return
+	}
+	mx, ok := portal.Bridge.Matrix.(*bridgev2matrix.Connector)
+	if !ok || !mx.Config.Encryption.Allow {
+		return
+	}
+	if wa.IsOwnJID(jid) {
+		return
+	}
+	if a, _ := matrixRTCCallStaticJIDAvailability(jid); a == matrixRTCCallAvailabilityDisabled {
+		return
+	}
+	room := portal.MXID
+	lookupCtx, cancelLookup := context.WithTimeout(ctx, 5*time.Second)
+	encrypted, err := mx.StateStore.IsEncrypted(lookupCtx, room)
+	cancelLookup()
+	if err != nil || !encrypted || ctx.Err() != nil || portal.MXID != room {
+		return
+	}
+	aliasCtx, cancelAliases := context.WithTimeout(ctx, 250*time.Millisecond)
+	keys := wa.matrixRTCCallAvailabilityKeys(aliasCtx, jid)
+	cancelAliases()
+	if _, ok := matrixRTCCallAvailabilityCache.get(keys, time.Now()); ok {
+		return
+	}
+	if !rtcProbes.acquire(ctx) {
+		return
+	}
+	defer rtcProbes.releaseSlot()
+	if ctx.Err() != nil || portal.MXID != room || wa.Client == nil || !wa.Client.IsConnected() {
+		return
+	}
+	queryCtx, cancelQuery := context.WithTimeout(ctx, 20*time.Second)
+	defer cancelQuery()
+	wa.matrixRTCCallAvailabilityForPeer(queryCtx, jid)
+}
+
+// Re-evaluate every existing 1:1 portal after WhatsApp reconnects and periodically. WhatsApp's
 // own consumer clients refresh business calling metadata independently of a
 // call attempt; doing the same here makes Element's call controls reflect the
 // remote account state before the user presses Call.
 func (wa *WhatsAppClient) refreshMatrixRTCExistingDMPortals(ctx context.Context) {
+	if ctx.Err() != nil || wa.Client == nil || !wa.Client.IsConnected() {
+		return
+	}
 	portals, err := wa.Main.Bridge.GetAllPortalsWithMXID(ctx)
 	if err != nil {
 		wa.UserLogin.Log.Warn().Err(err).Msg("Failed to enumerate portals for MatrixRTC callability refresh")
 		return
 	}
-	sem := make(chan struct{}, 4)
-	var wg sync.WaitGroup
+	refresh := newRTCPortalRefreshBatch(ctx, 4)
+	defer refresh.wait()
 	for _, portal := range portals {
+		if ctx.Err() != nil {
+			return
+		}
 		if portal == nil || portal.MXID == "" || portal.RoomType != database.RoomTypeDM || portal.OtherUserID == "" {
 			continue
 		}
@@ -734,20 +1061,17 @@ func (wa *WhatsAppClient) refreshMatrixRTCExistingDMPortals(ctx context.Context)
 			continue
 		}
 		portal := portal
-		jid = jid.ToNonAD()
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				return
+		if !refresh.submit(func() {
+			// Refresh an expired observation directly in this bounded batch.
+			// Do not rely on the opportunistic chat-view probe queue.
+			wa.refreshMatrixRTCPortalCapability(ctx, portal, jid)
+			if ctx.Err() == nil {
+				wa.refreshMatrixRTCCallPermission(ctx, portal)
 			}
-			wa.refreshMatrixRTCCallPermission(ctx, portal)
-		}()
+		}) {
+			return
+		}
 	}
-	wg.Wait()
 }
 
 // Restricted DM portals must not advertise call permission. Element derives
@@ -783,8 +1107,16 @@ func matrixRTCDMPowerLevelsForPeer(restrictCalls bool, events map[event.Type]int
 	return matrixRTCPowerLevels(restrictCalls, events)
 }
 
+type rtcGroupUpdate struct {
+	targets  []string
+	deadline time.Time
+}
+
 type rtcOutgoingSession struct {
-	groupUpdates chan []string
+	linkOwner    *WhatsAppClient
+	linkCall     *meowcaller.Call
+	ctx          context.Context
+	groupUpdates chan rtcGroupUpdate
 	seenUpdates  map[string]bool
 	device       id.DeviceID
 	eventID      string
@@ -792,29 +1124,31 @@ type rtcOutgoingSession struct {
 	cancel       context.CancelFunc
 }
 
-type rtcIntentRecord struct {
-	intent  string
-	expires time.Time
+type rtcPendingInvite struct {
+	sender string
+	device id.DeviceID
+	cancel context.CancelFunc
 }
 
 type rtcMemberRecord struct {
 	eventID  string
 	sticky   bool
 	memberID string
+	joinTS   uint64
 	deviceID string
 	format   string
 	slotID   string
 	sender   string
-	intent   string
 	expires  time.Time
 }
 
 type rtcLegacyMemberContent struct {
-	DeviceID     string `json:"device_id"`
-	Application  string `json:"application"`
-	CallID       string `json:"call_id"`
-	MembershipID string `json:"membershipID"`
-	Intent       string `json:"m.call.intent"`
+	DeviceID     string  `json:"device_id"`
+	Application  string  `json:"application"`
+	CallID       string  `json:"call_id"`
+	MembershipID string  `json:"membershipID"`
+	CreatedTS    *uint64 `json:"created_ts"`
+	Intent       string  `json:"m.call.intent"`
 }
 
 type rtcMemberContent struct {
@@ -830,6 +1164,7 @@ type rtcMemberContent struct {
 }
 
 type rtcInviteContent struct {
+	GroupMode        string `json:"fi.mau.whatsapp.group_call_mode"`
 	SlotID           string `json:"slot_id"`
 	SenderTS         int64  `json:"sender_ts"`
 	Lifetime         int64  `json:"lifetime"`
@@ -877,10 +1212,6 @@ func rtcSessionKey(roomID, slotID string) string {
 	return roomID + "\x00" + canonicalMatrixRTCSlotID(slotID)
 }
 
-func rtcIntentKey(roomID, slotID, sender string) string {
-	return roomID + "\x00" + canonicalMatrixRTCSlotID(slotID) + "\x00" + sender
-}
-
 func rtcMemberEventKey(roomID, eventID string) string {
 	return roomID + "\x00" + eventID
 }
@@ -894,9 +1225,6 @@ func (wa *WhatsAppConnector) initMatrixRTCEvents() {
 	wa.rtcMu.Lock()
 	if wa.rtcOutgoing == nil {
 		wa.rtcOutgoing = make(map[string]rtcOutgoingSession)
-	}
-	if wa.rtcIntents == nil {
-		wa.rtcIntents = make(map[string]rtcIntentRecord)
 	}
 	if wa.rtcMembers == nil {
 		wa.rtcMembers = make(map[string]rtcMemberRecord)
@@ -931,25 +1259,19 @@ func (wa *WhatsAppConnector) handleMatrixRTCMember(ctx context.Context, evt *eve
 		return
 	}
 	content.SlotID = canonicalMatrixRTCSlotID(content.SlotID)
-	key := rtcIntentKey(evt.RoomID.String(), content.SlotID, evt.Sender.String())
 	wa.rtcMu.Lock()
 	defer wa.rtcMu.Unlock()
 	wa.pruneRTCRecords(time.Now())
 	isJoin := content.Member.Membership == "join" || (content.Member.Membership == "" && content.Member.ID != "")
 	if !isJoin || content.Application.Type != "m.call" {
-		delete(wa.rtcIntents, key)
 		for k, v := range wa.rtcMembers {
-			if strings.HasPrefix(k, evt.RoomID.String()+"\x00") && v.sender == evt.Sender.String() && v.slotID == content.SlotID && (content.Member.ID == "" || v.memberID == content.Member.ID) {
+			if rtcWithdrawalMatches(k, v, evt.RoomID.String(), content.SlotID, evt.Sender.String(), string(rtcTrustedDevice(evt)), content.Member.ID, true, 0) {
 				delete(wa.rtcMembers, k)
 			}
 		}
 		return
 	}
-	expires := time.Now().Add(rtcIntentLifetime)
-	intent := content.Application.Intent
-	if intent == "audio" || intent == "video" {
-		wa.rtcIntents[key] = rtcIntentRecord{intent: intent, expires: expires}
-	}
+	expires := time.Now().Add(rtcMemberLifetime)
 	if evt.ID != "" {
 		format := "msc"
 		if content.Member.Membership == "" {
@@ -959,7 +1281,6 @@ func (wa *WhatsAppConnector) handleMatrixRTCMember(ctx context.Context, evt *eve
 			sticky: true, memberID: content.Member.ID, deviceID: string(rtcTrustedDevice(evt)), format: format,
 			slotID:  content.SlotID,
 			sender:  evt.Sender.String(),
-			intent:  intent,
 			expires: expires,
 		}
 	}
@@ -996,6 +1317,16 @@ func legacyMatrixRTCSlot(application, callID string) string {
 	return canonicalMatrixRTCSlotID(application + "#" + callID)
 }
 
+// Match the worker's legacy state translator: a refresh keeps the original
+// created_ts, clamped to the server timestamp. Without created_ts a replacement
+// event cannot prove that it is a refresh of the same generation.
+func legacyRTCJoinTimestamp(serverTS int64, createdTS *uint64) uint64 {
+	if serverTS <= 0 || createdTS == nil || *createdTS == 0 {
+		return 0
+	}
+	return min(uint64(serverTS), *createdTS)
+}
+
 func (wa *WhatsAppConnector) handleMatrixRTCLegacyMember(ctx context.Context, evt *event.Event) {
 	if evt == nil || evt.RoomID == "" || evt.Sender == "" || evt.ID == "" {
 		return
@@ -1009,15 +1340,15 @@ func (wa *WhatsAppConnector) handleMatrixRTCLegacyMember(ctx context.Context, ev
 	// content Matrix exposes it in unsigned.prev_content, so use that as a
 	// prompt cancellation path too.
 	if content.Application == "" && evt.Unsigned.PrevContent != nil {
-		_ = json.Unmarshal(evt.Unsigned.PrevContent.VeryRaw, &content)
+		if err := json.Unmarshal(evt.Unsigned.PrevContent.VeryRaw, &content); err != nil {
+			return
+		}
 		if content.MembershipID == "" && content.DeviceID != "" {
 			content.MembershipID = evt.Sender.String() + ":" + content.DeviceID
 		}
 		wa.rtcMu.Lock()
-		key := rtcIntentKey(evt.RoomID.String(), legacyMatrixRTCSlot(content.Application, content.CallID), evt.Sender.String())
-		delete(wa.rtcIntents, key)
 		for k, v := range wa.rtcMembers {
-			if strings.HasPrefix(k, evt.RoomID.String()+"\x00") && v.sender == evt.Sender.String() && v.memberID == content.MembershipID && v.deviceID == content.DeviceID {
+			if rtcWithdrawalMatches(k, v, evt.RoomID.String(), legacyMatrixRTCSlot(content.Application, content.CallID), evt.Sender.String(), content.DeviceID, content.MembershipID, false, legacyRTCJoinTimestamp(evt.Timestamp, content.CreatedTS)) {
 				delete(wa.rtcMembers, k)
 			}
 		}
@@ -1036,17 +1367,18 @@ func (wa *WhatsAppConnector) handleMatrixRTCLegacyMember(ctx context.Context, ev
 	if slotID == "" {
 		return
 	}
-	intent := content.Intent
-	if intent != "audio" && intent != "video" {
-		intent = "video"
-	}
-	expires := time.Now().Add(rtcIntentLifetime)
-	record := rtcMemberRecord{memberID: content.MembershipID, deviceID: content.DeviceID, format: "room_state", slotID: slotID, sender: evt.Sender.String(), intent: intent, expires: expires}
+	expires := time.Now().Add(rtcMemberLifetime)
+	record := rtcMemberRecord{memberID: content.MembershipID, joinTS: legacyRTCJoinTimestamp(evt.Timestamp, content.CreatedTS), deviceID: content.DeviceID, format: "room_state", slotID: slotID, sender: evt.Sender.String(), expires: expires}
 	wa.rtcMu.Lock()
 	wa.pruneRTCRecords(time.Now())
 	wa.rtcMembers[rtcMemberEventKey(evt.RoomID.String(), evt.ID.String())] = record
-	wa.rtcIntents[rtcIntentKey(evt.RoomID.String(), slotID, evt.Sender.String())] = rtcIntentRecord{intent: intent, expires: expires}
 	wa.rtcMu.Unlock()
+}
+
+// An ambiguous withdrawal is not evidence of a specific cached join ending.
+// The worker separately verifies the current roster before dialing.
+func rtcWithdrawalMatches(key string, record rtcMemberRecord, room, slot, sender, device, member string, sticky bool, join uint64) bool {
+	return device != "" && member != "" && slot != "" && strings.HasPrefix(key, room+"\x00") && record.slotID == slot && record.sender == sender && record.deviceID == device && record.memberID == member && record.sticky == sticky && (sticky || (join != 0 && record.joinTS == join))
 }
 
 // Called with rtcMu held. Event IDs are generally looked up only once.
@@ -1056,16 +1388,11 @@ func (wa *WhatsAppConnector) pruneRTCRecords(now time.Time) {
 			delete(wa.rtcMembers, k)
 		}
 	}
-	for k, v := range wa.rtcIntents {
-		if !v.expires.After(now) {
-			delete(wa.rtcIntents, k)
-		}
-	}
 }
 
 func rtcTrustedDevice(evt *event.Event) id.DeviceID {
 	d := evt.Mautrix.TrustSource
-	if !evt.Mautrix.WasEncrypted || evt.Mautrix.ForwardedKeys || d == nil || d.UserID != evt.Sender || evt.Mautrix.TrustState < id.TrustStateCrossSignedTOFU {
+	if !evt.Mautrix.WasEncrypted || evt.Mautrix.ForwardedKeys || d == nil || d.Deleted || d.UserID != evt.Sender || evt.Mautrix.TrustState < id.TrustStateCrossSignedTOFU {
 		return ""
 	}
 	return d.DeviceID
@@ -1092,45 +1419,21 @@ func (wa *WhatsAppConnector) matrixRTCMemberForNotification(roomID, eventID, sen
 	return record, true
 }
 
-func (wa *WhatsAppConnector) matrixRTCIntent(ctx context.Context, roomID, slotID, sender, hinted string) string {
-	if hinted == "audio" || hinted == "video" {
-		return hinted
+// The encrypted invitation may explicitly choose a mode. Otherwise the worker
+// resolves the current authenticated membership; historical cache entries are
+// never used to infer media intent.
+func rtcInvitationIntent(top, nested string) (string, bool) {
+	valid := func(s string) bool { return s == "audio" || s == "video" }
+	if valid(top) && valid(nested) && top != nested {
+		return "", false
 	}
-	deadline := time.NewTimer(rtcIntentWait)
-	defer deadline.Stop()
-	ticker := time.NewTicker(25 * time.Millisecond)
-	defer ticker.Stop()
-	key := rtcIntentKey(roomID, slotID, sender)
-	lookup := func() string {
-		wa.rtcMu.Lock()
-		defer wa.rtcMu.Unlock()
-		record, ok := wa.rtcIntents[key]
-		if !ok {
-			return ""
-		}
-		if time.Now().After(record.expires) {
-			delete(wa.rtcIntents, key)
-			return ""
-		}
-		return record.intent
+	if valid(top) {
+		return top, true
 	}
-	if intent := lookup(); intent != "" {
-		return intent
+	if valid(nested) {
+		return nested, true
 	}
-	for {
-		select {
-		case <-ctx.Done():
-			return ""
-		case <-deadline.C:
-			// MatrixRTC's own CallIntent default is video when no participant
-			// states an intent, so mirror that instead of silently downgrading.
-			return "video"
-		case <-ticker.C:
-			if intent := lookup(); intent != "" {
-				return intent
-			}
-		}
-	}
+	return "auto", true
 }
 
 func isMatrixRTCBridgeBotControlMembership(joined []id.UserID, bot, sender id.UserID, isGhost func(id.UserID) bool) bool {
@@ -1244,6 +1547,72 @@ func mentionsGhost(content *rtcInviteContent, ghostMXID string) bool {
 	return len(content.Mentions.UserIDs) == 0 && (content.NotificationType != "" || content.Application.NotificationType != "")
 }
 
+// Resolve the two MSC4075 spellings without letting a conflicting copy turn a
+// visual-only notification into an audible ring. Empty values retain the
+// existing compatibility path for an invite without a notification_type.
+func rtcNotificationPolicy(content *rtcInviteContent) (string, bool) {
+	top, nested := content.NotificationType, content.Application.NotificationType
+	for _, value := range []string{top, nested} {
+		if value != "" && value != "ring" && value != "notification" {
+			return "", false
+		}
+	}
+	if top != "" && nested != "" && top != nested {
+		return "", false
+	}
+	if top != "" {
+		return top, true
+	}
+	return nested, true
+}
+
+// A reference to an active invitation is not a membership reference. Handle
+// it exclusively, including refusals, so a rejected follow-up cannot start a
+// second session. Caller holds rtcMu for the current room/slot generation.
+func routeRTCGroupFollowup(current rtcOutgoingSession, content rtcInviteContent, notificationType, eventID, sender string, device id.DeviceID, targets []string, deadline, now time.Time) bool {
+	if current.eventID == "" || content.RelatesTo.RelType != "m.reference" || content.RelatesTo.EventID != current.eventID {
+		return false
+	}
+	if content.GroupMode != "" || (current.ctx != nil && current.ctx.Err() != nil) || current.groupUpdates == nil || current.seenUpdates == nil || eventID == "" || eventID == current.eventID || current.sender != sender || device == "" || current.device != device ||
+		(content.SlotID != "" && content.SlotID != matrixRTCSlotDefault) || (content.StickyKey != "" && content.StickyKey != matrixRTCSlotDefault) ||
+		(notificationType != "" && notificationType != "notification") || content.Mentions.Room || len(targets) == 0 || len(targets) > 31 ||
+		len(current.seenUpdates) >= 128 || current.seenUpdates[eventID] || !now.Before(deadline) {
+		return true
+	}
+	select {
+	case current.groupUpdates <- rtcGroupUpdate{targets: targets, deadline: deadline}:
+		current.seenUpdates[eventID] = true
+	default:
+	}
+	return true
+}
+
+func (wa *WhatsAppConnector) routeActiveRTCGroupFollowup(ctx context.Context, evt *event.Event, content rtcInviteContent, notificationType string, device id.DeviceID, deadline time.Time) bool {
+	if content.RelatesTo.RelType != "m.reference" || content.RelatesTo.EventID == "" {
+		return false
+	}
+	var targets []string
+	if !content.Mentions.Room && len(content.Mentions.UserIDs) <= 31 {
+		seen := make(map[string]bool)
+		for _, mxid := range content.Mentions.UserIDs {
+			if user, isGhost := wa.Bridge.Matrix.ParseGhostMXID(id.UserID(mxid)); isGhost {
+				jid := waid.ParseUserID(user).ToNonAD()
+				if !jid.IsEmpty() && !seen[jid.String()] {
+					targets = append(targets, jid.String())
+					seen[jid.String()] = true
+				}
+			}
+		}
+	}
+	wa.rtcMu.Lock()
+	defer wa.rtcMu.Unlock()
+	if ctx.Err() != nil {
+		return true
+	}
+	current := wa.rtcOutgoing[rtcSessionKey(evt.RoomID.String(), matrixRTCSlotDefault)]
+	return routeRTCGroupFollowup(current, content, notificationType, evt.ID.String(), evt.Sender.String(), device, targets, deadline, time.Now())
+}
+
 func (wa *WhatsAppConnector) handleMatrixRTCInvite(ctx context.Context, evt *event.Event) {
 	if evt == nil || evt.RoomID == "" || evt.Sender == "" || evt.ID == "" {
 		return
@@ -1252,11 +1621,11 @@ func (wa *WhatsAppConnector) handleMatrixRTCInvite(ctx context.Context, evt *eve
 	if err := json.Unmarshal(evt.Content.VeryRaw, &content); err != nil {
 		return
 	}
-	notificationType := content.NotificationType
-	if notificationType == "" {
-		notificationType = content.Application.NotificationType
+	if content.GroupMode != "" && content.GroupMode != "ad_hoc" && content.GroupMode != "call_link" {
+		return
 	}
-	if notificationType != "" && notificationType != "ring" && notificationType != "notification" {
+	notificationType, validNotification := rtcNotificationPolicy(&content)
+	if !validNotification {
 		return
 	}
 	lifetime := content.Lifetime
@@ -1290,26 +1659,127 @@ func (wa *WhatsAppConnector) handleMatrixRTCInvite(ctx context.Context, evt *eve
 	if content.SlotID == "" && content.StickyKey != "" {
 		return
 	}
-	if wa.rejectMatrixRTCBridgeBotControlCall(ctx, evt) {
-		return
-	}
 	device := rtcTrustedDevice(evt)
-	if device == "" {
+	ringDeadline := sent.Add(time.Duration(lifetime) * time.Millisecond)
+	// Visual-only notices cannot trigger a control-room decline. Preserve the
+	// existing control-room handling for rings even when no trusted device is
+	// available, but never admit an untrusted outgoing call.
+	if device == "" && notificationType == "notification" {
 		return
 	}
+	// All network/DB operations run off the appservice event processor. Register
+	// pending ownership synchronously so a subsequent decline can cancel it.
+	snapshot := *evt
+	if evt.Mautrix.TrustSource != nil {
+		trust := *evt.Mautrix.TrustSource
+		snapshot.Mautrix.TrustSource = &trust
+	}
+	snapshot.Content.VeryRaw = append(json.RawMessage(nil), evt.Content.VeryRaw...)
+	wa.queueRTCInvite(&snapshot, device, ringDeadline, func(pendingCtx context.Context) {
+		if pendingCtx.Err() != nil {
+			return
+		}
+		if notificationType != "notification" && wa.rejectMatrixRTCBridgeBotControlCall(pendingCtx, &snapshot) {
+			return
+		}
+		if device == "" || pendingCtx.Err() != nil {
+			return
+		}
+		if wa.routeActiveRTCGroupFollowup(pendingCtx, &snapshot, content, notificationType, device, ringDeadline) {
+			return
+		}
+		if content.SlotID == "" || ((snapshot.Type.Type == rtcInviteWire || snapshot.Type.Type == rtcNotificationStable) && content.RelatesTo.RelType == "m.reference" && content.RelatesTo.EventID != "") {
+			if content.RelatesTo.RelType != "m.reference" || content.RelatesTo.EventID == "" {
+				return
+			}
+			wait, stop := context.WithTimeout(pendingCtx, rtcReferenceWait)
+			record, ok := waitRTCReferencedMember(wait, 25*time.Millisecond, string(device), func() (rtcMemberRecord, bool) {
+				return wa.matrixRTCMemberForNotification(snapshot.RoomID.String(), content.RelatesTo.EventID, snapshot.Sender.String())
+			})
+			stop()
+			if ok && pendingCtx.Err() == nil {
+				wa.completeMatrixRTCInvite(pendingCtx, &snapshot, content, notificationType, device, ringDeadline, originalSlot, &record)
+			}
+			return
+		}
+		wa.completeMatrixRTCInvite(pendingCtx, &snapshot, content, notificationType, device, ringDeadline, originalSlot, nil)
+	})
+}
+
+// waitRTCReferencedMember returns only a matching, still-live membership. A
+// mismatching device is a terminal refusal rather than a reason to retry.
+func waitRTCReferencedMember(ctx context.Context, interval time.Duration, device string, lookup func() (rtcMemberRecord, bool)) (rtcMemberRecord, bool) {
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	for {
+		if ctx.Err() != nil {
+			return rtcMemberRecord{}, false
+		}
+		if record, ok := lookup(); ok {
+			if ctx.Err() != nil || (record.deviceID != "" && record.deviceID != device) {
+				return rtcMemberRecord{}, false
+			}
+			return record, true
+		}
+		select {
+		case <-ctx.Done():
+			return rtcMemberRecord{}, false
+		case <-tick.C:
+		}
+	}
+}
+
+func (wa *WhatsAppConnector) queueRTCInvite(evt *event.Event, device id.DeviceID, deadline time.Time, resume func(context.Context)) {
+	key := rtcMemberEventKey(evt.RoomID.String(), evt.ID.String())
+	ctx, cancel := context.WithDeadline(wa.Bridge.BackgroundCtx, deadline)
+	wa.rtcMu.Lock()
+	if wa.rtcPendingInvites == nil {
+		wa.rtcPendingInvites = make(map[string]rtcPendingInvite)
+	}
+	if _, exists := wa.rtcPendingInvites[key]; exists || len(wa.rtcPendingInvites) >= rtcPendingInviteLimit || ctx.Err() != nil {
+		wa.rtcMu.Unlock()
+		cancel()
+		return
+	}
+	wa.rtcPendingInvites[key] = rtcPendingInvite{sender: evt.Sender.String(), device: device, cancel: cancel}
+	wa.rtcMu.Unlock()
+	go func() {
+		defer cancel()
+		defer func() {
+			wa.rtcMu.Lock()
+			delete(wa.rtcPendingInvites, key)
+			wa.rtcMu.Unlock()
+		}()
+		if ctx.Err() == nil {
+			resume(ctx)
+		}
+	}()
+}
+
+func (wa *WhatsAppConnector) completeMatrixRTCInvite(ctx context.Context, evt *event.Event, content rtcInviteContent, notificationType string, device id.DeviceID, ringDeadline time.Time, originalSlot string, record *rtcMemberRecord) {
+	// The worker independently refreshes the actual device keys. A reused device
+	// ID must not authorize a different cryptographic identity.
+	trust := evt.Mautrix.TrustSource
+	if rtcTrustedDevice(evt) != device || device == "" || trust == nil || !rtcwire.ValidDeviceKey(string(trust.SigningKey)) || !rtcwire.ValidDeviceKey(string(trust.IdentityKey)) {
+		return
+	}
+	signingKey, identityKey := string(trust.SigningKey), string(trust.IdentityKey)
 	membershipFormat := "msc"
 	memberEvent := ""
-	// MSC4075 relates the ring to its membership event. Some versions also
-	// include a slot_id: that does not make the ring a new MSC4143 invite.
-	if content.SlotID == "" || ((evt.Type.Type == rtcInviteWire || evt.Type.Type == rtcNotificationStable) && content.RelatesTo.RelType == "m.reference" && content.RelatesTo.EventID != "") {
-		if content.RelatesTo.RelType != "m.reference" {
-			return
-		}
-		record, ok := wa.matrixRTCMemberForNotification(evt.RoomID.String(), content.RelatesTo.EventID, evt.Sender.String())
-		if !ok || (record.deviceID != "" && record.deviceID != string(device)) {
-			return
-		}
+	memberJoinID := ""
+	var memberJoinTS uint64
+	if record != nil {
 		memberEvent = content.RelatesTo.EventID
+		// The referenced event was independently observed in this room, and
+		// the encrypted invitation must bind its sender and device. Legacy
+		// member IDs alone are reusable: require the original join timestamp.
+		if record.sender == evt.Sender.String() && record.deviceID == string(device) && device != "" {
+			if record.format == "msc" && record.sticky {
+				memberJoinID = record.memberID
+			} else if record.format == "room_state" && record.memberID != "" && record.joinTS != 0 {
+				memberJoinID, memberJoinTS = record.memberID, record.joinTS
+			}
+		}
 		membershipFormat = record.format
 		if membershipFormat == "" {
 			membershipFormat = "room_state"
@@ -1319,11 +1789,12 @@ func (wa *WhatsAppConnector) handleMatrixRTCInvite(ctx context.Context, evt *eve
 			return
 		}
 		content.SlotID = relatedSlot
-		if content.Intent == "" && content.Application.Intent == "" {
-			content.Intent = record.intent
-		}
 	}
 	if content.SlotID != matrixRTCSlotDefault || (content.StickyKey != "" && content.StickyKey != content.SlotID) {
+		return
+	}
+	if content.GroupMode == "call_link" {
+		wa.completeRTCCallLinkInvite(ctx, evt, content, notificationType, device, ringDeadline, membershipFormat, memberEvent, memberJoinID, memberJoinTS)
 		return
 	}
 	portal, err := wa.Bridge.GetPortalByMXID(ctx, evt.RoomID)
@@ -1365,7 +1836,21 @@ func (wa *WhatsAppConnector) handleMatrixRTCInvite(ctx context.Context, evt *eve
 	// WhatsApp ghost itself. Never feed those events back into WhatsApp or an
 	// incoming WhatsApp -> Matrix ring could recursively start an outgoing call.
 	var targets []string
-	if isGroup && !content.Mentions.Room {
+	adHoc := content.GroupMode == "ad_hoc"
+	if adHoc {
+		var valid bool
+		targets, valid = rtcAdHocTargets(isGroup, content.Mentions.Room, content.Mentions.UserIDs, func(mxid string) (string, bool) {
+			ghost, ok := wa.Bridge.Matrix.ParseGhostMXID(id.UserID(mxid))
+			if !ok {
+				return "", false
+			}
+			jid := waid.ParseUserID(ghost).ToNonAD()
+			return jid.String(), !jid.IsEmpty() && (jid.Server == types.DefaultUserServer || jid.Server == types.HiddenUserServer) && !client.IsOwnJID(jid)
+		})
+		if !valid {
+			return
+		}
+	} else if isGroup && !content.Mentions.Room {
 		for _, mxid := range content.Mentions.UserIDs {
 			if user, isGhost := wa.Bridge.Matrix.ParseGhostMXID(id.UserID(mxid)); isGhost {
 				targets = append(targets, waid.ParseUserID(user).ToNonAD().String())
@@ -1379,43 +1864,44 @@ func (wa *WhatsAppConnector) handleMatrixRTCInvite(ctx context.Context, evt *eve
 		return
 	}
 
-	ringDeadline := sent.Add(time.Duration(lifetime) * time.Millisecond)
+	intent, validIntent := rtcInvitationIntent(content.Intent, content.Application.Intent)
+	if !validIntent {
+		return
+	}
+
 	// The invitation deadline applies only until WhatsApp answers. An active
 	// session must outlive the original ring deadline.
-	callCtx, cancel := context.WithCancel(wa.Bridge.BackgroundCtx)
+	callCtx, cancel, admitted := client.bindVoIPConnection(wa.Bridge.BackgroundCtx)
+	if !admitted {
+		return
+	}
 	key := rtcSessionKey(evt.RoomID.String(), content.SlotID)
 	wa.rtcMu.Lock()
-	if current, exists := wa.rtcOutgoing[key]; exists {
-		// Only a signed follow-up for this active group invitation may ring named
-		// roster members. An unrelated invite never replaces the running call.
-		if isGroup && current.groupUpdates != nil && len(targets) > 0 && current.sender == evt.Sender.String() && current.device == device &&
-			content.RelatesTo.RelType == "m.reference" && content.RelatesTo.EventID == current.eventID && !current.seenUpdates[evt.ID.String()] && len(current.seenUpdates) < 128 {
-			select {
-			case current.groupUpdates <- targets:
-				current.seenUpdates[evt.ID.String()] = true
-			default:
-			}
-		}
+	// Declines of pending invites cancel under this same lock, so
+	// a cancelled continuation cannot cross the outgoing admission boundary.
+	if ctx.Err() != nil || callCtx.Err() != nil || !time.Now().Before(ringDeadline) {
 		wa.rtcMu.Unlock()
 		cancel()
 		return
 	}
-	var groupUpdates chan []string
-	if isGroup {
-		groupUpdates = make(chan []string, 4)
+	if current, exists := wa.rtcOutgoing[key]; exists && (current.ctx == nil || current.ctx.Err() == nil || current.eventID == evt.ID.String()) {
+		// Follow-ups are routed before membership resolution; this path must
+		// never replace or mutate an already-owned session.
+		wa.rtcMu.Unlock()
+		cancel()
+		return
 	}
-	wa.rtcOutgoing[key] = rtcOutgoingSession{groupUpdates: groupUpdates, seenUpdates: make(map[string]bool), eventID: evt.ID.String(), sender: evt.Sender.String(), device: device, cancel: cancel}
+	var groupUpdates chan rtcGroupUpdate
+	if isGroup && !adHoc {
+		groupUpdates = make(chan rtcGroupUpdate, 4)
+	}
+	wa.rtcOutgoing[key] = rtcOutgoingSession{ctx: callCtx, groupUpdates: groupUpdates, seenUpdates: make(map[string]bool), eventID: evt.ID.String(), sender: evt.Sender.String(), device: device, cancel: cancel}
 	wa.rtcMu.Unlock()
 
-	hintedIntent := content.Intent
-	if hintedIntent == "" {
-		hintedIntent = content.Application.Intent
-	}
 	go func() {
 		defer cancel()
 		defer wa.finishMatrixRTCOutgoing(key, evt.ID.String())
-		intent := wa.matrixRTCIntent(callCtx, evt.RoomID.String(), content.SlotID, evt.Sender.String(), hintedIntent)
-		if intent == "" || callCtx.Err() != nil {
+		if callCtx.Err() != nil {
 			return
 		}
 		callID := evt.ID.String()
@@ -1452,7 +1938,7 @@ func (wa *WhatsAppConnector) handleMatrixRTCInvite(ctx context.Context, evt *eve
 			groupJID = peer.ToNonAD().String()
 		}
 		if err := client.runOutgoingRTCGateway(
-			callCtx, callID, roomID, content.SlotID, membershipFormat, ghostMXID, evt.Sender.String(), string(device), memberEvent, peer.ToNonAD().String(), isGroup, groupJID, intent == "video", ringDeadline, targets, groupUpdates,
+			callCtx, callID, roomID, content.SlotID, membershipFormat, ghostMXID, evt.Sender.String(), string(device), signingKey, identityKey, memberEvent, memberJoinID, memberJoinTS, peer.ToNonAD().String(), isGroup, groupJID, intent, ringDeadline, targets, groupUpdates, adHoc, "",
 		); err != nil && callCtx.Err() == nil {
 			client.UserLogin.Log.Warn().Err(err).
 				Str("matrix_event_id", callID).
@@ -1497,6 +1983,10 @@ func (wa *WhatsAppConnector) handleMatrixRTCDecline(ctx context.Context, evt *ev
 	}
 	wa.rtcMu.Lock()
 	var cancel context.CancelFunc
+	device := rtcTrustedDevice(evt)
+	if pending, ok := wa.rtcPendingInvites[rtcMemberEventKey(evt.RoomID.String(), referenced)]; ok && pending.sender == evt.Sender.String() && device != "" && pending.device == device {
+		pending.cancel()
+	}
 	for key, current := range wa.rtcOutgoing {
 		if strings.HasPrefix(key, evt.RoomID.String()+"\x00") && current.eventID == referenced && current.sender == evt.Sender.String() && rtcTrustedDevice(evt) == current.device {
 			cancel = current.cancel

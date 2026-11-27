@@ -2,6 +2,7 @@ package meowcaller
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
@@ -54,7 +55,8 @@ func (e *engine) placeGroupCall(
 	if err != nil {
 		return nil, err
 	}
-	node.Attrs["id"] = e.nextCallNodeID()
+	offerNodeID := e.nextCallNodeID()
+	node.Attrs["id"] = offerNodeID
 	groupState := selectedGroupCallState(selected)
 	groupState.GroupJID = groupJID
 	call := &Call{
@@ -69,7 +71,9 @@ func (e *engine) placeGroupCall(
 	m.creator = self
 	m.from = types.NewJID(callID, "call")
 	m.direction = CallDirectionOutgoing
+	m.offerNodeID = offerNodeID
 	m.group = true
+	m.explicitAdHoc = opts.strictAdHoc
 	m.videoMode = opts.Video
 	m.localVideo = opts.Video
 	m.remoteVideo = opts.Video
@@ -79,7 +83,7 @@ func (e *engine) placeGroupCall(
 	}
 	e.mu.Unlock()
 	if err = e.transmitCallNode(ctx, node); err != nil {
-		e.finishCall(callID, "offer_failed")
+		e.finishCallIfCurrent(call, "offer_failed")
 		return nil, fmt.Errorf("meowcaller: send group offer: %w", err)
 	}
 	e.c.log.Info().
@@ -87,6 +91,7 @@ func (e *engine) placeGroupCall(
 		Int("target_count", len(selected)).
 		Bool("video", opts.Video).
 		Msg("group offer sent")
+	go e.watchOutgoingOfferAck(call, offerNodeID)
 	return call, nil
 }
 
@@ -437,8 +442,11 @@ func (e *engine) joinPublicCallLink(
 	if err != nil {
 		return nil, err
 	}
-	if joined.CallID == "" {
-		return nil, errors.New("meowcaller: call-link join returned no call ID")
+	if joined.CallID == "" || joined.CallCreator.IsEmpty() || callLinkMedia(joined.Media) != media || (joined.Token != "" && joined.Token != token) || (!joined.InWaitingRoom && joined.Group == nil) {
+		return nil, errors.New("meowcaller: invalid call-link join identity or media")
+	}
+	if joined.Group != nil && !joined.Group.GroupJID.IsEmpty() {
+		return nil, errors.New("meowcaller: link join returned a chat-bound group")
 	}
 	result := callLinkJoinResult{
 		Token: joined.Token, Media: callLinkMedia(joined.Media),
@@ -455,11 +463,26 @@ func (e *engine) joinPublicCallLink(
 		phase = CallPhaseWaitingRoom
 	}
 	call := &Call{eng: e, id: result.CallID, peer: result.CallCreator, phase: phase}
-	call.setWaitingRoomState(waitingRoomStateFromJoin(&result))
+	waiting := waitingRoomStateFromJoin(&result)
+	if joined.Waiting != nil {
+		waiting.TransactionID = joined.Waiting.TransactionID
+		for _, user := range joined.Waiting.Users {
+			waiting.Users = append(waiting.Users, WaitingRoomUser{JID: user.JID, PN: user.PN, State: user.State})
+		}
+	}
+	call.setWaitingRoomState(waiting)
 
 	e.mu.Lock()
+	if e.calls[result.CallID] != nil || e.recentlyEnded(result.CallID) || hasEarlyTermination(e.earlyTerminations, types.BasicCallMeta{CallID: result.CallID, From: types.NewJID(result.CallID, "call"), CallCreator: result.CallCreator}, true, time.Now()) {
+		e.mu.Unlock()
+		return nil, errors.New("meowcaller: link join conflicts with an existing or ended call")
+	}
 	m := e.entry(result.CallID)
 	m.call = call
+	m.linkCall = true
+	m.linkTokenHash = sha256.Sum256([]byte(token))
+	m.linkVideo = opts.Video
+	m.explicitAdHoc = true
 	m.group = true
 	m.selfLID = e.c.wa.Store.GetLID().String()
 	m.peerLID = result.CallCreator.String()
@@ -478,7 +501,7 @@ func (e *engine) joinPublicCallLink(
 	if result.Group != nil {
 		e.applyGroupUpdate(*result.Group)
 	}
-	if result.InWaitingRoom {
+	if result.InWaitingRoom && call.State() == CallPhaseWaitingRoom {
 		e.startWaitingRoomHeartbeat(result.CallID)
 	}
 	return call, nil
@@ -561,46 +584,103 @@ func (e *engine) setHandRaised(callID string, raised bool) error {
 	return nil
 }
 
-func (e *engine) setScreenShare(callID string, active bool, screenShareID *uint32) error {
-	// Source of truth: https://github.com/purpshell/meowcaller/blob/36d54857c74e45ccb08f6444a32d2afa13f20be9/datasheets/group-video-reactions.md#L44-L56
+// The bridge entry point carries connection cancellation and an exact call
+// handle. Never route a late command by call ID alone.
+func (e *engine) setGroupHandRaised(ctx context.Context, call *Call, raised bool) error {
 	if err := e.requireRawCallAdapter(); err != nil {
 		return err
 	}
-	creator, err := e.callControlCreator(callID)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
+	e.mu.Lock()
+	current := e.calls[call.id]
+	if current == nil || current.call != call || !current.group || current.creator.IsEmpty() ||
+		e.c == nil || e.c.wa == nil || e.c.wa.Store == nil {
+		e.mu.Unlock()
+		return errors.New("meowcaller: group hand control unavailable")
+	}
+	creator := current.creator
+	self := e.c.wa.Store.GetLID().ToNonAD()
+	call.mu.Lock()
+	group := call.groupState
+	if call.phase != CallPhaseActive || !connectedHandParticipant(group, self) {
+		call.mu.Unlock()
+		e.mu.Unlock()
+		return errors.New("meowcaller: local participant is not connected")
+	}
+	transaction := group.TransactionID
+	call.mu.Unlock()
+	e.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	node := signaling.BuildRaiseHand(call.id, types.NewJID(call.id, "call"), creator, e.nextCallNodeID(), raised)
+	if err := e.transmitCallNode(ctx, node); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	stillCurrent := e.calls[call.id] == current
+	e.mu.Unlock()
+	if ctx.Err() != nil || !stillCurrent || !call.dispatchHandRaiseAt(HandRaiseState{Participant: self, Raised: raised}, transaction) {
+		return errors.New("meowcaller: hand submission completed after ownership changed")
+	}
+	return nil
+}
+
+func (e *engine) setScreenShare(ctx context.Context, call *Call, active bool, screenShareID *uint32) error {
+	// The captured non-dual-stream mode uses the primary video SSRC. Both source
+	// switches require a fresh IDR, and neither should stop audio or the call.
+	if err := e.requireRawCallAdapter(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	current := e.calls[call.id]
+	if current == nil || current.call != call || !current.group || current.creator.IsEmpty() ||
+		e.c == nil || e.c.wa == nil || e.c.wa.Store == nil {
+		e.mu.Unlock()
+		return errors.New("meowcaller: group screen-share control unavailable")
+	}
+	if active && (!current.videoMode || !current.localVideo || current.videoGate) {
+		e.mu.Unlock()
+		return errors.New("meowcaller: screen share requires active group video")
+	}
+	creator := current.creator
+	self := e.c.wa.Store.GetLID().ToNonAD()
+	call.mu.Lock()
+	group := call.groupState
+	if call.phase != CallPhaseActive || !connectedHandParticipant(group, self) {
+		call.mu.Unlock()
+		e.mu.Unlock()
+		return errors.New("meowcaller: local participant is not connected")
+	}
+	transaction := group.TransactionID
+	call.mu.Unlock()
+	e.mu.Unlock()
 	state := signaling.ScreenShareStopped
 	if active {
 		state = signaling.ScreenShareStarted
 	}
-	node := signaling.BuildScreenShare(
-		callID,
-		types.NewJID(callID, "call"),
-		creator,
-		e.nextCallNodeID(),
-		state,
-		screenShareID,
-	)
-	if err = e.transmitCallNode(context.Background(), node); err != nil {
+	node := signaling.BuildScreenShare(call.id, types.NewJID(call.id, "call"), creator, e.nextCallNodeID(), state, screenShareID)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := e.transmitCallNode(ctx, node); err != nil {
 		return err
 	}
 	e.mu.Lock()
-	var call *Call
-	if current := e.calls[callID]; current != nil {
-		call = current.call
-	}
-	participant := e.c.wa.Store.GetLID().ToNonAD()
+	stillCurrent := e.calls[call.id] == current
 	e.mu.Unlock()
-	if call != nil {
-		call.dispatchScreenShare(ScreenShareState{
-			Participant: participant, Active: active, Version: 2,
-			ScreenShareID: valueOrZero(screenShareID), HasScreenShareID: screenShareID != nil,
-		})
-		if active {
-			call.requestVideoKeyframe()
-		}
+	if ctx.Err() != nil || !stillCurrent || !call.dispatchScreenShareAt(ScreenShareState{
+		Participant: self, Active: active, Version: 2,
+		ScreenShareID: valueOrZero(screenShareID), HasScreenShareID: screenShareID != nil,
+	}, transaction) {
+		return errors.New("meowcaller: screen-share submission completed after ownership changed")
 	}
+	call.requestVideoKeyframe()
 	return nil
 }
 
@@ -619,7 +699,7 @@ func (e *engine) startWaitingRoomHeartbeat(callID string) {
 	// Source of truth: https://github.com/tulir/whatsmeow/blob/3775fbadf88fdf44ada62ae5c5db5d7cc6f26259/call_link.go#L215-L259
 	e.mu.Lock()
 	m := e.calls[callID]
-	if m == nil || m.call == nil {
+	if m == nil || m.call == nil || !m.linkCall || m.linkAdmitted || m.call.State() != CallPhaseWaitingRoom || m.waitingRoomCancel != nil {
 		e.mu.Unlock()
 		return
 	}

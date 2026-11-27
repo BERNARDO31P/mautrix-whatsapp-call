@@ -42,6 +42,8 @@ pub mod media;
 pub mod session;
 pub mod token;
 pub mod transport_impl;
+mod trusted_focus;
+pub use trusted_focus::TrustedFocus;
 pub mod video_encoding;
 
 pub use keys::{
@@ -90,6 +92,7 @@ pub(crate) async fn acquire_token(
         // land in different LiveKit rooms. See
         // `compat::room_state::RoomStateDialect::member_content`.
         LiveKitTarget::SfuGet { service_url } => {
+            token::validate_service_url(service_url)?;
             let openid_token = backend.openid_token().await?;
             token::get_legacy_token(
                 http,
@@ -101,6 +104,7 @@ pub(crate) async fn acquire_token(
             .await
         }
         LiveKitTarget::CsApi { url, server_name } => {
+            token::validate_sfu_url(url)?;
             let request = LiveKitTokenRequest {
                 server_name: Some(server_name.clone()),
                 url: url.clone(),
@@ -126,10 +130,9 @@ pub(crate) async fn acquire_token(
                         Error::Backend(error)
                     }
                 })?;
-            Ok(SfuToken {
-                jwt,
-                url: url.clone(),
-            })
+            let token = SfuToken { jwt, url: url.clone() };
+            token::validate_sfu_token(&token)?;
+            Ok(token)
         }
     }
 }
@@ -203,6 +206,14 @@ pub(crate) fn room_options(
 /// Errors produced by the LiveKit transport.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// An endpoint is unusable before attempting network IO.
+    #[error("invalid LiveKit {0} endpoint")]
+    InvalidEndpoint(&'static str),
+
+    /// The service returned an empty or whitespace-containing credential.
+    #[error("invalid LiveKit token response")]
+    InvalidToken,
+
     /// A transport-level HTTP error while talking to the authorisation service.
     #[error("HTTP error talking to the LiveKit authorisation service: {0}")]
     Http(#[from] reqwest::Error),

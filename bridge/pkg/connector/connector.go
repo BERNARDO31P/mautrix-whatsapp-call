@@ -64,10 +64,11 @@ type WhatsAppConnector struct {
 
 	unmigratedDMs *exsync.Set[networkid.PortalKey]
 
-	rtcMu       sync.Mutex
-	rtcOutgoing map[string]rtcOutgoingSession
-	rtcIntents  map[string]rtcIntentRecord
-	rtcMembers  map[string]rtcMemberRecord
+	rtcMu             sync.Mutex
+	rtcOutgoing       map[string]rtcOutgoingSession
+	rtcMembers        map[string]rtcMemberRecord
+	rtcPendingInvites map[string]rtcPendingInvite
+	rtcLinkRooms      rtcLinkRooms[*WhatsAppClient]
 }
 
 func init() {
@@ -176,6 +177,11 @@ func (wa *WhatsAppConnector) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to migrate Meta AI portals: %w", err)
 	}
+	wa.registerRTCCallLinkProvisioning()
+	wa.registerRTCGroupParticipantProvisioning()
+	wa.registerRTCGroupHandProvisioning()
+	wa.registerRTCReactionProvisioning()
+	wa.registerRTCVideoDecisionProvisioning()
 	go func() {
 		err = wa.syncMismatchingGhosts(wa.Bridge.BackgroundCtx)
 		if err != nil {

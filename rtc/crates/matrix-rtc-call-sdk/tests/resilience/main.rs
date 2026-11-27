@@ -49,6 +49,9 @@ async fn homeserver_outage_round_trip() {
     call.publish().await;
     call.drain_events();
     let publishes_before = call.sticky_sends().len();
+    use matrix_rtc_core::testing::MockDelayState;
+    let original_delay = call.mock.delayed_states().into_iter()
+        .find(|(_, _, state)| *state == MockDelayState::Pending).expect("armed server delay").1;
 
     call.homeserver_away();
     run_for(11).await;
@@ -71,9 +74,14 @@ async fn homeserver_outage_round_trip() {
     run_for(20).await;
     assert!(call.media.engine.interruptions().own_membership_lapsed);
     assert!(call.publications_muted(), "paused while lapsed");
+    assert!(call.mock.delayed_states().iter().any(|(_, id, state)| id == &original_delay && *state == MockDelayState::Fired));
 
     // Dave joins at the homeserver meanwhile; nothing reaches us.
     run_for(139).await;
+    assert_eq!(call.mock.calls_to(MockMethod::DelayedEvent).len(), 1,
+        "an outage must not trigger a speculative new delayed creation");
+    assert_eq!(call.sticky_sends().len(), publishes_before,
+        "no republish while disconnected");
     let calls_before = call.mock.calls().len();
     call.homeserver_back();
     call.client.report_connectivity(true);
@@ -84,21 +92,17 @@ async fn homeserver_outage_round_trip() {
         .map(|call| call.method)
         .filter(|method| *method != MockMethod::ToDevice)
         .collect();
-    assert_eq!(
-        after[..3],
-        [
-            MockMethod::DelayedEvent,
-            MockMethod::StickyEvent,
-            MockMethod::RestartDelayedEvent,
-        ],
-        "re-arm, republish, then the probe finds the new delay: {after:?}"
-    );
-    assert!(
-        !after[3..]
-            .iter()
-            .any(|method| matches!(method, MockMethod::DelayedEvent | MockMethod::StickyEvent)),
-        "nothing re-armed or republished again: {after:?}"
-    );
+    // The recovery may probe the old ID first, or a healthy heartbeat may
+    // replace an expired delay before the jittered recovery wakes. In either
+    // case exactly one create precedes exactly one republish, and the new
+    // ID must actually be renewed rather than only attempted.
+    let create = after.iter().position(|method| *method == MockMethod::DelayedEvent)
+        .expect("recovery must re-arm the expired delay");
+    let publish = after.iter().position(|method| *method == MockMethod::StickyEvent)
+        .expect("recovery must republish our membership");
+    assert!(create < publish, "arm before republish: {after:?}");
+    assert_eq!(after.iter().filter(|method| **method == MockMethod::DelayedEvent).count(), 1);
+    assert_eq!(after.iter().filter(|method| **method == MockMethod::StickyEvent).count(), 1);
     assert_eq!(
         call.sticky_sends().len(),
         publishes_before + 1,
@@ -137,6 +141,11 @@ async fn homeserver_outage_round_trip() {
         "dave gets our key"
     );
     assert_eq!(call.health(), SignallingHealth::Reachable);
+    let pending: Vec<_> = call.mock.delayed_states().into_iter().filter(|(_, _, state)| *state == MockDelayState::Pending).collect();
+    assert_eq!(pending.len(), 1, "exactly one re-armed server operation");
+    assert_ne!(pending[0].1, original_delay);
+    assert!(call.mock.restarted_events.lock().unwrap().iter().any(|(_, id)| id == &pending[0].1),
+        "the replacement must be renewed successfully");
     let interruptions = call.media.engine.interruptions();
     assert!(!interruptions.own_membership_lapsed);
     assert_eq!(interruptions.signalling, SignallingHealth::Reachable);

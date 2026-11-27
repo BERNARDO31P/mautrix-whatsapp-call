@@ -339,14 +339,34 @@ fn stream_stats_dto_zips_request_with_results() {
     ];
     let answered = matrix_rtc_transport::ReceiveStats {
         packets_received: 7,
-        ..Default::default()
+        packets_lost: -2,
+        bytes_received: 1234,
+        jitter: 0.125,
+        frames_decoded: 13,
+        frames_dropped: 17,
+        total_samples_received: 19,
+        concealed_samples: 11,
+        silent_concealed_samples: 3,
+        concealment_events: 5,
+        codec: Some("audio/opus".into()),
     };
     let dto = zip_stream_stats(request, vec![Some(answered), None]);
 
     assert_eq!(dto.len(), 2);
     assert_eq!(dto[0].member_id, "bob");
     assert_eq!(dto[0].kind, FfiStreamKind::Microphone);
-    assert_eq!(dto[0].stats.as_ref().map(|s| s.packets_received), Some(7));
+    let stats = dto[0].stats.as_ref().unwrap();
+    assert_eq!(stats.packets_received, 7);
+    assert_eq!(stats.packets_lost, -2);
+    assert_eq!(stats.bytes_received, 1234);
+    assert_eq!(stats.jitter, 0.125);
+    assert_eq!(stats.frames_decoded, 13);
+    assert_eq!(stats.frames_dropped, 17);
+    assert_eq!(stats.total_samples_received, 19);
+    assert_eq!(stats.concealed_samples, 11);
+    assert_eq!(stats.silent_concealed_samples, 3);
+    assert_eq!(stats.concealment_events, 5);
+    assert_eq!(stats.codec.as_deref(), Some("audio/opus"));
     assert_eq!(dto[1].kind, FfiStreamKind::Camera);
     // Asked about and answered with nothing, rather than left out.
     assert!(dto[1].stats.is_none());

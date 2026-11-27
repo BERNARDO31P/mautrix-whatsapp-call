@@ -165,3 +165,12 @@ func cloneByteSlices(values [][]byte) [][]byte {
 	}
 	return out
 }
+
+// A missing relay section does not rotate credentials. Keep the previous
+// immutable snapshot on omission or a non-increasing credential transaction.
+func selectGroupRelaySnapshot(previous, next *groupCallRelay) *groupCallRelay {
+	if previous != nil && (next == nil || next.TransactionID <= previous.TransactionID) {
+		return previous
+	}
+	return next
+}

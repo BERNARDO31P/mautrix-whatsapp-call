@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -235,13 +236,16 @@ func TestWhatsAppBusinessCallOptionClassification(t *testing.T) {
 	}
 }
 
+var matrixRTCTestBusinessPeer = types.NewJID("12345", types.DefaultUserServer)
+
 func matrixRTCTestBusinessProfileResponse(callingChildren []waBinary.Node) *waBinary.Node {
 	return &waBinary.Node{
 		Tag: "iq",
 		Content: []waBinary.Node{{
 			Tag: "business_profile",
 			Content: []waBinary.Node{{
-				Tag: "profile",
+				Tag:   "profile",
+				Attrs: waBinary.Attrs{"jid": matrixRTCTestBusinessPeer},
 				Content: []waBinary.Node{{
 					Tag: "profile_options",
 					Content: []waBinary.Node{{
@@ -260,7 +264,8 @@ func matrixRTCTestBusinessProfileOptionsResponse(profileOptions []waBinary.Node)
 		Content: []waBinary.Node{{
 			Tag: "business_profile",
 			Content: []waBinary.Node{{
-				Tag: "profile",
+				Tag:   "profile",
+				Attrs: waBinary.Attrs{"jid": matrixRTCTestBusinessPeer},
 				Content: []waBinary.Node{{
 					Tag:     "profile_options",
 					Content: profileOptions,
@@ -324,7 +329,7 @@ func TestWhatsAppBusinessCallProfileResponseClassification(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, _ := classifyWhatsAppBusinessCallProfileResponse(tc.resp)
+			got, _ := classifyWhatsAppBusinessCallProfileResponse(tc.resp, matrixRTCTestBusinessPeer)
 			if got != tc.want {
 				t.Fatalf("availability = %d, want %d", got, tc.want)
 			}
@@ -410,7 +415,8 @@ func matrixRTCTestFeatureResponse(featureChildren []waBinary.Node) *waBinary.Nod
 			Content: []waBinary.Node{{
 				Tag: "list",
 				Content: []waBinary.Node{{
-					Tag: "user",
+					Tag:   "user",
+					Attrs: waBinary.Attrs{"jid": matrixRTCTestBusinessPeer},
 					Content: []waBinary.Node{{
 						Tag:     "feature",
 						Content: featureChildren,
@@ -460,7 +466,7 @@ func TestWhatsAppVoIPFeatureResponseClassification(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, _ := classifyWhatsAppVoIPFeatureResponse(tc.resp)
+			got, _ := classifyWhatsAppVoIPFeatureResponse(tc.resp, matrixRTCTestBusinessPeer)
 			if got != tc.want {
 				t.Fatalf("availability = %d, want %d", got, tc.want)
 			}
@@ -543,9 +549,6 @@ func TestCanonicalMatrixRTCSlotID(t *testing.T) {
 	if rtcSessionKey("!room:example.org", "m.call#ROOM") != rtcSessionKey("!room:example.org", "m.call#room") {
 		t.Fatal("legacy and canonical room slot IDs produced different session keys")
 	}
-	if rtcIntentKey("!room:example.org", "m.call#ROOM", "@alice:example.org") != rtcIntentKey("!room:example.org", "m.call#room", "@alice:example.org") {
-		t.Fatal("legacy and canonical room slot IDs produced different intent keys")
-	}
 }
 
 func TestMatrixRTCBridgeBotControlMembership(t *testing.T) {
@@ -593,5 +596,99 @@ func TestRTCStricterPermissionsAndTrustedInvitingDevice(t *testing.T) {
 	evt.Mautrix.ForwardedKeys = true
 	if rtcTrustedDevice(evt) != "" {
 		t.Fatal("forwarded key admitted")
+	}
+}
+
+func TestMonitorRTCPeerEndDuringSetup(t *testing.T) {
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	var ended atomic.Bool
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		monitorRTCPeerEnd(ctx, time.Millisecond, ended.Load, stop)
+	}()
+	if ctx.Err() != nil {
+		t.Fatal("live WhatsApp call cancelled")
+	}
+	ended.Store(true)
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("remote hangup did not cancel setup")
+	}
+	<-done
+}
+
+func TestMonitorRTCPeerEndAlreadyEndedAndCancelled(t *testing.T) {
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	monitorRTCPeerEnd(ctx, time.Hour, func() bool { return true }, stop)
+	if ctx.Err() == nil {
+		t.Fatal("already ended call was not cancelled immediately")
+	}
+	monitorRTCPeerEnd(ctx, time.Hour, func() bool {
+		t.Fatal("cancelled call was inspected")
+		return false
+	}, stop)
+}
+
+func TestRTCPowerInheritedDefaults(t *testing.T) {
+	stateDefault := 75
+	pl := &event.PowerLevelsEventContent{StateDefaultPtr: &stateDefault, EventsDefault: 40}
+	if mergeRTCPortalPower(pl, false) || len(pl.Events) != 0 {
+		t.Fatal("eligible existing room acquired explicit overrides")
+	}
+	mergeRTCPortalPower(pl, true)
+	if pl.Events[rtcMemberStable] != 100 || pl.Events[rtcInviteStable] != 100 {
+		t.Fatal("restriction not installed")
+	}
+	stateDefault = 90
+	pl.EventsDefault = 60
+	mergeRTCPortalPower(pl, false)
+	if len(pl.Events) != 0 || pl.GetEventLevel(rtcEventType(rtcMemberStable, event.StateEventType)) != 90 || pl.GetEventLevel(rtcEventType(rtcInviteStable, event.MessageEventType)) != 60 {
+		t.Fatal("current inherited administrator rules not restored")
+	}
+	stateDefault = 120
+	pl.EventsDefault = 110
+	if mergeRTCPortalPower(pl, true) || len(pl.Events) != 0 {
+		t.Fatal("stricter inherited administrator rules modified")
+	}
+}
+
+func TestRTCPowerInitialBridgeRoom(t *testing.T) {
+	pl := &event.PowerLevelsEventContent{}
+	mergeRTCPortalPowerWithInitial(pl, true, true)
+	if pl.Events[rtcMemberStable] != 100 {
+		t.Fatal("new restricted room was not restricted")
+	}
+	mergeRTCPortalPower(pl, false)
+	if v, ok := pl.Events[rtcMemberStable]; !ok || v != 0 {
+		t.Fatal("new bridge room lost deliberate call permission")
+	}
+}
+
+func TestRTCRoomPeerJID(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		peer types.JID
+		want types.JID
+	}{
+		{"hosted PN", types.JID{User: "123", Server: types.HostedServer, Device: 7}, types.NewJID("123", types.DefaultUserServer)},
+		{"hosted LID", types.JID{User: "456", Server: types.HostedLIDServer, Device: 9}, types.NewJID("456", types.HiddenUserServer)},
+		{"PN", types.JID{User: "123", Server: types.DefaultUserServer, Device: 3}, types.NewJID("123", types.DefaultUserServer)},
+		{"LID", types.NewJID("456", types.HiddenUserServer), types.NewJID("456", types.HiddenUserServer)},
+		{"other domain", types.NewJID("123", types.MessengerServer), types.NewJID("123", types.MessengerServer)},
+		{"empty", types.EmptyJID, types.EmptyJID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			original := tc.peer
+			if got := rtcRoomPeerJID(tc.peer); got != tc.want {
+				t.Fatalf("room peer = %v, want %v", got, tc.want)
+			}
+			if tc.peer != original {
+				t.Fatal("raw call address was mutated")
+			}
+		})
 	}
 }

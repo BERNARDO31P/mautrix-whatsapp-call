@@ -46,7 +46,7 @@ pub use livekit::{LiveKitAttachOptions, LiveKitAttachment, attach_livekit};
 #[cfg(feature = "matrix-sdk")]
 pub use livekit::{LiveKitCall, LiveKitCallError, LiveKitCallOptions, close_slot, open_slot};
 #[cfg(feature = "livekit")]
-pub use matrix_rtc_livekit::supported_video_codecs;
+pub use matrix_rtc_livekit::{TrustedFocus, supported_video_codecs};
 pub use matrix_rtc_transport::ConnectionState;
 pub use participant::{Participant, StreamState, UnableToDecrypt};
 pub use tile::{
@@ -56,4 +56,4 @@ pub use tile::{
 // The SDK backend lives in `matrix-rtc-matrix-sdk`; re-exported so a host
 // driving a call keeps one dependency.
 #[cfg(feature = "matrix-sdk")]
-pub use matrix_rtc_matrix_sdk::SdkMatrixBackend;
+pub use matrix_rtc_matrix_sdk::{refresh_user_keys, CallKeyRecipients, CallRecipientKeys, SdkMatrixBackend};

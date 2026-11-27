@@ -238,7 +238,7 @@ where
             );
             // Adopt the index we are already on rather than assuming 0: a
             // rotation between the join and here would otherwise be missed.
-            if let Some(own) = key_handler.key_for(&own_identity) {
+            if let Some(own) = key_handler.accepted_key_for(&own_identity) {
                 connection.set_local_key_index(own.key_index);
             }
             Some(connection)

@@ -1,6 +1,6 @@
 # Updating mautrix-whatsapp-call and its dependencies
 
-`mautrix-whatsapp-call` intentionally pins its source, toolchain and runtime dependencies. A normal Docker image pull is **not** the mechanism used to update the modified bridge or the call worker.
+`mautrix-whatsapp-call` pins its source, toolchain and runtime dependencies. A normal Docker image pull is **not** the mechanism used to update the modified bridge or the call worker.
 
 ## 1. Normal project release update
 
@@ -179,7 +179,7 @@ deployment/mautrix-whatsapp-call/compose.yml
 
 Update the image tags there, then run the full runtime verification. A plain `docker compose pull` does not advance a pinned tag to a new release; it only fetches the image currently named by that tag.
 
-## 4. Required validation after any dependency bump
+## 4. Testing dependency updates
 
 At minimum run the source/project checks:
 

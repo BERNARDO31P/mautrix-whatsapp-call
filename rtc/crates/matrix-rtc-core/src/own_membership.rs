@@ -64,16 +64,16 @@
 use rand::Rng;
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::watch;
 // `std::time::SystemTime::now()` panics on wasm32-unknown-unknown; web-time's
 // is the same API over `Date.now()`.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-use web_time::{SystemTime, UNIX_EPOCH};
+use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::compat::MembershipFormat;
 use crate::encryption::RtcClock;
@@ -81,7 +81,7 @@ use crate::error::{CommandError, JoinError};
 use crate::executor;
 use crate::host::backend::MatrixBackend;
 use crate::host::event::RawStickyEventContent;
-use crate::outbox::{Outbox, PendingSend, SendFailure, SendKind, SendPolicy, SlotKey};
+use crate::outbox::{DelayOperation, Outbox, PendingSend, SendFailure, SendKind, SendPolicy, SignallingHealth, SlotKey};
 use crate::session::{ApplicationInfo, LeaveCode, LeaveReason};
 use crate::transport::{LEGACY_LIVEKIT_TYPE, MSC_LIVEKIT_TYPE, MemberTransports, RtcTransport};
 
@@ -110,16 +110,44 @@ const STICKY_REFRESH_FRACTION: u64 = 3;
 /// members of one outage do not all hit the returning homeserver at once.
 const RECOVERY_JITTER_MAX_MS: u64 = 3_000;
 
-/// Wall-clock milliseconds since the Unix epoch.
+/// A fixed epoch estimate. Wall time is sampled only on the first read;
+/// subsequent reads use monotonic elapsed time, even across room attachments.
+struct MonotonicEpochClock(OnceLock<(u64, Instant)>);
+
+impl MonotonicEpochClock {
+    const fn new() -> Self {
+        Self(OnceLock::new())
+    }
+
+    fn read(&self, monotonic_now: impl Fn() -> Instant, wall_now: impl FnOnce() -> u64) -> u64 {
+        let (epoch_ms, start) = self.0.get_or_init(|| {
+            let start = monotonic_now();
+            (wall_now(), start)
+        });
+        anchored_ms(*epoch_ms, monotonic_now().saturating_duration_since(*start))
+    }
+}
+
+/// Process-local monotonic milliseconds, anchored to the Unix epoch once.
 ///
-/// The sticky refresh is decided by comparing timestamps on each
-/// [`OwnMembershipMachine::keep_alive`] tick, so it does not depend on how
-/// punctually the session's upkeep wakes.
+/// Membership deadlines, outbox health and encryption rotation share this
+/// clock. Wall-clock corrections must not shorten or extend elapsed call
+/// intervals. Legacy membership expiry also uses this fixed epoch estimate,
+/// including across feeder reattachments. The initial wall offset is assumed
+/// accurate; subsequent corrections require a fresh process to recalibrate.
+/// Never use this estimate to serialize a new wire timestamp.
 pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    static CLOCK: MonotonicEpochClock = MonotonicEpochClock::new();
+    CLOCK.read(Instant::now, || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+            .unwrap_or(0)
+    })
+}
+
+fn anchored_ms(epoch_ms: u64, elapsed: Duration) -> u64 {
+    epoch_ms.saturating_add(elapsed.as_millis().min(u64::MAX as u128) as u64)
 }
 
 /// Converts an RtcTransport to a JSON value for event content, as a room in
@@ -177,6 +205,7 @@ pub enum OwnMembershipState {
 pub struct KeepAliveInfo {
     /// The delay id of the delayed cleanup event.
     pub delayed_event_id: String,
+    operation: DelayOperation,
     /// The timeout in milliseconds before the event fires, measured from the
     /// last successful restart.
     pub timeout_ms: u64,
@@ -330,6 +359,9 @@ pub struct OwnMembershipMachine<T: MatrixBackend> {
     refreshing: AtomicBool,
     /// A delayed leave is being armed; the beat does not start another.
     arming: AtomicBool,
+    // Delayed creations whose outcome was not conclusively settled.
+    unsettled_delay_creates: Arc<AtomicU64>,
+    replaced_delay_uncertain: AtomicBool,
     /// How long a recovery waits before its first send (R22).
     recovery_jitter: Arc<dyn Fn() -> Duration + Send + Sync>,
     /// Where "now" comes from (see [`Self::set_clock`]).
@@ -367,8 +399,97 @@ impl Drop for Busy<'_> {
 impl<'a> Busy<'a> {
     /// Takes the flag, or `None` if it is already taken.
     fn take(flag: &'a AtomicBool) -> Option<Self> {
-        (!flag.swap(true, Ordering::SeqCst)).then_some(Self(flag))
+        // Construct the guard only after acquiring the flag. `then_some` is
+        // eager and would drop a temporary guard on a failed acquisition,
+        // clearing the flag owned by another operation.
+        flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Self(flag))
     }
+}
+
+// The server has allocated a delayed event as soon as creation returns an ID.
+// Until that ID is committed to keep_alive_info, dropping the result (including
+// when an outbox generation is superseded) must cancel the exact event.
+struct UncommittedDelay<T: MatrixBackend + 'static> {
+    backend: Arc<T>,
+    room_id: String,
+    id: Option<String>,
+    operation: DelayOperation,
+    outbox: Outbox,
+    unsettled_creates: Arc<AtomicU64>,
+}
+
+impl<T: MatrixBackend + 'static> UncommittedDelay<T> {
+    fn commit(mut self) -> (String, DelayOperation) {
+        let id = self.id.take().expect("uncommitted delayed event ID");
+        self.unsettled_creates.fetch_sub(1, Ordering::SeqCst);
+        (id, self.operation.clone())
+    }
+}
+
+impl<T: MatrixBackend + 'static> Drop for UncommittedDelay<T> {
+    fn drop(&mut self) {
+        let Some(id) = self.id.take() else { return };
+        if !executor::can_spawn() {
+            log::warn!("Cannot cancel uncommitted delayed leave without an executor");
+            return;
+        }
+        let backend = self.backend.clone();
+        let room_id = self.room_id.clone();
+        let operation = self.operation.clone();
+        let outbox = self.outbox.clone();
+        let unsettled = self.unsettled_creates.clone();
+        executor::spawn(async move {
+            // Exact-ID cleanup is independent of subsequent outbox generations.
+            // Only confirmed cancellation may settle the durable record.
+            if cancel_uncommitted_delay(backend.as_ref(), &room_id, &id).await
+                && outbox.settle_delay(&operation, Some(&id)).is_ok()
+            {
+                unsettled.fetch_sub(1, Ordering::SeqCst);
+            } else {
+                log::warn!("[{room_id}] Could not settle uncommitted delayed leave; ownership retained");
+            }
+        });
+    }
+}
+
+// Cancellation by exact ID is safe to repeat: a successful cancellation
+// whose response is lost leaves no matching delay for the next attempt. A
+// missing ID stops retries but is not proof that the event never fired.
+// Keep this independent of the membership outbox and bound both the attempts
+// and their combined lifetime, including server-specified rate-limit waits.
+async fn cancel_uncommitted_delay<T: MatrixBackend>(
+    backend: &T,
+    room_id: &str,
+    id: &str,
+) -> bool {
+    executor::timeout(Duration::from_secs(30), async {
+        for attempt in 0..3u32 {
+            let backoff = Duration::from_secs(1u64 << attempt);
+            let wait = match executor::timeout(
+                Duration::from_secs(10),
+                backend.cancel_delayed_event(room_id.to_owned(), id.to_owned()),
+            ).await {
+                Ok(Ok(())) => return true,
+                Ok(Err(error)) if is_not_found(&error) => return false,
+                Ok(Err(error)) if error.is_permanent() => return false,
+                Ok(Err(error)) => error.backend_error()
+                    .filter(|error| error.is_rate_limited())
+                    .and_then(|error| error.retry_after_ms)
+                    .map(Duration::from_millis)
+                    .unwrap_or(backoff)
+                    .max(backoff),
+                Err(_) => backoff,
+            };
+            if attempt < 2 {
+                // Clamp only to avoid timer overflow on hostile/invalid server
+                // values. The outer deadline expires rather than retrying early.
+                executor::sleep(wait.min(Duration::from_secs(30))).await;
+            }
+        }
+        false
+    }).await.unwrap_or(false)
 }
 
 impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
@@ -423,6 +544,8 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             departures: watch::Sender::new(0),
             refreshing: AtomicBool::new(false),
             arming: AtomicBool::new(false),
+            unsettled_delay_creates: Arc::new(AtomicU64::new(0)),
+            replaced_delay_uncertain: AtomicBool::new(false),
             recovery_jitter: Arc::new(|| {
                 Duration::from_millis(rand::thread_rng().gen_range(0..=RECOVERY_JITTER_MAX_MS))
             }),
@@ -487,6 +610,13 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
     /// Gets the current state of the membership machine.
     pub fn state(&self) -> OwnMembershipState {
         self.state.lock().unwrap().clone()
+    }
+
+    /// A session-scoped probe for detached media activation tasks. Captures
+    /// only the state, not the backend (which need not be Send on WASM).
+    pub(crate) fn joined_probe(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let state = self.state.clone();
+        Arc::new(move || *state.lock().unwrap() == OwnMembershipState::Joined)
     }
 
     /// Gets the sticky key (membership ID) for our membership.
@@ -675,9 +805,33 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
 
     /// Takes `kind`'s slot if still joined. Under the state lock, so a leave
     /// either sees the send and cancels it, or the send sees the leave.
-    fn begin_if_joined(&self, kind: SendKind) -> Option<PendingSend> {
+    pub(crate) fn begin_if_joined(&self, kind: SendKind) -> Option<PendingSend> {
         let state = self.state.lock().unwrap();
         (*state == OwnMembershipState::Joined).then(|| self.outbox.begin(self.key(kind)))
+    }
+
+    /// Capture the desired membership and register its send in one critical
+    /// section. In particular, a refresh must not supersede a transport move
+    /// with a snapshot taken before that move updated `last_sticky`.
+    fn begin_membership_send(&self, refresh_only: bool) -> Option<(SentSticky, PendingSend, u64)> {
+        let state = self.state.lock().unwrap();
+        if *state != OwnMembershipState::Joined {
+            return None;
+        }
+        // Do not issue a fresh publication while an earlier delayed create
+        // may still be able to erase this participation. Explicit leave is
+        // intentionally not routed through this publication gate.
+        if self.outbox.records_delays() && self.unsettled_delay_creates.load(Ordering::SeqCst) != 0 {
+            return None;
+        }
+        let desired = self.last_sticky.lock().unwrap();
+        let sticky = desired.as_ref()?;
+        let elapsed = self.now_ms().saturating_sub(sticky.sent_at_ms);
+        if refresh_only && elapsed < self.membership_lifetime_ms() / STICKY_REFRESH_FRACTION {
+            return None;
+        }
+        let pending = self.outbox.begin(self.key(SendKind::Membership));
+        Some((sticky.clone(), pending, elapsed))
     }
 
     /// One attempt at putting `content` in the sticky map.
@@ -756,6 +910,8 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             "[{}] Scheduling delayed leave event (dead man's switch safety net)",
             room_id
         );
+        // The server may start its countdown before the arm response reaches us.
+        let arm_started = executor::Instant::now();
         let armed = self
             .outbox
             .send(
@@ -764,25 +920,28 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
                 || {
                     // Sticky, to replace the join's entry in the sticky map, and
                     // for as long as the join would have stayed there.
-                    self.backend.send_delayed_sticky_event(
-                        room_id.clone(),
-                        "m.rtc.member".to_string(),
-                        delayed_content.clone(),
-                        self.sticky_duration_ms,
-                        keep_alive_timeout_ms,
-                    )
+                    self.create_delayed_leave(delayed_content.clone())
                 },
             )
             .await;
         match armed {
             // Store the delayed event ID for later cancellation
-            Ok(delayed_event_id) => {
+            Ok(armed) => {
+                let state = self.state.lock().unwrap();
+                if *state != OwnMembershipState::Joining {
+                    return Err(JoinError::from_send_failure(SendFailure::Cancelled));
+                }
                 *self.delayed_support.lock().unwrap() = DelayedLeaveSupport::Supported;
+                let (delayed_event_id, operation) = armed.commit();
                 *self.keep_alive_info.lock().unwrap() = Some(KeepAliveInfo {
                     delayed_event_id,
+                    operation,
                     timeout_ms: keep_alive_timeout_ms,
                     last_restart_ms: self.now_ms(),
                 });
+            }
+            Err(failure @ (SendFailure::Cancelled | SendFailure::Superseded)) => {
+                return Err(JoinError::from_send_failure(failure));
             }
             // Not fatal: the dead man's switch is a cleanup optimisation, not a
             // precondition for being in the call. Join without it, and let the
@@ -794,6 +953,14 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             Err(failure) => {
                 let error = failure.into_command_error();
                 self.mark_delayed_leave_unsupported(&error);
+                if self.outbox.records_delays() && (self.unsettled_delay_creates.load(Ordering::SeqCst) != 0
+                    || matches!(&error, CommandError::ClientRejected(_))) {
+                    *self.state.lock().unwrap() = OwnMembershipState::NotJoined;
+                    return Err(JoinError::Refused {
+                        errcode: None,
+                        message: "delayed leave creation is unsettled; ownership retained for recovery".to_owned(),
+                    });
+                }
                 self.published_lifetime_ms
                     .store(self.degraded_lifetime_ms, Ordering::Relaxed);
                 log::warn!(
@@ -817,11 +984,27 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             "[{}] Sending join membership event (step 2 of dead man's switch)",
             room_id
         );
+        // Leave a quarter of the delay for the first restart, measured from
+        // the start of the arm request (not its potentially late response).
+        // Without an armed delay, preserve the caller's full remaining budget.
+        let publish_budget = if keep_alive_timeout_ms > 0
+            && self.keep_alive_info.lock().unwrap().is_some()
+        {
+            let delay = Duration::from_millis(keep_alive_timeout_ms);
+            remaining().min((delay - delay / 4).saturating_sub(arm_started.elapsed()))
+        } else {
+            remaining()
+        };
+        if publish_budget.is_zero() {
+            *self.state.lock().unwrap() = OwnMembershipState::NotJoined;
+            self.cancel_armed_delayed_leave();
+            return Err(JoinError::TimedOut);
+        }
         let published = self
             .outbox
             .send(
                 self.key(SendKind::Membership),
-                SendPolicy::new().deadline(remaining()),
+                SendPolicy::new().deadline(publish_budget),
                 || self.publish_once(join_content.clone()),
             )
             .await;
@@ -861,9 +1044,9 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
     }
 
     /// A join that failed after arming its delayed leave cancels it (R6), with
-    /// one attempt that the failed join does not wait for. Where nothing can
-    /// spawn it, the delay fires its leave for a membership that never went
-    /// out, which nobody sees.
+    /// bounded exact-ID cancellation that the failed join does not wait for.
+    /// A durable journal retains any operation whose settlement is unconfirmed,
+    /// including when the process cannot spawn cleanup.
     fn cancel_armed_delayed_leave(&self) {
         let Some(info) = self.keep_alive_info.lock().unwrap().take() else {
             return;
@@ -873,19 +1056,12 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         }
         let backend = self.backend.clone();
         let outbox = self.outbox.clone();
-        let key = self.key(SendKind::DelayedLeave);
         let room_id = self.room_id.clone();
         executor::spawn(async move {
-            let cancelled = outbox
-                .send(key, SendPolicy::single_attempt(), || {
-                    backend.cancel_delayed_event(room_id.clone(), info.delayed_event_id.clone())
-                })
-                .await;
-            if let Err(failure) = cancelled {
-                log::debug!(
-                    "[{room_id}] the failed join's delayed leave was not cancelled ({failure}); \
-                     it fires for a membership that never went out",
-                );
+            if !cancel_uncommitted_delay(backend.as_ref(), &room_id, &info.delayed_event_id).await
+                || outbox.settle_delay(&info.operation, Some(&info.delayed_event_id)).is_err()
+            {
+                log::warn!("[{room_id}] failed join's delayed leave remains unsettled");
             }
         });
     }
@@ -947,6 +1123,14 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
     /// (R8); the leave's waits for a refresh already at the host, so it cannot
     /// be overtaken by it.
     pub async fn leave(&self, leave_reason: Option<LeaveReason>) -> Result<(), CommandError> {
+        self.leave_with_settlement(leave_reason, false).await
+    }
+
+    // Legacy state keys are reused across joins. Unlike an MSC membership
+    // with a unique key, a surviving delayed leave can erase a future join.
+    pub(crate) async fn leave_with_settlement(
+        &self, leave_reason: Option<LeaveReason>, require_settlement: bool,
+    ) -> Result<(), CommandError> {
         let room_id = self.room_id.clone();
 
         // A voluntary leave with no stated cause is MSC4143's plain `leave` code.
@@ -978,15 +1162,14 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         }
         self.latest_event_id.send_replace(None);
 
-        // Cancel the delayed leave event if one exists
-        if let Some(event_id) = self.delayed_event_id() {
+        // Cancel the delayed leave event if one exists.
+        let mut cancellation_error = None;
+        let armed = self.keep_alive_info.lock().unwrap().clone();
+        if let Some(info) = armed {
+            let event_id = info.delayed_event_id;
             log::debug!("[{}] Canceling delayed leave event: {}", room_id, event_id);
-            // Deliberately not propagated. The leave event above already went
-            // through, so we *have* left; the cancellation is only tidying up a
-            // safety net that is now redundant. The common failure is a 404
-            // because the delay already fired — which is the outcome we wanted
-            // anyway. Failing the whole leave here would leave the machine
-            // stuck in `Leaving` after a successful leave.
+            // For fresh MSC keys the cancellation is only cleanup. For reused
+            // legacy keys we must confirm it before another join can proceed.
             match self
                 .outbox
                 .send(
@@ -999,16 +1182,27 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
                 )
                 .await
             {
-                Ok(()) => log::debug!("[{}] Delayed leave event canceled", room_id),
-                Err(error) => log::debug!(
-                    "[{room_id}] Delayed leave {event_id} could not be canceled ({error}); \
-                     it has most likely already fired, which leaves us departed either way.",
-                ),
+                Ok(()) => {
+                    if let Err(error) = self.outbox.settle_delay(&info.operation, Some(&event_id)) {
+                        log::warn!("[{room_id}] Delayed leave cancellation record remains unsettled: {error}");
+                        if require_settlement { cancellation_error = Some(error); }
+                    } else {
+                        log::debug!("[{}] Delayed leave event canceled", room_id);
+                    }
+                },
+                Err(error) => {
+                    log::debug!("[{room_id}] Delayed leave {event_id} cancellation unconfirmed ({error})");
+                    if require_settlement {
+                        // Even M_NOT_FOUND can mean a delayed state write is
+                        // already being delivered. Do not assume safe reuse.
+                        cancellation_error = Some(error.into_command_error());
+                    }
+                },
             }
 
-            // Clear the stored event ID regardless: either it is canceled, or
-            // it fired and no longer exists.
-            {
+            // Keep evidence of an uncertain legacy cancellation until the
+            // machine is dropped. The client fence remains dirty afterwards.
+            if cancellation_error.is_none() {
                 let mut info_guard = self.keep_alive_info.lock().unwrap();
                 *info_guard = None;
             }
@@ -1020,6 +1214,15 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             *state_guard = OwnMembershipState::Left;
         }
 
+        if let Some(error) = cancellation_error {
+            return Err(error);
+        }
+        if require_settlement && (self.unsettled_delay_creates.load(Ordering::SeqCst) != 0
+            || self.replaced_delay_uncertain.load(Ordering::SeqCst)) {
+            return Err(CommandError::ClientRejected(
+                "legacy delayed leave has an unconfirmed earlier operation; state-key ownership retained".to_owned(),
+            ));
+        }
         log::info!("[{}] Successfully left session", room_id);
 
         Ok(())
@@ -1100,22 +1303,39 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         };
         let room_id = &self.room_id;
         let deadline_ms = info.last_restart_ms.saturating_add(info.timeout_ms);
-        if clock_fallback && self.now_ms() > deadline_ms {
+        let overdue = self.now_ms() > deadline_ms;
+        // A locally expired timer is not proof that a restart never reached
+        // the server. In particular do not discard the known ID or issue a
+        // non-idempotent create during an outage. Durable hosts always probe
+        // the exact ID; retain the clock fallback for healthy non-journal hosts.
+        if clock_fallback && overdue && self.outbox.health() == SignallingHealth::Reachable
+            && !self.outbox.records_delays()
+        {
             log::warn!(
                 "[{room_id}] Delayed leave {} has not been restarted for longer than its {}ms \
                  delay, so it has already fired; arming a replacement and republishing.",
                 info.delayed_event_id,
                 info.timeout_ms,
             );
-            self.rearm_and_republish().await;
+            self.rearm_and_republish(&info, true).await;
             return false;
         }
-        let Some(pending) = self.begin_if_joined(SendKind::DelayedLeave) else {
-            return false;
+        let pending = {
+            let state = self.state.lock().unwrap();
+            let current = self.keep_alive_info.lock().unwrap();
+            if *state != OwnMembershipState::Joined
+                || !current.as_ref().is_some_and(|current| current.operation == info.operation)
+            {
+                return false;
+            }
+            // Registration and replacement of the known operation share the
+            // state lock, so a stale probe cannot supersede a new create.
+            self.outbox.begin(self.key(SendKind::DelayedLeave))
         };
         let tolerance = Duration::from_millis(deadline_ms.saturating_sub(self.now_ms()));
+        let policy = if overdue { SendPolicy::single_attempt() } else { SendPolicy::new().tolerance(tolerance) };
         match pending
-            .run(SendPolicy::new().tolerance(tolerance), || {
+            .run(policy, || {
                 self.backend
                     .restart_delayed_event(room_id.clone(), info.delayed_event_id.clone())
             })
@@ -1125,7 +1345,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
                 {
                     let mut guard = self.keep_alive_info.lock().unwrap();
                     if let Some(current) = guard.as_mut()
-                        && current.delayed_event_id == info.delayed_event_id
+                        && current.operation == info.operation
                     {
                         current.last_restart_ms = self.now_ms();
                     }
@@ -1139,7 +1359,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
                      replacement and republishing.",
                     info.delayed_event_id,
                 );
-                self.rearm_and_republish().await;
+                self.rearm_and_republish(&info, false).await;
                 false
             }
             Err(SendFailure::Superseded | SendFailure::Cancelled) => false,
@@ -1165,7 +1385,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             return;
         };
         let was_degraded = !self.delayed_leave_supported();
-        match self.arm(SendPolicy::single_attempt()).await {
+        match self.arm().await {
             // The membership lifetime stays where the join left it. It is the
             // safe direction to be wrong in — a shorter lifetime than we now
             // need costs signalling, where a longer one would cost a ghost —
@@ -1185,15 +1405,33 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         }
     }
 
-    /// Our delayed leave is gone: arm a new one, retried until it lands, then
-    /// put the same join content back (R19), so the member id is the one it
-    /// always was.
-    async fn rearm_and_republish(&self) {
+    /// Our delayed leave is gone: attempt one new arm, then put the same
+    /// join content back (R19). Creation has no transaction ID, so an
+    /// ambiguous result must not cause an immediate duplicate request.
+    async fn rearm_and_republish(&self, expected: &KeepAliveInfo, clock_predicted: bool) {
         let Some(_arming) = Busy::take(&self.arming) else {
             return;
         };
-        *self.keep_alive_info.lock().unwrap() = None;
-        match self.arm(SendPolicy::new()).await {
+        {
+            let state = self.state.lock().unwrap();
+            if *state != OwnMembershipState::Joined {
+                return;
+            }
+            let mut current = self.keep_alive_info.lock().unwrap();
+            if !current.as_ref().is_some_and(|info| {
+                info.operation == expected.operation && (!clock_predicted || (
+                    info.last_restart_ms == expected.last_restart_ms
+                    && self.outbox.health() == SignallingHealth::Reachable
+                ))
+            }) {
+                return;
+            }
+            current.take();
+            // A clock prediction or missing ID does not confirm that the old
+            // delayed state write has completed. Retain the legacy fence.
+            self.replaced_delay_uncertain.store(true, Ordering::SeqCst);
+        }
+        match self.arm().await {
             Ok(()) => {}
             Err(SendFailure::Superseded | SendFailure::Cancelled) => return,
             Err(failure) => {
@@ -1254,10 +1492,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
     /// Re-sends our join content, retried until it lands, is superseded or the
     /// join leaves. Same content, so the same member id.
     pub async fn republish(&self) {
-        let Some(sticky) = self.last_sticky.lock().unwrap().clone() else {
-            return;
-        };
-        let Some(pending) = self.begin_if_joined(SendKind::Membership) else {
+        let Some((sticky, pending, _)) = self.begin_membership_send(false) else {
             return;
         };
         log::info!("[{}] republishing our membership", self.room_id);
@@ -1316,25 +1551,16 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
     /// leaves, or the entry lapses. Content is re-sent verbatim, so peers see
     /// an update identical to what they already hold. One refresh at a time.
     pub async fn refresh_if_due(&self) {
-        let Some(sticky) = self.last_sticky.lock().unwrap().clone() else {
-            // Not joined (or the join's sticky send failed): nothing to refresh.
-            return;
-        };
-
-        // The lifetime the join settled on, which is both when the refresh falls
-        // due and what it re-publishes — a refresh that stated a different
-        // duration is what MSC4354 asks clients not to do.
-        let lifetime_ms = self.membership_lifetime_ms();
-        let elapsed = self.now_ms().saturating_sub(sticky.sent_at_ms);
-        if elapsed < lifetime_ms / STICKY_REFRESH_FRACTION {
-            return;
-        }
         let Some(_refreshing) = Busy::take(&self.refreshing) else {
             return;
         };
-        let Some(pending) = self.begin_if_joined(SendKind::Membership) else {
+        // Check the due time and capture the latest desired content while
+        // registering the send, rather than registering an obsolete snapshot.
+        let Some((sticky, pending, elapsed)) = self.begin_membership_send(true) else {
             return;
         };
+        // The lifetime is fixed for this join (MSC4354).
+        let lifetime_ms = self.membership_lifetime_ms();
 
         let room_id = &self.room_id;
         log::debug!(
@@ -1435,8 +1661,88 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         }
     }
 
-    /// Arms a delayed leave through the outbox under `policy`, recording it.
-    async fn arm(&self, policy: SendPolicy) -> Result<(), SendFailure> {
+    async fn create_delayed_leave(&self, content: Value) -> Result<UncommittedDelay<T>, CommandError> {
+        let backend = self.backend.clone();
+        let room_id = self.room_id.clone();
+        let sticky_duration_ms = self.sticky_duration_ms;
+        let delay_ms = self.keep_alive_timeout_ms;
+        let unsettled_creates = self.unsettled_delay_creates.clone();
+        let outbox = self.outbox.clone();
+        let operation = DelayOperation {
+            token: format!("{:032x}", rand::random::<u128>()),
+            room_id: room_id.clone(),
+            slot_id: self.slot_id.clone(),
+            member_id: self.sticky_key.clone(),
+            user_id: backend.own_user_id(),
+            device_id: backend.own_device_id(),
+        };
+        // Increment before handing off the request. Cancellation, response
+        // loss, and dropping an uncommitted ID cannot imply settlement.
+        {
+            let state = self.state.lock().unwrap();
+            if !matches!(*state, OwnMembershipState::Joining | OwnMembershipState::Joined) {
+                return Err(CommandError::ClientRejected("membership is no longer joining or joined".to_owned()));
+            }
+            if outbox.records_delays() && unsettled_creates.load(Ordering::SeqCst) != 0 {
+                return Err(CommandError::ClientRejected("prior delayed leave creation remains unsettled".to_owned()));
+            }
+            // The durable intent precedes every network submission. A failure
+            // here refuses this operation; no request can have been sent.
+            outbox.begin_delay(&operation)?;
+            unsettled_creates.fetch_add(1, Ordering::SeqCst);
+        }
+        let request = async move {
+            let result = executor::timeout(
+                Duration::from_secs(30),
+                backend.send_delayed_sticky_event(
+                    room_id.clone(),
+                    "m.rtc.member".to_string(),
+                    content,
+                    sticky_duration_ms,
+                    delay_ms,
+                ),
+            )
+            .await;
+            let id = match result {
+                Ok(Ok(id)) => id,
+                Ok(Err(error)) => {
+                    if error.is_delayed_events_unsupported() {
+                        outbox.settle_delay(&operation, None)?;
+                        unsettled_creates.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    return Err(error);
+                }
+                Err(_) => return Err(CommandError::from_message("delayed leave creation response timed out")),
+            };
+            let guard = UncommittedDelay {
+                backend,
+                room_id,
+                id: Some(id),
+                operation,
+                outbox,
+                unsettled_creates,
+            };
+            // A returned ID is durable before the result can be committed or
+            // lost to caller cancellation. On a write failure the guard still
+            // tries to cancel the exact ID; the intent stays unresolved.
+            guard.outbox.identify_delay(&guard.operation, guard.id.as_deref().expect("delay ID"))?;
+            Ok(guard)
+        };
+        if !executor::can_spawn() {
+            return request.await;
+        }
+        // The caller's join budget may be shorter than the server response.
+        // Keep observing this one bounded request if the outbox stops waiting.
+        // If the receiver is gone, the returned guard cancels the exact ID.
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        executor::spawn(async move {
+            let _ = sender.send(request.await);
+        });
+        receiver.await.map_err(|_| CommandError::from_message("delayed leave creation task stopped"))?
+    }
+
+    /// Arms a delayed leave through the outbox, exactly once per attempt.
+    async fn arm(&self) -> Result<(), SendFailure> {
         let Some(pending) = self.begin_if_joined(SendKind::DelayedLeave) else {
             return Err(SendFailure::Cancelled);
         };
@@ -1447,24 +1753,24 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             keep_alive_timeout_ms
         );
         let delayed_content = self.build_delayed_leave_content(&self.slot_id, &self.sticky_key);
-        let delayed_event_id = pending
-            .run(policy, || {
-                self.backend.send_delayed_sticky_event(
-                    self.room_id.clone(),
-                    "m.rtc.member".to_string(),
-                    delayed_content.clone(),
-                    self.sticky_duration_ms,
-                    keep_alive_timeout_ms,
-                )
-            })
+        let armed = pending
+            .run(SendPolicy::single_attempt(), || self.create_delayed_leave(delayed_content.clone()))
             .await?;
 
-        *self.delayed_support.lock().unwrap() = DelayedLeaveSupport::Supported;
-        *self.keep_alive_info.lock().unwrap() = Some(KeepAliveInfo {
-            delayed_event_id,
-            timeout_ms: keep_alive_timeout_ms,
-            last_restart_ms: self.now_ms(),
-        });
+        {
+            let state = self.state.lock().unwrap();
+            if *state != OwnMembershipState::Joined {
+                return Err(SendFailure::Cancelled);
+            }
+            *self.delayed_support.lock().unwrap() = DelayedLeaveSupport::Supported;
+            let (delayed_event_id, operation) = armed.commit();
+            *self.keep_alive_info.lock().unwrap() = Some(KeepAliveInfo {
+                delayed_event_id,
+                operation,
+                timeout_ms: keep_alive_timeout_ms,
+                last_restart_ms: self.now_ms(),
+            });
+        }
         self.update_lapsed();
         log::trace!("[{}] Delayed leave scheduled successfully", self.room_id);
         Ok(())
@@ -1489,6 +1795,74 @@ mod tests {
     use crate::transport::RawRtcTransport;
 
     const APPLICATION_TYPE: &str = "m.call";
+
+    #[test]
+    fn local_deadlines_use_elapsed_time_from_the_epoch_anchor() {
+        let anchor = 1_700_000_000_000;
+        let deadline = anchor + 30_000;
+        assert_eq!(anchored_ms(anchor, Duration::ZERO), anchor);
+        assert!(anchored_ms(anchor, Duration::from_millis(29_999)) < deadline);
+        assert_eq!(anchored_ms(anchor, Duration::from_secs(30)), deadline);
+        assert_eq!(anchored_ms(u64::MAX - 1, Duration::from_secs(1)), u64::MAX);
+    }
+
+    #[test]
+    fn elapsed_clock_ignores_wall_corrections_after_first_read() {
+        let clock = MonotonicEpochClock::new();
+        let start = Instant::now();
+        let epoch = 1_700_000_000_000;
+        assert_eq!(clock.read(|| start, || epoch), epoch);
+        // A forward correction cannot prematurely expire a live membership.
+        assert_eq!(clock.read(|| start + Duration::from_micros(500), || epoch + 60_000), epoch);
+        // Nor can a backward correction prolong it or lose fractional elapsed time.
+        assert_eq!(clock.read(|| start + Duration::from_millis(1), || epoch - 60_000), epoch + 1);
+        assert_eq!(clock.read(|| start + Duration::from_secs(30), || panic!("wall must not be sampled again")), epoch + 30_000);
+    }
+
+    #[test]
+    fn default_clock_is_shared_with_outbox() {
+        let before = now_ms();
+        let outbox = Outbox::new();
+        let observed = (outbox.clock())();
+        assert!(before <= observed);
+        assert!(observed <= now_ms());
+    }
+
+    #[test]
+    fn busy_failed_acquisition_preserves_owner() {
+        let flag = AtomicBool::new(false);
+        let owner = Busy::take(&flag).expect("first acquisition succeeds");
+        for _ in 0..8 {
+            assert!(Busy::take(&flag).is_none());
+            assert!(flag.load(Ordering::SeqCst));
+        }
+        drop(owner);
+        assert!(!flag.load(Ordering::SeqCst));
+        let next = Busy::take(&flag).expect("released flag can be acquired");
+        drop(next);
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn busy_concurrent_rejections_do_not_release_owner() {
+        let flag = AtomicBool::new(false);
+        let owner = Busy::take(&flag).expect("first acquisition succeeds");
+        std::thread::scope(|scope| {
+            let flag = &flag;
+            for _ in 0..4 {
+                scope.spawn(move || {
+                    for _ in 0..64 {
+                        assert!(Busy::take(flag).is_none());
+                        assert!(flag.load(Ordering::SeqCst));
+                    }
+                });
+            }
+        });
+        drop(owner);
+        assert!(!flag.load(Ordering::SeqCst));
+        assert!(Busy::take(&flag).is_some());
+        assert!(!flag.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn test_machine_starts_not_joined() {
@@ -1870,6 +2244,83 @@ mod tests {
             machine
         }
 
+        #[derive(Default)]
+        struct RecordingDelayJournal {
+            records: Mutex<Vec<(DelayOperation, Option<String>)>>,
+        }
+        impl crate::outbox::LegacyLeaveJournal for RecordingDelayJournal {
+            fn pending(&self, _: &str, _: &str) -> Result<bool, CommandError> { Ok(false) }
+            fn mark(&self, _: &str, _: &str) -> Result<(), CommandError> { Ok(()) }
+            fn clear(&self, _: &str, _: &str) -> Result<(), CommandError> { Ok(()) }
+            fn records_delays(&self) -> bool { true }
+            fn begin_delay(&self, operation: &DelayOperation) -> Result<(), CommandError> {
+                self.records.lock().unwrap().push((operation.clone(), None)); Ok(())
+            }
+            fn identify_delay(&self, operation: &DelayOperation, id: &str) -> Result<(), CommandError> {
+                let mut records = self.records.lock().unwrap();
+                let entry = records.iter_mut().find(|entry| &entry.0 == operation).unwrap();
+                assert!(entry.1.is_none()); entry.1 = Some(id.to_owned()); Ok(())
+            }
+            fn settle_delay(&self, operation: &DelayOperation, id: Option<&str>) -> Result<(), CommandError> {
+                let mut records = self.records.lock().unwrap();
+                let index = records.iter().position(|entry| &entry.0 == operation && entry.1.as_deref() == id).unwrap();
+                records.remove(index); Ok(())
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn durable_unknown_arm_never_publishes_or_retries() {
+            let mock = Arc::new(MockBackend::new());
+            let mut machine = machine(&mock, MembershipTimings::default());
+            let journal = Arc::new(RecordingDelayJournal::default());
+            machine.set_outbox(Outbox::with_legacy_journal(journal.clone()));
+            mock.script(MockMethod::DelayedEvent, [MockOutcome::Hang]);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            assert!(matches!(machine.join(MemberTransports::default(), Some(deadline)).await,
+                Err(JoinError::Refused { .. })));
+            assert!(mock.calls_to(MockMethod::StickyEvent).is_empty());
+            tokio::time::sleep(Duration::from_secs(40)).await;
+            assert_eq!(mock.calls_to(MockMethod::DelayedEvent).len(), 1);
+            let records = journal.records.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert!(records[0].1.is_none());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn durable_late_id_is_cancelled_and_settled_without_publishing() {
+            let mock = Arc::new(MockBackend::new());
+            let mut machine = machine(&mock, MembershipTimings::default());
+            let journal = Arc::new(RecordingDelayJournal::default());
+            machine.set_outbox(Outbox::with_legacy_journal(journal.clone()));
+            mock.script(MockMethod::DelayedEvent, [MockOutcome::After(Duration::from_secs(8), Box::new(MockOutcome::Ok))]);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            assert!(machine.join(MemberTransports::default(), Some(deadline)).await.is_err());
+            assert_eq!(journal.records.lock().unwrap().len(), 1);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            assert_eq!(mock.calls_to(MockMethod::CancelDelayedEvent).len(), 1);
+            assert!(journal.records.lock().unwrap().is_empty());
+            assert!(mock.calls_to(MockMethod::StickyEvent).is_empty());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn durable_ambiguous_replacement_retains_both_records_and_blocks_publication() {
+            let mock = Arc::new(MockBackend::new());
+            let mut machine = machine(&mock, MembershipTimings::default());
+            let journal = Arc::new(RecordingDelayJournal::default());
+            machine.set_outbox(Outbox::with_legacy_journal(journal.clone()));
+            machine.join(MemberTransports::default(), None).await.unwrap();
+            mock.script(MockMethod::RestartDelayedEvent, [fail_with("M_NOT_FOUND", 404)]);
+            mock.script(MockMethod::DelayedEvent, [fail()]);
+            machine.recover().await;
+            machine.republish().await;
+            assert_eq!(mock.calls_to(MockMethod::DelayedEvent).len(), 2);
+            assert_eq!(mock.calls_to(MockMethod::StickyEvent).len(), 1);
+            let records = journal.records.lock().unwrap();
+            assert_eq!(records.len(), 2);
+            assert!(records[0].1.is_some());
+            assert!(records[1].1.is_none());
+        }
+
         async fn at(seconds: f64, origin: tokio::time::Instant) {
             tokio::time::sleep_until(origin + Duration::from_secs_f64(seconds)).await;
         }
@@ -2000,6 +2451,59 @@ mod tests {
             );
         }
 
+        #[tokio::test(start_paused = true)]
+        async fn overdue_delay_is_probed_not_recreated_during_outage() {
+            let mock = Arc::new(MockBackend::new());
+            mock.enable_delayed_model();
+            let machine = machine(&mock, MembershipTimings::default());
+            machine.join(MemberTransports::default(), None).await.unwrap();
+            let original = machine.delayed_event_id().unwrap();
+            mock.set_outage(Some(fail()));
+            machine.outbox().report_connectivity(false);
+            tokio::time::sleep(Duration::from_secs(31)).await;
+            machine.update_lapsed();
+            assert!(machine.is_lapsed());
+            for _ in 0..3 {
+                machine.restart_delayed_leave().await;
+                assert_eq!(machine.delayed_event_id().as_deref(), Some(original.as_str()));
+                assert_eq!(mock.calls_to(MockMethod::DelayedEvent).len(), 1);
+                assert_eq!(mock.calls_to(MockMethod::StickyEvent).len(), 1);
+                assert!(machine.is_lapsed());
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            // No external connectivity notification: an exact-ID restart can
+            // still discover the returned homeserver and the expired delay.
+            mock.set_outage(None);
+            machine.restart_delayed_leave().await;
+            assert_ne!(machine.delayed_event_id().as_deref(), Some(original.as_str()));
+            assert_eq!(mock.calls_to(MockMethod::DelayedEvent).len(), 2);
+            assert_eq!(mock.calls_to(MockMethod::StickyEvent).len(), 2);
+            assert!(!machine.is_lapsed());
+            machine.restart_delayed_leave().await;
+            assert_eq!(mock.calls_to(MockMethod::DelayedEvent).len(), 2);
+            assert_eq!(mock.calls_to(MockMethod::StickyEvent).len(), 2);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn overdue_local_clock_does_not_replace_a_restart_with_lost_response() {
+            let mock = Arc::new(MockBackend::new());
+            mock.enable_delayed_model();
+            let machine = machine(&mock, MembershipTimings::default());
+            machine.join(MemberTransports::default(), None).await.unwrap();
+            let original = machine.delayed_event_id().unwrap();
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            mock.script(MockMethod::RestartDelayedEvent, [MockOutcome::AcceptedThenFail(BackendError::new("response lost"))]);
+            assert!(tokio::time::timeout(Duration::from_millis(500), machine.restart_delayed_leave()).await.is_err());
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            machine.update_lapsed();
+            assert!(machine.is_lapsed());
+            machine.restart_delayed_leave().await;
+            assert_eq!(machine.delayed_event_id().as_deref(), Some(original.as_str()));
+            assert_eq!(mock.calls_to(MockMethod::DelayedEvent).len(), 1);
+            assert_eq!(mock.calls_to(MockMethod::StickyEvent).len(), 1);
+            assert!(!machine.is_lapsed());
+        }
+
         /// R19: a restart answered `M_NOT_FOUND` means the delay fired: re-arm,
         /// then put the same join content back; the set that follows with the
         /// new event id causes nothing more.
@@ -2097,6 +2601,37 @@ mod tests {
                 moved,
                 "what refreshes from now on"
             );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_registered_old_refresh_cannot_overwrite_a_focus_move() {
+            use crate::transport::{LiveKitTransport, RawRtcTransport};
+
+            let mock = Arc::new(MockBackend::new());
+            let machine = machine(&mock, MembershipTimings {
+                sticky_duration_ms: 3_000,
+                ..MembershipTimings::default()
+            });
+            machine.join(MemberTransports::publishing(RawRtcTransport {
+                transport_type: "livekit".to_owned(),
+                extra_fields: [("livekit_service_url".to_owned(), "https://a".into())].into(),
+            }), None).await.unwrap();
+            assert!(machine.begin_membership_send(true).is_none());
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let (old, pending, _) = machine.begin_membership_send(true).unwrap();
+            machine.republish_transports(transport_to_json(
+                &RtcTransport::LiveKit(LiveKitTransport::service("https://b".to_owned())),
+                MembershipFormat::RoomState,
+            )).await;
+            let result = pending.run(SendPolicy::single_attempt(), || {
+                machine.publish_once(old.content.clone())
+            }).await;
+            assert!(matches!(result, Err(SendFailure::Superseded)));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            machine.refresh_if_due().await;
+            assert_eq!(mock.last_sticky_event().unwrap().2["transports"]["published"][0]["livekit_service_url"], "https://b");
+            machine.begin_leave();
+            assert!(machine.begin_membership_send(false).is_none());
         }
 
         /// R19: a delay that survived leaves the decision to the next complete
@@ -2216,10 +2751,138 @@ mod tests {
                 .unwrap_err();
 
             assert!(matches!(failed, JoinError::TimedOut));
-            assert_eq!(started.elapsed(), Duration::from_secs(30));
+            assert_eq!(started.elapsed(), Duration::from_millis(22_500));
             tokio::time::sleep(Duration::from_secs(1)).await;
             assert_eq!(mock.calls_to(MockMethod::CancelDelayedEvent).len(), 1);
             assert_eq!(machine.state(), OwnMembershipState::NotJoined);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn slow_arm_response_consumes_initial_publish_budget() {
+            let mock = Arc::new(MockBackend::new());
+            let machine = machine(&mock, MembershipTimings::default());
+            mock.script(MockMethod::DelayedEvent, [MockOutcome::After(
+                Duration::from_secs(8), Box::new(MockOutcome::Ok),
+            )]);
+            mock.script(MockMethod::StickyEvent, [MockOutcome::Hang]);
+            let started = tokio::time::Instant::now();
+            assert!(matches!(machine.join(MemberTransports::default(), None).await,
+                Err(JoinError::TimedOut)));
+            assert_eq!(started.elapsed(), Duration::from_millis(22_500));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn cancelled_join_cleans_up_late_returned_delay_id() {
+            let mock = Arc::new(MockBackend::new());
+            let machine = machine(&mock, MembershipTimings::default());
+            mock.script(MockMethod::DelayedEvent, [MockOutcome::After(
+                Duration::from_secs(2), Box::new(MockOutcome::Ok),
+            )]);
+            let (result, ()) = tokio::join!(
+                machine.join(MemberTransports::default(), None),
+                async {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    machine.begin_leave();
+                },
+            );
+            assert!(result.is_err());
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(machine.delayed_event_id().is_none());
+            assert!(mock.calls_to(MockMethod::StickyEvent).is_empty());
+            assert_eq!(mock.cancelled_events.lock().unwrap().as_slice(),
+                &[("!room:example.org".to_owned(), "delayed-!room:example.org-m.rtc.member".to_owned())]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn uncommitted_delay_cleanup_retries_only_the_returned_id() {
+            let mock = Arc::new(MockBackend::new());
+            mock.script(MockMethod::CancelDelayedEvent, [fail(), MockOutcome::Ok]);
+            let guard = UncommittedDelay {
+                backend: mock.clone(),
+                room_id: "!room:example.org".to_owned(),
+                id: Some("old-delay".to_owned()),
+                operation: DelayOperation {
+                    token: "test".to_owned(), room_id: "!room:example.org".to_owned(),
+                    slot_id: "test".to_owned(), member_id: "test".to_owned(),
+                    user_id: "@test:example.org".to_owned(), device_id: "test".to_owned(),
+                },
+                outbox: Outbox::new(),
+                unsettled_creates: Arc::new(AtomicU64::new(1)),
+            };
+            drop(guard);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(mock.calls_to(MockMethod::CancelDelayedEvent), secs(&[0, 1]));
+            assert_eq!(mock.cancelled_events.lock().unwrap().as_slice(),
+                &[("!room:example.org".to_owned(), "old-delay".to_owned())]);
+            assert!(mock.calls_to(MockMethod::DelayedEvent).is_empty());
+            assert!(mock.calls_to(MockMethod::RestartDelayedEvent).is_empty());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn uncommitted_delay_cleanup_stops_on_missing_or_permanent_error() {
+            for (code, status, expected) in [("M_NOT_FOUND", 404, false), ("M_FORBIDDEN", 403, false)] {
+                let mock = MockBackend::new();
+                mock.script(MockMethod::CancelDelayedEvent, [fail_with(code, status)]);
+                assert_eq!(cancel_uncommitted_delay(&mock, "!room:example.org", "old-delay").await, expected);
+                assert_eq!(mock.calls_to(MockMethod::CancelDelayedEvent), [Duration::ZERO]);
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn uncommitted_delay_cleanup_honours_rate_limit_within_total_budget() {
+            let mock = MockBackend::new();
+            let limited = |ms| MockOutcome::Fail(BackendError::with_matrix_error(
+                Some("M_LIMIT_EXCEEDED".to_owned()), Some(429), "rate limited",
+            ).with_retry_after_ms(Some(ms)));
+            mock.script(MockMethod::CancelDelayedEvent, [limited(4_000), limited(u64::MAX)]);
+            let started = tokio::time::Instant::now();
+            assert!(!cancel_uncommitted_delay(&mock, "!room:example.org", "old-delay").await);
+            assert_eq!(mock.calls_to(MockMethod::CancelDelayedEvent), secs(&[0, 4]));
+            assert_eq!(started.elapsed(), Duration::from_secs(30));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn uncommitted_delay_cleanup_bounds_hanging_requests() {
+            let mock = MockBackend::new();
+            mock.script(MockMethod::CancelDelayedEvent, [MockOutcome::Hang, MockOutcome::Hang, MockOutcome::Hang]);
+            let started = tokio::time::Instant::now();
+            assert!(!cancel_uncommitted_delay(&mock, "!room:example.org", "old-delay").await);
+            assert_eq!(mock.calls_to(MockMethod::CancelDelayedEvent), secs(&[0, 11, 23]));
+            assert_eq!(started.elapsed(), Duration::from_secs(30));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn expired_arm_budget_still_observes_and_cancels_returned_id() {
+            let mock = Arc::new(MockBackend::new());
+            let machine = machine(&mock, MembershipTimings::default());
+            mock.script(MockMethod::DelayedEvent, [MockOutcome::After(
+                Duration::from_secs(8), Box::new(MockOutcome::Ok),
+            )]);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            machine.join(MemberTransports::default(), Some(deadline)).await.unwrap();
+            assert!(machine.delayed_event_id().is_none());
+            assert!(mock.cancelled_events.lock().unwrap().is_empty());
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            assert_eq!(mock.calls_to(MockMethod::DelayedEvent).len(), 1);
+            assert_eq!(mock.cancelled_events.lock().unwrap().as_slice(),
+                &[("!room:example.org".to_owned(), "delayed-!room:example.org-m.rtc.member".to_owned())]);
+            assert!(machine.delayed_event_id().is_none());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn failed_replacement_arm_does_not_immediately_retry_creation() {
+            let mock = Arc::new(MockBackend::new());
+            let machine = machine(&mock, MembershipTimings::default());
+            machine.join(MemberTransports::default(), None).await.unwrap();
+            mock.script(MockMethod::RestartDelayedEvent, [fail_with("M_NOT_FOUND", 404)]);
+            mock.script(MockMethod::DelayedEvent, [fail()]);
+            machine.recover().await;
+            assert_eq!(mock.calls_to(MockMethod::DelayedEvent).len(), 2);
+            assert!(machine.delayed_event_id().is_none());
+            assert!(!machine.delayed_leave_supported());
+            assert_eq!(mock.calls_to(MockMethod::StickyEvent).len(), 2);
+            machine.keep_alive().await;
+            assert_eq!(mock.calls_to(MockMethod::DelayedEvent).len(), 2);
         }
 
         /// R6: the budget is the caller's: a deadline already half spent

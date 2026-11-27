@@ -8,9 +8,9 @@ process command line. Existing sessions are never replaced.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import fcntl
-from session_files import identity_lock, ensure_session, is_ready, mark_ready
+from session_files import identity_lock, ensure_session, is_ready, prepare_ready
 import hashlib
 import json
 import os
@@ -21,12 +21,13 @@ import sys
 import time
 from urllib import error, parse, request
 
-import yaml
+from ghost_namespace import resolve_metadata, username_template_pattern
+from portal_kind import portal_kind
 
 REGISTRATION = Path(os.environ.get("RTC_AUTOPROVISION_REGISTRATION", "/run/secrets/mautrix-whatsapp-registration.yaml"))
 CONFIG = Path(os.environ.get("RTC_AUTOPROVISION_CONFIG", "/run/secrets/mautrix-whatsapp-config.yaml"))
 HOMESERVER = os.environ.get("MATRIX_HOMESERVER", "http://synapse:8008").rstrip("/")
-SERVER = os.environ.get("MATRIXRTC_SERVER_NAME", "").strip().lower()
+SERVER = os.environ.get("MATRIXRTC_SERVER_NAME", "").strip()
 STATE_ROOT = Path(os.environ.get("RTC_WORKER_STATE_DIR", "/var/lib/mautrix-whatsapp-call"))
 INTERVAL = max(5, int(os.environ.get("RTC_AUTOPROVISION_INTERVAL_SECONDS", "15")))
 CACHE_TTL = max(300, int(os.environ.get("RTC_AUTOPROVISION_CACHE_TTL_SECONDS", "21600")))
@@ -34,86 +35,13 @@ NEGATIVE_CACHE_TTL = max(5, int(os.environ.get("RTC_AUTOPROVISION_NEGATIVE_CACHE
 JOBS = max(1, min(16, int(os.environ.get("RTC_AUTOPROVISION_JOBS", "4"))))
 PROVISION_BIN = os.environ.get("RTC_GHOST_PROVISION_BIN", "/usr/local/bin/mautrix-whatsapp-call-provision")
 CACHE_FILE = STATE_ROOT / ".autoprovision-room-cache.json"
+GROUP_MEDIA = os.environ.get("MATRIXRTC_EXPERIMENTAL_INDEPENDENT_GROUP_MEDIA", "0") == "1"
+GROUP_CACHE_TTL = min(CACHE_TTL, 60)
 
 
 def log(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
-
-def load_yaml(path: Path, label: str) -> dict:
-    if not path.is_file():
-        raise RuntimeError(f"{label} not found: {path}")
-    try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError) as exc:
-        raise RuntimeError(f"failed to parse {label} {path}") from None
-    if not isinstance(data, dict):
-        raise RuntimeError(f"{label} root must be a mapping: {path}")
-    return data
-
-
-def registration_value(key: str) -> str:
-    data = load_yaml(REGISTRATION, "WhatsApp appservice registration")
-    value = data.get(key)
-    if not isinstance(value, str) or not value:
-        raise RuntimeError(f"Missing {key} in {REGISTRATION}")
-    return value
-
-
-def config_appservice() -> dict:
-    data = load_yaml(CONFIG, "mautrix-whatsapp config")
-    appservice = data.get("appservice")
-    if not isinstance(appservice, dict):
-        raise RuntimeError(f"Missing appservice mapping in {CONFIG}")
-    return appservice
-
-
-def config_bot_localpart() -> str:
-    appservice = config_appservice()
-    bot = appservice.get("bot")
-    if isinstance(bot, dict):
-        username = bot.get("username")
-        if isinstance(username, str) and username:
-            return username
-    sender = load_yaml(REGISTRATION, "WhatsApp appservice registration").get("sender_localpart")
-    if isinstance(sender, str) and sender:
-        return sender
-    raise RuntimeError(f"Could not determine mautrix-whatsapp bot username from {CONFIG} or {REGISTRATION}")
-
-
-def username_template_pattern(template: str, server_name: str) -> re.Pattern[str]:
-    marker = "{{.}}"
-    if template.count(marker) != 1:
-        raise RuntimeError(f"unsupported mautrix-whatsapp username_template: {template!r}")
-    prefix, suffix = template.split(marker, 1)
-    if not (prefix or suffix) or any(c in prefix + suffix for c in "@:\r\n"):
-        raise RuntimeError("username_template must define a distinct ghost namespace")
-    expression = "^@" + re.escape(prefix) + "[^:]+" + re.escape(suffix) + ":" + re.escape(server_name) + "$"
-    return re.compile(expression)
-
-
-def registration_user_regexes() -> list[re.Pattern[str]]:
-    registration = load_yaml(REGISTRATION, "WhatsApp appservice registration")
-    namespaces = registration.get("namespaces")
-    patterns: list[re.Pattern[str]] = []
-    if isinstance(namespaces, dict):
-        users = namespaces.get("users")
-        if isinstance(users, list):
-            for entry in users:
-                if not isinstance(entry, dict):
-                    continue
-                value = entry.get("regex")
-                if not isinstance(value, str) or "@" not in value:
-                    continue
-                try:
-                    patterns.append(re.compile(value))
-                except re.error as exc:
-                    raise RuntimeError(f"invalid user namespace regex in {REGISTRATION}: {value}: {exc}") from exc
-    template = config_appservice().get("username_template")
-    if not isinstance(template, str) or not template:
-        raise RuntimeError("appservice.username_template is required")
-    scope = username_template_pattern(template, SERVER).pattern
-    return [re.compile(rf"^(?=(?:{p.pattern})){scope[1:]}") for p in patterns] or [re.compile(scope)]
 
 def is_bridge_user(user_id: str, patterns: list[re.Pattern[str]]) -> bool:
     return any(pattern.fullmatch(user_id)  for pattern in patterns)
@@ -149,6 +77,38 @@ def api(path: str, token: str, as_user: str | None = None, body: dict | None = N
         return exc.code, parsed
 
 
+class InvalidRoomResponse(ValueError):
+    """A successful HTTP response did not contain the expected room state."""
+
+
+def validate_room_inputs(members, hints, encryption) -> None:
+    if not all(isinstance(value, dict) for value in (members, hints, encryption)):
+        raise InvalidRoomResponse("room state must be an object")
+    joined = members.get("joined")
+    service = hints.get("service_members")
+    if not isinstance(joined, dict) or not all(isinstance(user, str) and isinstance(info, dict)
+                                               for user, info in joined.items()):
+        raise InvalidRoomResponse("invalid joined members")
+    if not isinstance(service, list) or not all(isinstance(user, str) for user in service):
+        raise InvalidRoomResponse("invalid service members")
+    if not isinstance(encryption.get("algorithm"), str):
+        raise InvalidRoomResponse("invalid encryption algorithm")
+
+
+def validate_portal_state(state) -> None:
+    if not isinstance(state, list) or not all(isinstance(event, dict) for event in state):
+        raise InvalidRoomResponse("invalid room state list")
+    for event in state:
+        if event.get("type") not in ("m.bridge", "uk.half-shot.bridge"):
+            continue
+        content = event.get("content")
+        if not isinstance(content, dict) or not isinstance(event.get("sender"), str):
+            raise InvalidRoomResponse("invalid bridge state event")
+        for key in ("protocol", "channel"):
+            if key in content and not isinstance(content[key], dict):
+                raise InvalidRoomResponse("invalid bridge state content")
+
+
 def eligible_ghost_from_state(
     members: dict,
     hints: dict,
@@ -175,25 +135,8 @@ def eligible_ghost_from_state(
 
 
 def is_whatsapp_dm_portal(state, bot, patterns):
-    if not isinstance(state, list):
-        return False
-    kinds = set()
-    for event in state:
-        if not isinstance(event, dict) or event.get("type") not in ("m.bridge", "uk.half-shot.bridge"):
-            continue
-        content = event.get("content") or {}
-        sender = event.get("sender", "")
-        if content.get("bridgebot") != bot or (content.get("protocol") or {}).get("id") != "whatsapp":
-            continue
-        if sender != bot and not is_bridge_user(sender, patterns):
-            continue
-        jid = (content.get("channel") or {}).get("id", "")
-        kind = content.get("com.beeper.room_type.v2", content.get("com.beeper.room_type"))
-        if isinstance(jid, str) and kind == "dm" and re.search(r"@(s\.whatsapp\.net|lid|hosted|hosted\.lid|bot)$", jid):
-            kinds.add("dm")
-        else:
-            kinds.add("other")
-    return kinds == {"dm"}
+    return portal_kind(state, bot, patterns) == "dm"
+
 
 def run_self_test() -> None:
     bot = "@whatsappbot:example.org"
@@ -230,7 +173,7 @@ def run_self_test() -> None:
 def load_room_cache() -> dict[str, dict]:
     try:
         raw = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except (OSError, ValueError, RecursionError):
         return {}
     if not isinstance(raw, dict):
         return {}
@@ -240,8 +183,11 @@ def load_room_cache() -> dict[str, dict]:
             continue
         checked_at = entry.get("checked_at")
         ghost = entry.get("ghost")
-        if isinstance(checked_at, (int, float)) and isinstance(ghost, str):
-            clean[room_id] = {"checked_at": int(checked_at), "ghost": ghost}
+        if type(checked_at) is int and checked_at >= 0 and isinstance(ghost, str):
+            clean[room_id] = {"checked_at": checked_at, "ghost": ghost}
+            group_ghosts = entry.get("group_ghosts")
+            if isinstance(group_ghosts, list) and all(isinstance(g, str) for g in group_ghosts):
+                clean[room_id]["group_ghosts"] = group_ghosts
     return clean
 
 
@@ -263,7 +209,11 @@ def eligible_ghosts(token: str, bot_mxid: str, ghost_patterns: list[re.Pattern[s
         raise RuntimeError(f"failed to list bridge-bot rooms: HTTP {status}")
 
     now = int(time.time())
-    joined_rooms = [room for room in joined.get("joined_rooms", []) if isinstance(room, str)]
+    if not isinstance(joined, dict) or not isinstance(joined.get("joined_rooms"), list):
+        raise InvalidRoomResponse("invalid joined rooms response")
+    if not all(isinstance(room, str) for room in joined["joined_rooms"]):
+        raise InvalidRoomResponse("invalid joined room ID")
+    joined_rooms = list(dict.fromkeys(joined["joined_rooms"]))
     joined_set = set(joined_rooms)
     cache = {room: entry for room, entry in load_room_cache().items() if room in joined_set}
     # The bridge bot is also the aggregate MatrixRTC identity for WhatsApp
@@ -276,44 +226,81 @@ def eligible_ghosts(token: str, bot_mxid: str, ghost_patterns: list[re.Pattern[s
         if cached:
             ghost = cached.get("ghost", "")
             ttl = CACHE_TTL if ghost else NEGATIVE_CACHE_TTL
-            if now - int(cached.get("checked_at", 0)) < ttl:
-                if not ghost:
+            if GROUP_MEDIA and "group_ghosts" in cached:
+                group_ghosts = cached["group_ghosts"]
+                if 0 <= now - cached["checked_at"] < GROUP_CACHE_TTL and all(
+                    is_bridge_user(g, ghost_patterns) and g.endswith(":" + SERVER) for g in group_ghosts
+                ):
+                    ghosts.update(group_ghosts)
                     continue
-                if is_bridge_user(ghost, ghost_patterns) and ghost_is_ready(ghost):
+            elif 0 <= now - cached["checked_at"] < ttl:
+                if not ghost and GROUP_MEDIA:
+                    pass  # Legacy negative entries may represent groups.
+                elif not ghost:
+                    continue
+                if ghost and is_bridge_user(ghost, ghost_patterns) and ghost_is_ready(ghost):
                     ghosts.add(ghost)
                     continue
 
-        room = parse.quote(room_id, safe="")
-        status, members = api(f"/_matrix/client/v3/rooms/{room}/joined_members", token, bot_mxid)
-        if status != 200:
-            continue
-        status, hints = api(
-            f"/_matrix/client/v3/rooms/{room}/state/io.element.functional_members/",
-            token,
-            bot_mxid,
-        )
-        if status != 200:
-            continue
-        status, encryption = api(
-            f"/_matrix/client/v3/rooms/{room}/state/m.room.encryption/",
-            token,
-            bot_mxid,
-        )
-        if status != 200 or encryption.get("algorithm") != "m.megolm.v1.aes-sha2":
-            cache[room_id] = {"checked_at": now, "ghost": ""}
-            continue
-        ghost = eligible_ghost_from_state(members, hints, encryption, bot_mxid, ghost_patterns, SERVER)
-        if ghost:
-            status, state = api(f"/_matrix/client/v3/rooms/{room}/state", token, bot_mxid)
+        try:
+            room = parse.quote(room_id, safe="")
+            status, members = api(f"/_matrix/client/v3/rooms/{room}/joined_members", token, bot_mxid)
             if status != 200:
                 continue
-            if not is_whatsapp_dm_portal(state, bot_mxid, ghost_patterns):
-                ghost = None
-        cache[room_id] = {"checked_at": now, "ghost": ghost or ""}
-        if ghost:
-            ghosts.add(ghost)
+            status, hints = api(
+                f"/_matrix/client/v3/rooms/{room}/state/io.element.functional_members/",
+                token,
+                bot_mxid,
+            )
+            if status != 200:
+                continue
+            status, encryption = api(
+                f"/_matrix/client/v3/rooms/{room}/state/m.room.encryption/",
+                token,
+                bot_mxid,
+            )
+            if status != 200:
+                continue
+            validate_room_inputs(members, hints, encryption)
+            if encryption.get("algorithm") != "m.megolm.v1.aes-sha2":
+                cache[room_id] = {"checked_at": now, "ghost": ""}
+                continue
+            ghost = eligible_ghost_from_state(members, hints, encryption, bot_mxid, ghost_patterns, SERVER)
+            if ghost or GROUP_MEDIA:
+                status, state = api(f"/_matrix/client/v3/rooms/{room}/state", token, bot_mxid)
+                if status != 200:
+                    continue
+                validate_portal_state(state)
+                kind = portal_kind(state, bot_mxid, ghost_patterns)
+                if kind != "dm":
+                    ghost = None
+                if GROUP_MEDIA and kind == "group":
+                    joined = set(members["joined"])
+                    services = set(hints["service_members"])
+                    local = ":" + SERVER
+                    group_ghosts = []
+                    if bot_mxid in joined and bot_mxid in services and any(
+                        u.endswith(local) and u not in services and not is_bridge_user(u, ghost_patterns)
+                        for u in joined
+                    ):
+                        group_ghosts = sorted(u for u in joined - services - {bot_mxid}
+                            if u.endswith(local) and is_bridge_user(u, ghost_patterns))
+                    cache[room_id] = {"checked_at": now, "ghost": "", "group_ghosts": group_ghosts}
+                    ghosts.update(group_ghosts)
+                    continue
+            cache[room_id] = {"checked_at": now, "ghost": ghost or ""}
+            if ghost:
+                ghosts.add(ghost)
+        except (OSError, json.JSONDecodeError, UnicodeError, InvalidRoomResponse) as exc:
+            # A transient read failure is not evidence that a room is ineligible.
+            log(f"MatrixRTC auto-provision room read failed for {room_id}: {type(exc).__name__}")
+            continue
 
-    save_room_cache(cache)
+    try:
+        save_room_cache(cache)
+    except OSError as exc:
+        # The cache is an optimisation, not a prerequisite for provisioning.
+        log(f"MatrixRTC auto-provision cache write failed: {type(exc).__name__}")
     return sorted(ghosts)
 
 
@@ -342,7 +329,13 @@ def ghost_state_folder(ghost: str) -> Path:
 
 def ghost_is_ready(ghost: str) -> bool:
     folder = ghost_state_folder(ghost)
-    return is_ready(folder,ghost)
+    try:
+        return is_ready(folder, ghost)
+    except OSError:
+        # Readiness discovery is advisory. A local failure must not abort the
+        # entire room scan. The per-identity provisioning job will recheck
+        # under its lock and report any persistent error independently.
+        return False
 
 
 def ensure_ghost(ghost: str, token: str) -> tuple[str, bool, str]:
@@ -352,59 +345,85 @@ def ensure_ghost(ghost: str, token: str) -> tuple[str, bool, str]:
             return ghost, False, "ready"
 
         write_session(ghost, token)
-        env = os.environ.copy()
-        env["RTC_GHOST_MXID"] = ghost
-        env["RTC_WORKER_STATE_DIR"] = str(STATE_ROOT)
-        env["MATRIX_HOMESERVER"] = HOMESERVER
-        if HOMESERVER.startswith("http://"):
-            env["RTC_ALLOW_INSECURE_HOMESERVER"] = "1"
-        result = subprocess.run(
-            [PROVISION_BIN],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=120,
-            check=False,
-        )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip().splitlines()
-            last = detail[-1] if detail else f"exit {result.returncode}"
-            raise RuntimeError(f"cross-signing preparation failed for {ghost}: {last}")
-        mark_ready(folder, ghost)
+        with prepare_ready(folder, ghost):
+            env = os.environ.copy()
+            env["RTC_GHOST_MXID"] = ghost
+            env["RTC_WORKER_STATE_DIR"] = str(STATE_ROOT)
+            env["MATRIX_HOMESERVER"] = HOMESERVER
+            if HOMESERVER.startswith("http://"):
+                env["RTC_ALLOW_INSECURE_HOMESERVER"] = "1"
+            result = subprocess.run(
+                [PROVISION_BIN],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout).strip().splitlines()
+                last = detail[-1] if detail else f"exit {result.returncode}"
+                raise RuntimeError(f"cross-signing preparation failed for {ghost}: {last}")
         return ghost, True, "provisioned"
 
 
 def scan_once() -> int:
     if not SERVER or "." not in SERVER:
         raise RuntimeError("MATRIXRTC_SERVER_NAME is required")
-    token = registration_value("as_token")
-    bot_localpart = config_bot_localpart()
-    ghost_patterns = registration_user_regexes()
+    metadata = resolve_metadata(REGISTRATION, CONFIG, SERVER)
+    token = metadata["as_token"]
+    bot_localpart = metadata["bot_localpart"]
+    ghost_patterns = [re.compile(pattern) for pattern in metadata["ghost_regexes"]]
     bot_mxid = f"@{bot_localpart}:{SERVER}"
     status, whoami = api("/_matrix/client/v3/account/whoami", token, bot_mxid)
     if status != 200 or whoami.get("user_id") != bot_mxid:
         raise RuntimeError(f"WhatsApp appservice token cannot authenticate as {bot_mxid}")
 
-    ghosts = eligible_ghosts(token, bot_mxid, ghost_patterns)
-    pending = [ghost for ghost in ghosts if not ghost_is_ready(ghost)]
-    if not pending:
-        return 0
-
     failures = 0
     changed = 0
+    # Group-call readiness must not depend on enumerating the DM rooms.
+    # Prepare the authenticated bot once before discovery, even if discovery fails.
+    if not ghost_is_ready(bot_mxid):
+        try:
+            _, was_changed, _ = ensure_ghost(bot_mxid, token)
+            if was_changed:
+                changed += 1
+                log(f"MatrixRTC auto-provisioned ghost: {bot_mxid}")
+        except Exception as exc:
+            failures += 1
+            log(f"MatrixRTC auto-provision failed for {bot_mxid}: {exc}")
+
+    try:
+        ghosts = eligible_ghosts(token, bot_mxid, ghost_patterns)
+    except (RuntimeError, OSError, ValueError) as exc:
+        log(f"MatrixRTC auto-provision discovery failed: {type(exc).__name__}")
+        return failures + 1
+    pending = [ghost for ghost in ghosts if ghost != bot_mxid and not ghost_is_ready(ghost)]
+    if not pending:
+        return failures
+
+    # Keep executor backlog bounded even on installations with many contacts.
+    remaining = iter(pending)
     with ThreadPoolExecutor(max_workers=JOBS) as pool:
-        futures = {pool.submit(ensure_ghost, ghost, token): ghost for ghost in pending}
-        for future in as_completed(futures):
-            ghost = futures[future]
-            try:
-                _, was_changed, _ = future.result()
-                if was_changed:
-                    changed += 1
-                    log(f"MatrixRTC auto-provisioned ghost: {ghost}")
-            except Exception as exc:
-                failures += 1
-                log(f"MatrixRTC auto-provision failed for {ghost}: {exc}")
+        futures = {pool.submit(ensure_ghost, ghost, token): ghost
+                   for ghost in (next(remaining, None) for _ in range(JOBS))
+                   if ghost is not None}
+        while futures:
+            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done:
+                ghost = futures.pop(future)
+                try:
+                    _, was_changed, _ = future.result()
+                    if was_changed:
+                        changed += 1
+                        log(f"MatrixRTC auto-provisioned ghost: {ghost}")
+                except Exception as exc:
+                    failures += 1
+                    log(f"MatrixRTC auto-provision failed for {ghost}: {exc}")
+                next_ghost = next(remaining, None)
+                if next_ghost is not None:
+                    futures[pool.submit(ensure_ghost, next_ghost, token)] = next_ghost
     if changed or failures:
         log(f"MatrixRTC auto-provision pass: eligible={len(ghosts)} pending={len(pending)} provisioned={changed} failed={failures}")
     return failures

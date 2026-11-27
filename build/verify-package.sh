@@ -20,15 +20,17 @@ for rel in \
     deployment/mautrix-whatsapp-call/compose.yml \
     deployment/mautrix-whatsapp-call/install-or-upgrade.sh \
     deployment/mautrix-whatsapp-call/render-hostname.py \
+    deployment/mautrix-whatsapp-call/validate-candidate.py \
     deployment/mautrix-whatsapp-call/bridge/Dockerfile \
     deployment/mautrix-whatsapp-call/bridge/mautrix-whatsapp-call-bridge \
     deployment/mautrix-whatsapp-call/worker/Dockerfile \
     deployment/mautrix-whatsapp-call/worker/mautrix-whatsapp-call-worker \
     deployment/mautrix-whatsapp-call/worker/mautrix-whatsapp-call-provision \
-    SOURCE-VERSIONS.env SHA256SUMS; do
+    SOURCE-VERSIONS.env BUILD-RECORD.json SHA256SUMS; do
     [[ -f "$ROOT/$rel" ]] || { echo "Missing release file: $rel" >&2; exit 41; }
 done
 python3 -B "$SCRIPT_DIR/runtime-layout.py" verify-tree "$ROOT"
+python3 -B "$SCRIPT_DIR/build-record.py" verify-release "$ROOT"
 
 bad_mode="$(find "$ROOT" -xdev \( -perm -0020 -o -perm -0002 \) -print -quit)"
 if [[ -n "$bad_mode" ]]; then

@@ -198,8 +198,9 @@ pub fn build_invite_withdrawal(slot_id: &str) -> Value {
 }
 
 /// What ringing or notifying sends in `format`, as its event type and
-/// content, stamped `sender_ts_ms`: an `m.rtc.invite` in MSC (spec 038 R26),
-/// today's `m.rtc.notification` in room-state (R36).
+/// content, stamped `sender_ts_ms`. MSC rings use `m.rtc.invite`; visual
+/// notifications in either dialect use the typed `m.rtc.notification`
+/// envelope so an invite cannot turn a visual notification into a ring.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ring_event(
     format: MembershipFormat,
@@ -211,8 +212,8 @@ pub(crate) fn ring_event(
     member_event_id: &str,
     sender_ts_ms: u64,
 ) -> (&'static str, Value) {
-    match format {
-        MembershipFormat::Msc => (
+    match (format, config.notification_type) {
+        (MembershipFormat::Msc, NotificationType::Ring) => (
             INVITE_EVENT_TYPE,
             build_invite_content(
                 slot_id,
@@ -221,7 +222,7 @@ pub(crate) fn ring_event(
                 sender_ts_ms,
             ),
         ),
-        MembershipFormat::RoomState => (
+        _ => (
             NOTIFICATION_EVENT_TYPE,
             build_notification_content(
                 config,
@@ -352,9 +353,8 @@ pub(crate) fn others_joined(members: &[JoinedMembership], user_id: &str, device_
 /// budget (R6) — or, without one, for as long as the notification lives.
 /// Keyed by the join's scope, so the join's leave cancels it.
 ///
-/// `format` decides what goes out: an `m.rtc.invite` in MSC, which relates
-/// to nothing, or today's notification, which relates to `member_event_id`
-/// (spec 038 R26, R36). An invite that targets nobody is not sent (R28).
+/// A visual notification always relates to `member_event_id`; it never
+/// creates an MSC invite. An event that targets nobody is not sent (R28).
 #[allow(clippy::too_many_arguments)]
 pub async fn notify_session_started<B: MatrixBackend + 'static>(
     backend: &DialectBackend<B>,
@@ -428,12 +428,28 @@ pub async fn notify_session_started<B: MatrixBackend + 'static>(
     );
     let sent = outbox
         .send(key, SendPolicy::new().deadline(budget), || {
-            backend.send_sticky_event(
-                room_id.to_owned(),
-                event_type.to_owned(),
-                content.clone(),
-                notification_sticky_duration_ms(notify.lifetime_ms()),
-            )
+            let content = content.clone();
+            async move {
+                // The visual-only notification has no sticky invite key. Send it
+                // as the deployed timeline event in MSC too; retain the legacy
+                // dialect's existing notification rewrite and routing.
+                if format == MembershipFormat::Msc
+                    && notify.notification_type == NotificationType::Notification
+                {
+                    backend.send_room_event(
+                        room_id.to_owned(),
+                        matrix_rtc_core::wire_event_type(event_type).to_owned(),
+                        content,
+                    ).await
+                } else {
+                    backend.send_sticky_event(
+                        room_id.to_owned(),
+                        event_type.to_owned(),
+                        content,
+                        notification_sticky_duration_ms(notify.lifetime_ms()),
+                    ).await
+                }
+            }
         })
         .await;
     if let Err(error) = sent {
@@ -457,6 +473,28 @@ mod tests {
             "$member_event",
             1_752_583_130_365,
         )
+    }
+
+    #[test]
+    fn notification_dialect_preserves_visual_intent() {
+        for format in [MembershipFormat::Msc, MembershipFormat::RoomState] {
+            for config in [NotifyConfig::notification(), NotifyConfig::ring()] {
+                let (event_type, content) = ring_event(
+                    format, &config, "m.call#room", "m.call", "@alice:example.org",
+                    "DEVICEID", "$member_event", 123,
+                );
+                if format == MembershipFormat::Msc && config.notification_type == NotificationType::Ring {
+                    assert_eq!(event_type, INVITE_EVENT_TYPE);
+                    assert_eq!(content["msc4354_sticky_key"], "m.call#room");
+                } else {
+                    assert_eq!(event_type, NOTIFICATION_EVENT_TYPE);
+                    assert_eq!(content["notification_type"], config.notification_type.as_str());
+                    assert_eq!(content["application"]["notification_type"], config.notification_type.as_str());
+                    assert_eq!(content["m.relates_to"]["event_id"], "$member_event");
+                    assert!(content.get("msc4354_sticky_key").is_none());
+                }
+            }
+        }
     }
 
     /// MSC4075 as written: everything under `application`, plus the three

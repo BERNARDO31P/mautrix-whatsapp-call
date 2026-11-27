@@ -100,6 +100,8 @@ pub enum FfiScriptedOutcome {
         retry_after_ms: Option<u64>,
         permanent: bool,
     },
+    /// Accepted delayed mutation or to-device send whose reply is lost.
+    AcceptedThenFail,
     /// Never answers, as a request the network swallowed.
     Hang,
     /// Succeeds after `delay_ms`.
@@ -120,6 +122,7 @@ impl From<FfiScriptedOutcome> for MockOutcome {
                     .with_retry_after_ms(retry_after_ms);
                 Self::Fail(if permanent { error.permanent() } else { error })
             }
+            FfiScriptedOutcome::AcceptedThenFail => Self::AcceptedThenFail(BackendError::new("scripted response loss")),
             FfiScriptedOutcome::Hang => Self::Hang,
             FfiScriptedOutcome::Slow { delay_ms } => {
                 Self::After(Duration::from_millis(delay_ms), Box::new(Self::Ok))
@@ -156,9 +159,9 @@ pub struct ScriptedMatrixBackend {
 impl ScriptedMatrixBackend {
     #[uniffi::constructor]
     pub fn new(user_id: String, device_id: String) -> Arc<Self> {
-        Arc::new(Self {
-            mock: Arc::new(MockBackend::with_identity(user_id, device_id)),
-        })
+        let mock = Arc::new(MockBackend::with_identity(user_id, device_id));
+        mock.enable_delayed_model();
+        Arc::new(Self { mock })
     }
 
     /// This backend as the library takes it.
@@ -264,6 +267,13 @@ impl ScriptedMatrixBackend {
             .collect()
     }
 
+    /// Content of attempted sends (including cancelled, rejected or lost replies).
+    pub fn to_device_attempted(&self, user_id: String, device_id: String) -> Vec<String> {
+        self.mock.to_device_attempts.lock().unwrap().iter()
+            .filter(|(u, d, _, _)| u == &user_id && d == &device_id)
+            .map(|(_, _, _, content)| content.to_string()).collect()
+    }
+
     /// Every call received so far, in order.
     pub fn calls(&self) -> Vec<FfiScriptedCall> {
         self.mock
@@ -283,12 +293,12 @@ impl ScriptedMatrixBackend {
     pub fn play(&self, fixture: String) -> Result<(), FfiScriptError> {
         let away = |secs: u64| {
             let mock = self.mock.clone();
-            mock.set_outage(Some(MockOutcome::Fail(BackendError::new(
+            let generation = mock.begin_outage(Some(MockOutcome::Fail(BackendError::new(
                 "scripted outage: the homeserver is away",
             ))));
             runtime().spawn(async move {
                 tokio::time::sleep(Duration::from_secs(secs)).await;
-                mock.set_outage(None);
+                mock.end_outage(generation);
             });
         };
         match fixture.as_str() {
@@ -697,11 +707,11 @@ impl ScriptedMediaTransport {
         let own = self.inner.own_key();
         match (fixture.as_str(), own) {
             ("outage.own_sfu.recovers_40s", Some(own)) => {
-                self.inner.close(&own);
+                let generation = self.inner.close_generation(&own);
                 let inner = self.inner.clone();
                 runtime().spawn(async move {
                     tokio::time::sleep(Duration::from_secs(40)).await;
-                    inner.restore(&own);
+                    inner.restore_generation(&own, generation);
                 });
             }
             ("outage.own_sfu.budget" | "outage.own_sfu.fallback", Some(own)) => {
@@ -714,14 +724,15 @@ impl ScriptedMediaTransport {
                     .into_iter()
                     .filter(|focus| Some(focus) != own.as_ref())
                     .collect();
-                for peer in &peers {
-                    self.inner.interrupt(peer);
-                }
+                let peers: Vec<_> = peers.into_iter().map(|peer| {
+                    let generation = self.inner.interrupt_generation(&peer);
+                    (peer, generation)
+                }).collect();
                 let inner = self.inner.clone();
                 runtime().spawn(async move {
                     tokio::time::sleep(Duration::from_secs(60)).await;
-                    for peer in &peers {
-                        inner.restore(peer);
+                    for (peer, generation) in peers {
+                        inner.restore_generation(&peer, generation);
                     }
                 });
             }

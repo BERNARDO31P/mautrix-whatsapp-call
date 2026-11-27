@@ -42,3 +42,14 @@ func TestParseVoipSettingsOpus(t *testing.T) {
 		t.Error("UseMlowCodecV1 = true, want false")
 	}
 }
+
+func TestPartialVoipSettingsPreserveCodec(t *testing.T) {
+	vs, err := ParseVoipSettings([]byte(`{"encode":{"frame_ms":"20"}}`))
+	if err != nil || vs.CodecExplicit || vs.FrameMs != 20 {
+		t.Fatalf("partial codec settings: %+v / %v", vs, err)
+	}
+	vs, err = ParseVoipSettings([]byte(`{"encode":{"use_mlow_codec_v1":"false"}}`))
+	if err != nil || !vs.CodecExplicit || vs.UseMlowCodecV1 {
+		t.Fatalf("explicit codec settings: %+v / %v", vs, err)
+	}
+}

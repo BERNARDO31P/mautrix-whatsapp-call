@@ -33,6 +33,8 @@ use crate::{
 struct Focus {
     /// Connects fail while set.
     down: bool,
+    /// Ownership of a timed outage; a stale recovery cannot restore this focus.
+    outage_generation: u64,
     /// Connects are refused while set.
     refused: bool,
     /// How many more connects present a rejected token.
@@ -119,43 +121,69 @@ impl ScriptedTransport {
 
     /// The transport loses `key` and tries to get it back: connects fail and
     /// a live connection reports [`ConnectionEvent::Reconnecting`].
-    pub fn interrupt(&self, key: &str) {
+    pub fn interrupt(&self, key: &str) { self.interrupt_generation(key); }
+
+    pub fn interrupt_generation(&self, key: &str) -> u64 {
         self.with_focus(key, |focus| {
+            focus.outage_generation = focus.outage_generation.checked_add(1).expect("outage generation exhausted");
             focus.down = true;
             if let Some(events) = &focus.events {
                 let _ = events.send(ConnectionEvent::Reconnecting);
             }
-        });
+            focus.outage_generation
+        })
     }
 
     /// The transport gives `key` up: connects fail, and a live connection
     /// reports [`ConnectionEvent::Closed`] and ends.
-    pub fn close(&self, key: &str) {
+    pub fn close(&self, key: &str) { self.close_generation(key); }
+
+    pub fn close_generation(&self, key: &str) -> u64 {
         self.with_focus(key, |focus| {
+            focus.outage_generation = focus.outage_generation.checked_add(1).expect("outage generation exhausted");
             focus.down = true;
             if let Some(events) = focus.events.take() {
                 let _ = events.send(ConnectionEvent::Closed {
                     message: "scripted outage".to_owned(),
                 });
             }
-        });
+            focus.outage_generation
+        })
     }
 
     /// `key` works again: connects succeed, and a connection that was only
     /// interrupted reports [`ConnectionEvent::Reconnected`].
     pub fn restore(&self, key: &str) {
         self.with_focus(key, |focus| {
-            focus.down = false;
-            focus.refused = false;
-            if let Some(events) = &focus.events {
-                let _ = events.send(ConnectionEvent::Reconnected);
-            }
+            focus.outage_generation = focus.outage_generation.checked_add(1).expect("outage generation exhausted");
+            Self::restore_focus(focus);
         });
+    }
+
+    pub fn restore_generation(&self, key: &str, generation: u64) -> bool {
+        self.with_focus(key, |focus| {
+            if focus.outage_generation != generation { return false; }
+            focus.outage_generation = focus.outage_generation.checked_add(1).expect("outage generation exhausted");
+            Self::restore_focus(focus);
+            true
+        })
+    }
+
+    fn restore_focus(focus: &mut Focus) {
+        let changed = focus.down || focus.refused;
+        focus.down = false;
+        focus.refused = false;
+        if changed && let Some(events) = &focus.events {
+            let _ = events.send(ConnectionEvent::Reconnected);
+        }
     }
 
     /// Connects to `key` are refused for good (a 4xx), until restored.
     pub fn refuse(&self, key: &str) {
-        self.with_focus(key, |focus| focus.refused = true);
+        self.with_focus(key, |focus| {
+            focus.outage_generation = focus.outage_generation.checked_add(1).expect("outage generation exhausted");
+            focus.refused = true;
+        });
     }
 
     /// The next `times` connects to `key` present a token the SFU rejects.
@@ -373,7 +401,7 @@ impl TransportConnection for ScriptedConnection {
         Some(Box::new(self.current()))
     }
 
-    fn take_over(&self, handover: Box<dyn Any>) -> Result<(), TransportError> {
+    fn take_over(&self, handover: Box<dyn Any>) -> Result<Option<tokio::sync::oneshot::Receiver<Result<(), TransportError>>>, TransportError> {
         let key = handover.downcast::<String>().map_err(|_| {
             TransportError::Unsupported("not a scripted connection's handover".into())
         })?;
@@ -384,7 +412,7 @@ impl TransportConnection for ScriptedConnection {
             .takeovers
             .push((*key).clone());
         *self.current.lock().expect("scripted connection poisoned") = *key;
-        Ok(())
+        Ok(None)
     }
 
     async fn close(&self) -> Result<(), TransportError> {
@@ -431,5 +459,26 @@ impl LocalTrackHandle for ScriptedLocalTrack {
 
     async fn unpublish(&self) -> Result<(), TransportError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod outage_tests {
+    use super::*;
+
+    #[test]
+    fn stale_restore_cannot_reopen_superseding_outage() {
+        let transport = ScriptedTransport::new();
+        let old = transport.interrupt_generation("a");
+        let new = transport.close_generation("a");
+        let peer = transport.interrupt_generation("b");
+        assert!(!transport.restore_generation("a", old));
+        assert!(transport.restore_generation("b", peer));
+        assert!(transport.with_focus("a", |focus| focus.down));
+        transport.refuse("a");
+        assert!(!transport.restore_generation("a", new));
+        assert!(transport.with_focus("a", |focus| focus.refused));
+        transport.restore("a");
+        assert!(!transport.with_focus("a", |focus| focus.down || focus.refused));
     }
 }

@@ -84,7 +84,7 @@ func mediaTestGroupUpdate(self, peer, added, pending types.JID, transactionID ui
 	return groupCallUpdate{CallID: "CID", TransactionID: transactionID, Participants: participants}
 }
 
-func protectParticipantAudio(t *testing.T, callKey []byte, self, sender types.JID, payload []byte) ([]byte, uint32) {
+func newTestParticipantAudioSender(t *testing.T, callKey []byte, self, sender types.JID) (*MediaPipeline, uint32) {
 	t.Helper()
 	participantID := rtp.FormatE2ESrtpParticipantID(sender.String())
 	ssrc, err := rtp.DeriveWasmParticipantSsrc("CID", participantID, 0)
@@ -95,6 +95,12 @@ func protectParticipantAudio(t *testing.T, callKey []byte, self, sender types.JI
 	if err != nil {
 		t.Fatalf("sender pipeline: %v", err)
 	}
+	return tx, ssrc
+}
+
+func protectParticipantAudio(t *testing.T, callKey []byte, self, sender types.JID, payload []byte) ([]byte, uint32) {
+	t.Helper()
+	tx, ssrc := newTestParticipantAudioSender(t, callKey, self, sender)
 	packet, err := tx.ProtectAudio(payload)
 	if err != nil {
 		t.Fatalf("protect sender audio: %v", err)
@@ -781,8 +787,9 @@ func TestParticipantReceiveRegistryBuffersSharedRawEpochUntilRoster(t *testing.T
 		t.Fatalf("apply matching roster: %v", err)
 	}
 	for _, participant := range []types.JID{peer, added} {
-		packet, _ := protectRawParticipantAudio(t, rawKey, participant, []byte{1})
-		if _, ok := registry.DecodeAudio(packet); !ok {
+		// Use a valid 16 kHz / 60 ms MLow SID, not an arbitrary active TOC byte.
+		packet, _ := protectRawParticipantAudio(t, rawKey, participant, []byte{0x90})
+		if audio, ok := registry.DecodeAudio(packet); !ok || len(audio.PCM) != FrameSamples {
 			t.Fatalf("buffered shared epoch did not activate %s", participant)
 		}
 	}
@@ -813,16 +820,24 @@ func TestParticipantReceiveRegistryCarriesCurrentEpochToNewRosterMembers(t *test
 	if err = registry.ApplyGroupUpdate(mediaTestGroupUpdate(self, peer, added, pending, 18, true)); err != nil {
 		t.Fatalf("apply expanded roster: %v", err)
 	}
-	addedPacket, _ := protectRawParticipantAudio(t, rawKey, added, []byte{1})
-	if _, ok := registry.DecodeAudio(addedPacket); !ok {
+	addedPacket, _ := protectRawParticipantAudio(t, rawKey, added, []byte{0x90})
+	if audio, ok := registry.DecodeAudio(addedPacket); !ok || len(audio.PCM) != FrameSamples {
 		t.Fatal("new roster member did not inherit the current shared epoch")
 	}
 	staleKey := bytes.Repeat([]byte{0xd8}, 32)
 	if err = registry.ApplyGroupRawEpoch(16, staleKey); err != nil {
 		t.Fatalf("stale epoch: %v", err)
 	}
-	peerPacket, _ := protectRawParticipantAudio(t, rawKey, peer, []byte{2})
-	if _, ok := registry.DecodeAudio(peerPacket); !ok {
+	if !registry.hasEpoch || registry.installedEpoch.transactionID != 17 || !bytes.Equal(registry.installedEpoch.rawKey, rawKey) {
+		t.Fatal("stale epoch changed the installed epoch record")
+	}
+	// Attempt the wrong key first: a repeated timestamp cannot mask acceptance.
+	stalePacket, _ := protectRawParticipantAudio(t, staleKey, peer, []byte{0x90})
+	if _, ok := registry.DecodeAudio(stalePacket); ok {
+		t.Fatal("stale epoch packet was accepted")
+	}
+	peerPacket, _ := protectRawParticipantAudio(t, rawKey, peer, []byte{0x90})
+	if audio, ok := registry.DecodeAudio(peerPacket); !ok || len(audio.PCM) != FrameSamples {
 		t.Fatal("stale epoch replaced the current shared epoch")
 	}
 }
@@ -849,8 +864,11 @@ func TestParticipantReceiveRegistryRejectsMalformedEpochWithoutChangingMedia(t *
 	if err = registry.ApplyGroupRawEpoch(17, bytes.Repeat([]byte{1}, 31)); err == nil {
 		t.Fatal("short group raw epoch was accepted")
 	}
-	peerPacket, _ := protectParticipantAudio(t, callKey, self, peer, []byte{3})
-	if _, ok := registry.DecodeAudio(peerPacket); !ok {
+	if registry.hasEpoch || len(registry.pendingEpochs) != 0 {
+		t.Fatal("malformed epoch was installed or buffered")
+	}
+	peerPacket, _ := protectParticipantAudio(t, callKey, self, peer, []byte{0x90})
+	if audio, ok := registry.DecodeAudio(peerPacket); !ok || len(audio.PCM) != FrameSamples {
 		t.Fatal("malformed epoch changed a working receive key")
 	}
 	remote, err := NewMediaPipeline(callKey, peer.String(), self.String(), selfSSRC, FrameSamples)
@@ -1425,5 +1443,98 @@ func TestParticipantReceiveRegistryDepartureWaitsForInFlightDecode(t *testing.T)
 	}
 	if _, ok := registry.DecodeAudio(addedPacket); ok {
 		t.Fatal("departed participant produced audio after pruning completed")
+	}
+}
+
+func TestAudioTimestampAdmission(t *testing.T) {
+	var a, b audioTimestampAdmission
+	for _, step := range []struct {
+		ts   uint32
+		want bool
+	}{
+		{0xfffffc40, true}, {0xfffffc40, false}, {0, true}, {0xfffffc40, false}, {960, true}, {0, false}, {960, false}, {1920, true},
+	} {
+		if got := a.accept(step.ts); got != step.want {
+			t.Fatalf("timestamp %d: got %v want %v", step.ts, got, step.want)
+		}
+	}
+	if !b.accept(0) || !b.accept(960) {
+		t.Fatal("different receiver shared timestamp cursor")
+	}
+}
+
+func TestRetiredRegistryRejectsRetainedMediaHandlesAndRekey(t *testing.T) {
+	key := iota32()
+	self := mediaTestJID("111111111111111", 14)
+	peer := mediaTestJID("222222222222222", 0)
+	registry, err := newParticipantReceiveRegistry("CID", key, self.String(), peer.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiver := registry.byDeviceID[registry.fallbackID]
+	sender, err := NewMediaPipeline(key, self.String(), peer.String(), 0x10203040, FrameSamples)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = registry.attachSendPipeline(sender); err != nil {
+		t.Fatal(err)
+	}
+	rtcp, err := newMediaSrtcpSender(key, self.String(), 0x10203040, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = registry.attachSRTCPSender(rtcp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = sender.ProtectAudio([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	packet, _ := protectParticipantAudio(t, key, self, peer, []byte{1})
+	if _, _, ok := receiver.pipe.UnprotectAudio(packet); !ok {
+		t.Fatal("active receive rejected packet")
+	}
+	// Clear is terminal and idempotent, even with retained references.
+	registry.clear()
+	registry.clear()
+	for _, pipe := range []*MediaPipeline{sender, receiver.pipe, receiver.videoPipe, receiver.appDataPipe} {
+		if _, err = pipe.ProtectAudio([]byte{1}); !errors.Is(err, errMediaKeysRetired) {
+			t.Fatalf("retired audio: %v", err)
+		}
+		if _, err = pipe.ProtectRTP(&rtp.RtpHeader{}, []byte{1}); !errors.Is(err, errMediaKeysRetired) {
+			t.Fatalf("retired RTP: %v", err)
+		}
+		if _, _, ok := pipe.UnprotectAudio(packet); ok {
+			t.Fatal("retired receive accepted packet")
+		}
+		if err = pipe.RekeyRecv(key, peer.String()); !errors.Is(err, errMediaKeysRetired) {
+			t.Fatalf("retired receive rekey: %v", err)
+		}
+		if err = pipe.RekeySendFromRaw(key, self.String()); !errors.Is(err, errMediaKeysRetired) {
+			t.Fatalf("retired send rekey: %v", err)
+		}
+	}
+	if _, err = rtcp.senderReport(rtp.RtcpSenderStats{}, 1, nil); !errors.Is(err, errMediaKeysRetired) {
+		t.Fatalf("retired SRTCP: %v", err)
+	}
+	if _, err = rtcp.groupSenderReport(rtp.RtcpSenderStats{}, 1, nil); !errors.Is(err, errMediaKeysRetired) {
+		t.Fatalf("retired group SRTCP: %v", err)
+	}
+	if _, err = rtcp.pictureLossIndication(1); !errors.Is(err, errMediaKeysRetired) {
+		t.Fatalf("retired PLI: %v", err)
+	}
+	if err = receiver.srtcp.rekey(key, peer.String()); !errors.Is(err, errMediaKeysRetired) {
+		t.Fatalf("retired SRTCP receive rekey: %v", err)
+	}
+	if err = registry.ApplyGroupRawEpoch(1, key); !errors.Is(err, errMediaKeysRetired) {
+		t.Fatalf("retired epoch: %v", err)
+	}
+	if err = registry.RekeyFallback(peer.String()); !errors.Is(err, errMediaKeysRetired) {
+		t.Fatalf("retired fallback: %v", err)
+	}
+	if err = registry.attachSendPipeline(sender); !errors.Is(err, errMediaKeysRetired) {
+		t.Fatalf("retired attach: %v", err)
+	}
+	if err = registry.attachSRTCPSender(rtcp); !errors.Is(err, errMediaKeysRetired) {
+		t.Fatalf("retired RTCP attach: %v", err)
 	}
 }

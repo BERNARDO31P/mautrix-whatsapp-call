@@ -224,6 +224,8 @@ struct Bus {
     /// so counting only the accepted ones would make an unreachable member look
     /// cheap.
     sends: AtomicU64,
+    /// Accepted recipient messages, separately from request attempts.
+    accepted: AtomicU64,
     /// The same sends, kept in order with who sent what to which device, so a
     /// scenario can be broken down into "this change cost these keys and these
     /// messages" rather than just a total. Feeds `Call::describe_since`.
@@ -363,6 +365,7 @@ impl MatrixBackend for PeerSender {
                 deliveries.push(ToDeviceDelivery::failed(recipient, "M_LIMIT_EXCEEDED"));
                 continue;
             }
+            self.bus.accepted.fetch_add(1, Ordering::SeqCst);
             self.bus.in_flight.lock().unwrap().push(KeyMessage {
                 from_member_id: from_member_id.clone(),
                 to: recipient.clone(),
@@ -459,6 +462,8 @@ struct Call {
     config: EncryptionConfig,
     /// Bumped per join so a rejoining device gets a fresh `member_id`.
     joins: u32,
+    /// Completed participations: retain their costs without retaining key bytes.
+    retired: Vec<(String, String, usize)>,
 }
 
 impl Call {
@@ -470,6 +475,7 @@ impl Call {
             peers: Vec::new(),
             config,
             joins: 0,
+            retired: Vec::new(),
         }
     }
 
@@ -508,7 +514,9 @@ impl Call {
 
         // A rejoin reuses the device but never the participation.
         if let Some(existing) = self.peers.iter().position(|peer| peer.name == name) {
-            self.peers.remove(existing);
+            let retired = self.peers.remove(existing);
+            assert!(!retired.in_call, "a rejoin must retire its previous membership");
+            self.retired.push((retired.name, retired.member_id, retired.media.keys_minted()));
         }
 
         let media = Arc::new(MediaSim::new(
@@ -705,20 +713,23 @@ impl Call {
     /// whole call's spend, where `total_rotations` discounts the key each member
     /// arrives with.
     fn keys_minted_total(&self) -> usize {
-        self.peers.iter().map(|peer| peer.media.keys_minted()).sum()
+        self.peers.iter().map(|peer| peer.media.keys_minted()).sum::<usize>()
+            + self.retired.iter().map(|(_, _, keys)| *keys).sum::<usize>()
     }
 
     fn total_rotations(&self) -> usize {
         self.peers
             .iter()
             .map(|peer| peer.media.keys_minted().saturating_sub(1))
-            .sum()
+            .sum::<usize>() + self.retired.iter().map(|(_, _, keys)| keys.saturating_sub(1)).sum::<usize>()
     }
 
-    /// Every (message, recipient) pair the homeserver accepted.
+    /// Every attempted (message, recipient) pair, accepted or rejected.
     fn key_sends(&self) -> u64 {
         self.bus.sends()
     }
+
+    fn accepted_key_sends(&self) -> u64 { self.bus.accepted.load(Ordering::SeqCst) }
 
     /// Where the send log stands now, to describe what a later step cost.
     fn mark(&self) -> usize {
@@ -743,13 +754,15 @@ impl Call {
                 .iter()
                 .find(|peer| &peer.member_id == member_id)
                 .map(|peer| peer.name.as_str())
+                .or_else(|| self.retired.iter().find(|(_, id, _)| id == member_id).map(|(name, _, _)| name.as_str()))
                 .unwrap_or("<gone>");
+            let participation = format!("{name}[{member_id}]");
             match counted
                 .iter_mut()
-                .find(|(seen, seen_index, _)| seen == name && seen_index == index)
+                .find(|(seen, seen_index, _)| seen == &participation && seen_index == index)
             {
                 Some((_, _, count)) => *count += 1,
-                None => counted.push((name.to_owned(), *index, 1)),
+                None => counted.push((participation, *index, 1)),
             }
         }
 
@@ -774,9 +787,10 @@ impl Call {
             .map(|peer| format!("{}:{:?}", peer.name, peer.media.own_indexes()))
             .collect();
         format!(
-            "{} key(s) minted after the first, {} to-device send(s); own key indexes {}",
+            "{} key(s) minted after the first, {} attempted / {} accepted to-device send(s); own key indexes {}",
             self.total_rotations(),
             self.key_sends(),
+            self.accepted_key_sends(),
             per_peer.join(" "),
         )
     }
@@ -1485,6 +1499,37 @@ async fn a_reconnecting_member_costs_one_rotation() {
         "one reconnection is one interruption — {}",
         call.cost(),
     );
+}
+
+#[tokio::test]
+async fn cumulative_cost_survives_rejoin_and_refused_delivery() {
+    let mut call = Call::with_defaults();
+    call.join("alice").await;
+    call.join("bob").await;
+    call.advance(30_000).await;
+    call.join("carol").await;
+    call.advance(30_000).await;
+    call.leave("bob").await;
+    let before_keys = call.keys_minted_total();
+    let before_rotations = call.total_rotations();
+    let old_id = call.peer("bob").member_id.clone();
+    let old_cost = call.peer("bob").media.keys_minted();
+    assert!(old_cost >= 1);
+    call.block_device("bob");
+    call.join("bob").await;
+    assert_eq!(call.retired.last().unwrap().2, old_cost);
+    assert!(call.keys_minted_total() > before_keys);
+    assert!(call.total_rotations() >= before_rotations);
+    assert!(call.key_sends() > call.accepted_key_sends());
+    assert!(call.describe_since(0, "whole call").contains(&old_id));
+    call.unblock_device("bob");
+    for peer in call.peers.iter().filter(|peer| peer.in_call) {
+        for member_id in peer.manager.undelivered_members() {
+            peer.manager.retry_undelivered_key_now(&member_id).await.unwrap();
+        }
+    }
+    call.deliver_all().await;
+    call.assert_media_flows_once_settled("bob rejoined").await;
 }
 
 /// Eight people arriving over four minutes, one at a time.

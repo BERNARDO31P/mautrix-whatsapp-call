@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"sync"
+	"sync/atomic"
 )
 
 // Audio in meowcaller is 16 kHz mono float32 PCM carried in 60 ms frames — the rate
@@ -52,22 +54,30 @@ func (f SinkFunc) Close() error { return nil }
 // chunked into FrameSamples frames (zero-padding the final partial frame). It is the
 // substrate the WAV/MP3/Opus decoders feed once they have produced 16 kHz mono PCM.
 type pcmS16Source struct {
-	r   io.ReadCloser
-	buf []byte
+	r      io.ReadCloser
+	buf    []byte
+	readMu sync.Mutex
+	closed atomic.Bool
 }
 
 // PCMStream plays raw s16le mono 16 kHz PCM read from r. r is closed when the source
-// is exhausted or Close is called.
+// is exhausted or Close is called. To interrupt a pending read, r must support
+// concurrent Read and Close and its Close must unblock Read (for example io.PipeReader).
 func PCMStream(r io.ReadCloser) AudioSource {
 	return &pcmS16Source{r: r, buf: make([]byte, FrameSamples*2)}
 }
 
 // ReadFrame reads one frame of s16le PCM and converts it to float32 in [-1, 1).
 func (s *pcmS16Source) ReadFrame() ([]float32, error) {
-	if s.r == nil {
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+	if s.closed.Load() || s.r == nil {
 		return nil, errSourceClosed
 	}
 	n, err := io.ReadFull(s.r, s.buf)
+	if s.closed.Load() {
+		return nil, errSourceClosed
+	}
 	if n == 0 {
 		if err == io.EOF {
 			return nil, io.EOF
@@ -89,10 +99,9 @@ func (s *pcmS16Source) ReadFrame() ([]float32, error) {
 
 // Close closes the underlying reader.
 func (s *pcmS16Source) Close() error {
-	if s.r == nil {
+	// Do not wait for readMu: Close may be what unblocks ReadFrame.
+	if !s.closed.CompareAndSwap(false, true) || s.r == nil {
 		return nil
 	}
-	err := s.r.Close()
-	s.r = nil
-	return err
+	return s.r.Close()
 }

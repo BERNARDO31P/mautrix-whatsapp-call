@@ -15,7 +15,7 @@ use matrix_rtc_core::MatrixBackend;
 
 use matrix_rtc_livekit::{
     LiveKitMediaTransport, LiveKitTransportConnection, MediaKeyBridge, Msc4195KeyProviders,
-    identity_mapper, msc4195_media_key_bridge,
+    TrustedFocus, identity_mapper, msc4195_media_key_bridge,
 };
 
 /// What [`attach_livekit`] needs besides the call.
@@ -54,16 +54,27 @@ pub async fn attach_livekit<B: MatrixBackend + 'static>(
     backend: Arc<dyn MatrixBackend>,
     options: LiveKitAttachOptions,
 ) -> Result<LiveKitAttachment, AttachError> {
+    attach_livekit_with_trusted_focus(call, backend, options, None).await
+}
+
+pub(super) async fn attach_livekit_with_trusted_focus<B: MatrixBackend + 'static>(
+    call: &RtcCall<B>,
+    backend: Arc<dyn MatrixBackend>,
+    options: LiveKitAttachOptions,
+    trusted_focus: Option<TrustedFocus>,
+) -> Result<LiveKitAttachment, AttachError> {
     // One mapper for the core, the transport, our own identity and the ring.
     let mapper = identity_mapper();
     let providers = Msc4195KeyProviders::new();
     let key_bridge = Arc::new(msc4195_media_key_bridge(providers.clone()));
     let (own_user_id, own_device_id) = (backend.own_user_id(), backend.own_device_id());
-    let transport = Arc::new(
-        LiveKitMediaTransport::new(options.http.unwrap_or_default(), backend, providers)
-            .with_auto_subscribe(options.auto_subscribe)
-            .with_identity_mapper(mapper.clone()),
-    );
+    let transport = LiveKitMediaTransport::new(options.http.unwrap_or_default(), backend, providers)
+        .with_auto_subscribe(options.auto_subscribe)
+        .with_identity_mapper(mapper.clone());
+    let transport = Arc::new(match trusted_focus {
+        Some(policy) => transport.with_trusted_focus(policy)?,
+        None => transport,
+    });
     let media = attach_media(
         call,
         transport,

@@ -34,7 +34,7 @@ use crate::direct_call::{
 };
 use crate::intent::{CALL_INTENT_KEY, CallIntent, CallIntentConsensus};
 use crate::notification::{
-    INVITE_EVENT_TYPE, NotifyConfig, build_invite_withdrawal, is_own_participation,
+    INVITE_EVENT_TYPE, NotificationType, NotifyConfig, build_invite_withdrawal, is_own_participation,
     notification_sticky_duration_ms, notify_session_started, others_joined,
 };
 use crate::reactions::{
@@ -288,7 +288,7 @@ impl CallState {
     fn new(clock: &Clock, members: Vec<JoinedMembership>) -> Self {
         let mut reactions = ReactionsState::new();
         reactions.set_clock(clock.clone());
-        reactions.sync_roster(&members);
+        reactions.sync_roster(&[], &members);
         Self {
             reactions,
             members,
@@ -299,8 +299,8 @@ impl CallState {
     }
 
     fn sync_roster(&mut self, members: &[JoinedMembership]) {
+        self.reactions.sync_roster(&self.members, members);
         self.members = members.to_vec();
-        self.reactions.sync_roster(members);
         if let Some(direct) = &self.direct {
             direct.on_roster(members);
         }
@@ -445,9 +445,11 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
 
     /// Remembers that this join invites the room to `slot_id`, so the invite
     /// can be withdrawn (spec 038 R30, R31). Only MSC invites are: a
-    /// room-state notification is a plain room event.
+    /// visual or room-state notification is a plain room event.
     fn record_invite(&self, slot_id: &str, notify: &NotifyConfig) {
-        if self.rtc.format() != MembershipFormat::Msc {
+        if self.rtc.format() != MembershipFormat::Msc
+            || notify.notification_type != NotificationType::Ring
+        {
             return;
         }
         let sticky_ms = notification_sticky_duration_ms(notify.lifetime_ms());

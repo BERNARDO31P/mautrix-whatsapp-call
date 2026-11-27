@@ -21,6 +21,8 @@ type VoipSettings struct {
 	// UseMlowCodecV1 mirrors encode.use_mlow_codec_v1: true => Meta's 16 kHz MLow
 	// codec, false => RFC Opus. Absent => true (MLow), matching current behavior.
 	UseMlowCodecV1 bool
+	// CodecExplicit distinguishes partial settings from an explicit codec selection.
+	CodecExplicit bool
 	// FrameMs mirrors encode.frame_ms (audio frame duration in ms); 0 if absent.
 	FrameMs int
 	// TargetBitrate mirrors rc.target_bitrate in bits/s; 0 if absent.
@@ -41,8 +43,8 @@ func ParseVoipSettings(raw []byte, log ...zerolog.Logger) (*VoipSettings, error)
 	}
 	var doc struct {
 		Encode struct {
-			UseMlowCodecV1 string `json:"use_mlow_codec_v1"`
-			FrameMs        string `json:"frame_ms"`
+			UseMlowCodecV1 *string `json:"use_mlow_codec_v1"`
+			FrameMs        string  `json:"frame_ms"`
 		} `json:"encode"`
 		RC struct {
 			TargetBitrate string `json:"target_bitrate"`
@@ -53,7 +55,8 @@ func ParseVoipSettings(raw []byte, log ...zerolog.Logger) (*VoipSettings, error)
 		return nil, fmt.Errorf("signaling: parse voip_settings: %w", err)
 	}
 	vs := &VoipSettings{
-		UseMlowCodecV1: doc.Encode.UseMlowCodecV1 != "false",
+		UseMlowCodecV1: doc.Encode.UseMlowCodecV1 == nil || *doc.Encode.UseMlowCodecV1 != "false",
+		CodecExplicit:  doc.Encode.UseMlowCodecV1 != nil,
 		FrameMs:        atoiOrZero(doc.Encode.FrameMs),
 		TargetBitrate:  atoiOrZero(doc.RC.TargetBitrate),
 		Present:        true,

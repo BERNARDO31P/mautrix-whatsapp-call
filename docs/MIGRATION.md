@@ -33,6 +33,8 @@ After successful verification, the previous project deployment directory, its ol
 
 Runtime packaging and installation normalize project code to non-writable Linux modes even when the source checkout comes from Windows/DrvFS. `generated/` and `worker-state/` remain private (`0700` directories, `0600` regular files).
 
-## Compatibility identifiers intentionally retained
+## Compatibility
 
-`MATRIXRTC_*` environment variables, MatrixRTC appservice registration filenames/IDs and upstream MatrixRTC crate/protocol names are retained intentionally. They are compatibility/state identifiers used by Synapse, LiveKit and the existing deployment, not project/release names. Renaming them would rotate or migrate persistent authentication/state for no functional benefit.
+`MATRIXRTC_*` environment variables, MatrixRTC appservice registration filenames/IDs and upstream MatrixRTC crate/protocol names remain unchanged for compatibility with existing deployments.
+
+The room migration intentionally enables missing call-event permissions in legacy encrypted WhatsApp portals with standard Matrix defaults (`state_default: 50`, `events_default: 0`). Custom inherited defaults for the relevant event class, existing explicit permissions and bridge-managed restrictions are retained. Restriction markers distinguish inherited rules from explicitly configured rules so the bridge can restore the correct origin. Existing explicit restrictions are not automatically relaxed by migration. A standard default deliberately chosen by an administrator is indistinguishable from an ordinary default; review eligible rooms before migration if that distinction matters.

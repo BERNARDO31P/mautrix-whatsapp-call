@@ -185,10 +185,18 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 		go wa.syncGhost(evt.JID, "business name event", nil)
 
 	case *events.Connected:
+		wa.openVoIPAdmission()
 		log.Debug().Msg("Connected to WhatsApp socket")
 		wa.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 		if wa.Main.Config.RTCGatewaySocket != "" {
-			go wa.refreshMatrixRTCExistingDMPortals(context.WithoutCancel(ctx))
+			wa.startRTCConnectionWork(context.WithoutCancel(ctx), func(probeCtx context.Context) {
+				if wa.Main.Config.ExperimentalWhatsAppVoIP {
+					// Refresh expired capability observations even on long-lived sockets.
+					wa.rtcReconnectRefresh.scheduleWithExpiry(probeCtx, wa.refreshMatrixRTCExistingDMPortals, 15*time.Minute, matrixRTCCallAvailabilityCache, string(wa.UserLogin.ID))
+				} else {
+					wa.rtcReconnectRefresh.request(probeCtx, wa.refreshMatrixRTCExistingDMPortals)
+				}
+			})
 		}
 		if wa.offlineSyncWaiter.Load() == nil {
 			go func() {
@@ -226,9 +234,13 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 		wa.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 		wa.notifyOfflineSyncWaiter(nil)
 	case *events.LoggedOut:
+		wa.rtcProbeLifetime.stop()
+		wa.rtcReconnectRefresh.stop()
 		wa.handleWALogout(ctx, evt.Reason, evt.OnConnect)
 		wa.notifyOfflineSyncWaiter(fmt.Errorf("logged out: %s", evt.Reason))
 	case *events.Disconnected:
+		wa.rtcProbeLifetime.stop()
+		wa.rtcReconnectRefresh.stop()
 		wa.teardownVoIP()
 		// Don't send the normal transient disconnect state if we're already in a different transient disconnect state.
 		// TODO remove this if/when the phone offline state is moved to a sub-state of CONNECTED
@@ -252,6 +264,7 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 		})
 		wa.notifyOfflineSyncWaiter(fmt.Errorf("stream error: %s", message))
 	case *events.StreamReplaced:
+		wa.replaceVoIPStream()
 		wa.UserLogin.BridgeState.Send(status.BridgeState{
 			StateEvent:         status.StateUnknownError,
 			Error:              WAStreamReplaced,

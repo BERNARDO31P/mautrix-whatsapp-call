@@ -418,19 +418,19 @@ func IsStunPacket(data []byte) bool {
 	return len(data) >= 2 && (data[0]&0xc0) == 0x00
 }
 
-// StunMessageType returns the STUN message type; ok=false if data is too short.
+// StunMessageType returns the type only for a structurally complete STUN frame.
 func StunMessageType(data []byte) (uint16, bool) {
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/wacore/src/voip/stun.rs#L192-L194
-	if len(data) < 2 {
+	if !validStunFrame(data) {
 		return 0, false
 	}
-	return (uint16(data[0]&0x3f) << 8) | uint16(data[1]), true
+	return binary.BigEndian.Uint16(data[:2]), true
 }
 
-// StunTransactionID returns the 12-byte transaction id; ok=false if data < 20 bytes.
+// StunTransactionID returns the transaction ID of a structurally complete frame.
 func StunTransactionID(data []byte) ([]byte, bool) {
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/wacore/src/voip/stun.rs#L196-L198
-	if len(data) < 20 {
+	if !validStunFrame(data) {
 		return nil, false
 	}
 	return data[8:20], true
@@ -483,7 +483,7 @@ type StunAttribute struct {
 func ParseStunAttributes(data []byte, log ...zerolog.Logger) []StunAttribute {
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/wacore/src/voip/stun.rs#L231-L251
 	lg := pickLog(log)
-	if !IsStunPacket(data) || len(data) < 20 {
+	if !validStunFrame(data) {
 		lg.Debug().Int("packet_bytes", len(data)).Msg("parse stun attributes: not a stun packet or too short")
 		return nil
 	}
@@ -493,9 +493,6 @@ func ParseStunAttributes(data []byte, log ...zerolog.Logger) []StunAttribute {
 		attrType := (uint16(data[off]) << 8) | uint16(data[off+1])
 		length := (int(data[off+2]) << 8) | int(data[off+3])
 		off += 4
-		if off+length > len(data) {
-			break
-		}
 		attrs = append(attrs, StunAttribute{
 			AttrType: attrType,
 			Value:    append([]byte(nil), data[off:off+length]...),
@@ -518,13 +515,12 @@ func ParseStunErrorCode(data []byte, log ...zerolog.Logger) (uint16, bool) {
 		lg.Debug().Uint16("msg_type", t).Msg("parse stun error code: not an error response")
 		return 0, false
 	}
-	bodyLen := (int(data[2]) << 8) | int(data[3])
-	end := min(20+bodyLen, len(data))
+	end := len(data)
 	off := 20
 	for off+4 <= end {
 		attrType := (uint16(data[off]) << 8) | uint16(data[off+1])
 		length := (int(data[off+2]) << 8) | int(data[off+3])
-		if attrType == attrErrorCode && length >= 4 && off+8 <= len(data) {
+		if attrType == attrErrorCode && length >= 4 {
 			class := uint16(data[off+6])
 			number := uint16(data[off+7])
 			code := class*100 + number

@@ -13,6 +13,7 @@ description = "The call application over matrix-rtc-core: Element Call reactions
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
+matrix-rtc-transport = { path = "../matrix-rtc-transport" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

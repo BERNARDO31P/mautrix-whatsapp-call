@@ -284,12 +284,14 @@ async fn a_closed_slot_withdraws_our_invite() {
     sink.on_sticky_events(Vec::new());
     settle().await;
     let call = room
-        .join_call(CallJoinOptions::new().kind(crate::CallKind::Group {
-            notify: Some(crate::GroupNotify::default()),
+        .join_call(CallJoinOptions::new().kind(CallKind::Direct {
+            ring: Some(crate::RingConfig::default()),
         }))
         .await
         .expect("join");
-    settle().await;
+    status_once(&call, |status| matches!(status,
+        CallStatus::Calling { ring: RingPhase::Ringing { .. }, .. }
+    )).await;
     let invites = || {
         mock.sticky_events
             .lock()
@@ -301,7 +303,8 @@ async fn a_closed_slot_withdraws_our_invite() {
             .map(|(_, _, content, _)| content.clone())
             .collect::<Vec<_>>()
     };
-    assert_eq!(invites().len(), 1, "the call starter invites");
+    assert_eq!(invites().len(), 1, "the direct call starter invites");
+    assert_eq!(invites()[0]["msc4354_sticky_key"], json!(SLOT));
 
     sink.on_state_events(
         SLOT_EVENT_TYPE.to_owned(),
@@ -318,6 +321,7 @@ async fn a_closed_slot_withdraws_our_invite() {
     settle().await;
 
     assert!(!call.is_live());
+    assert_eq!(invites().len(), 2, "exactly one invite and one withdrawal");
     assert_eq!(
         invites().last(),
         Some(&json!({ "msc4354_sticky_key": SLOT })),
@@ -477,57 +481,97 @@ async fn join_failures_say_whether_they_timed_out_or_were_refused() {
     ));
     assert_eq!(started.elapsed(), Duration::ZERO);
 
+    // The refused join also armed a delay. Let its detached cancellation finish.
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let cancelled_before = mock.calls_to(MockMethod::CancelDelayedEvent).len();
     mock.script(MockMethod::StickyEvent, [MockOutcome::Hang]);
     let started = tokio::time::Instant::now();
     assert!(matches!(
         room.join_call(CallJoinOptions::new()).await,
         Err(RtcError::Join(JoinError::TimedOut))
     ));
-    assert_eq!(started.elapsed(), JOIN_BUDGET);
+    // Preserve a quarter of the armed delay for the first immediate renewal.
+    let delay = Duration::from_millis(matrix_rtc_core::DEFAULT_KEEP_ALIVE_TIMEOUT_MS);
+    assert_eq!(started.elapsed(), JOIN_BUDGET.min(delay - delay / 4));
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(mock.calls_to(MockMethod::CancelDelayedEvent).len(), cancelled_before + 1);
+    assert!(mock.restarted_events.lock().unwrap().is_empty(), "failed joins must not start upkeep");
 }
 
-/// R6: neither the first key rollout nor the notification fails a join, and
-/// the notification, retried, never holds it past its budget.
+/// R6: a failed visual group notification never delays or fails the join.
+/// MSC group notifications are timeline events, not sticky ringing invites.
 #[tokio::test(start_paused = true)]
-async fn a_failed_key_rollout_or_notification_never_fails_the_join() {
+async fn a_failed_notification_never_fails_the_join() {
     let mock = mock();
     let client = RtcClient::new(mock.clone());
     let room = open(&client, &mock, ROOM).await;
-    // Bob leaves, so the join starts the session and notifies the room.
-    let sink = mock
-        .room_subscription(ROOM)
-        .expect("subscribed")
-        .sink
-        .clone();
+    let sink = mock.room_subscription(ROOM).unwrap().sink.clone();
     sink.on_sticky_events(Vec::new());
     tokio::time::sleep(Duration::from_millis(1)).await;
-    mock.script(MockMethod::ToDevice, std::iter::repeat_n(offline(), 100));
-    mock.script(
-        MockMethod::StickyEvent,
-        std::iter::once(MockOutcome::Ok).chain(std::iter::repeat_n(offline(), 100)),
-    );
+    mock.script(MockMethod::RoomEvent, [offline(), offline(), MockOutcome::Ok]);
     let started = tokio::time::Instant::now();
+    let call = room.join_call(CallJoinOptions::new().kind(CallKind::Group {
+        notify: Some(crate::GroupNotify::default()),
+    })).await.expect("notification failure is not a join failure");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let member_event_id = call.membership_event_id().await.expect("own join event");
 
-    let call = room
-        .join_call(CallJoinOptions::new().kind(CallKind::Group {
-            notify: Some(crate::GroupNotify {
-                intent: None,
-                lifetime_ms: None,
-                mentions: Default::default(),
-            }),
-        }))
-        .await;
-
-    assert!(call.is_ok(), "{:?}", call.err());
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "the join waits for neither: it is over once the membership has landed"
-    );
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(call.is_live());
+    assert_eq!(mock.calls_to(MockMethod::RoomEvent).len(), 3,
+        "two failed notification attempts and one successful retry after join");
+    {
+        let events = mock.room_events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let (room_id, event_type, content) = &events[0];
+        assert_eq!(room_id, ROOM);
+        assert_eq!(event_type, matrix_rtc_core::wire_event_type("m.rtc.notification"));
+        assert_eq!(content["notification_type"], json!("notification"));
+        assert_eq!(content["m.relates_to"]["event_id"], json!(member_event_id));
+    }
+    assert!(!mock.sticky_events.lock().unwrap().iter().any(|(_, event_type, _, _)|
+        event_type == matrix_rtc_core::wire_event_type("m.rtc.invite")),
+        "a visual group notification must not ring as a sticky invite");
+    call.leave(LeaveSessionParams::new()).await.expect("leave");
     tokio::time::sleep(JOIN_BUDGET).await;
-    assert!(
-        mock.calls_to(MockMethod::StickyEvent).len() > 2,
-        "the notification was retried after the join returned"
-    );
+    assert_eq!(mock.calls_to(MockMethod::RoomEvent).len(), 3);
+}
+
+/// A failed first key rollout must not fail or hold the join. Use an actual
+/// encrypted slot with another participant, not an empty unencrypted roster.
+#[tokio::test(start_paused = true)]
+async fn a_failed_key_rollout_never_fails_the_join() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let sink = mock.room_subscription(ROOM).unwrap().sink.clone();
+    sink.on_encryption(true);
+    sink.on_state_events(SLOT_EVENT_TYPE.to_owned(), vec![EventIn {
+        event_id: "$slot".to_owned(), sender: BOB.to_owned(),
+        event_type: SLOT_EVENT_TYPE.to_owned(), state_key: Some(SLOT.to_owned()),
+        origin_server_ts: 1,
+        content: json!({"status": "open", "application": {"type": "m.call"},
+            "encryption": {"type": "m.per_member"}}),
+        encryption: EventEncryption::Cleartext,
+    }]);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    mock.script(MockMethod::ToDevice, std::iter::repeat_n(offline(), 100));
+    let mut options = CallJoinOptions::new();
+    options.join.encryption_config = Some(EncryptionConfig {
+        delay_before_use_ms: 0, require_confirmed_sender: false,
+        ..EncryptionConfig::default()
+    });
+    let started = tokio::time::Instant::now();
+    let call = room.join_call(options).await.expect("key failure is not a join failure");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!mock.calls_to(MockMethod::ToDevice).is_empty(), "the rollout actually attempted delivery");
+    assert!(mock.to_device_messages.lock().unwrap().is_empty(), "every scripted delivery failed");
+    assert!(call.is_live());
+    call.leave(LeaveSessionParams::new()).await.expect("leave");
+    let attempts = mock.calls_to(MockMethod::ToDevice).len();
+    tokio::time::sleep(JOIN_BUDGET).await;
+    assert_eq!(mock.calls_to(MockMethod::ToDevice).len(), attempts, "no new key delivery after leave");
 }
 
 #[tokio::test]
@@ -549,6 +593,146 @@ async fn joining_a_slot_held_by_a_live_session_is_refused() {
     let again = room.join_call(CallJoinOptions::new()).await.expect("join");
     assert!(again.is_live());
     assert!(mock.cancelled_events.lock().unwrap().len() > cancelled_before);
+}
+
+// The generic and call APIs must agree on slot ownership, including when
+// another executor thread is already waiting on the room state lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_generic_and_call_join_share_session_ownership() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = Arc::new(open(&client, &mock, ROOM).await);
+    let start = Arc::new(tokio::sync::Barrier::new(2));
+    let generic = {
+        let room = room.clone();
+        let start = start.clone();
+        tokio::spawn(async move {
+            start.wait().await;
+            room.join(CallJoinOptions::new().join).await
+        })
+    };
+    let call = {
+        let room = room.clone();
+        tokio::spawn(async move {
+            start.wait().await;
+            room.join_call(CallJoinOptions::new()).await
+        })
+    };
+    let (generic, call) = tokio::join!(generic, call);
+    match (generic.expect("generic task"), call.expect("call task")) {
+        (Ok(session), Err(RtcError::Join(JoinError::AlreadyJoined(_)))) => {
+            assert!(session.is_live());
+            assert!(Arc::ptr_eq(&room.sessions()[SLOT], &session.end));
+            assert!(session.membership_event_id().await.is_some());
+            session.leave(LeaveSessionParams::new()).await.expect("leave");
+        }
+        (Err(RtcError::Join(JoinError::AlreadyJoined(_))), Ok(call)) => {
+            assert!(call.is_live());
+            assert!(Arc::ptr_eq(&room.sessions()[SLOT], &call.session().end));
+            assert!(call.session().membership_event_id().await.is_some());
+            call.session().leave(LeaveSessionParams::new()).await.expect("leave");
+        }
+        _ => panic!("exactly one join must own the slot"),
+    }
+}
+
+// Simulate a leave that ended locally but lost the room-lock race to a rejoin.
+#[tokio::test]
+async fn delayed_local_leave_does_not_remove_replacement_session() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let old = room.join(JoinOptions::application("m.call")).await.expect("old join");
+    assert!(old.end.end(LeaveReason::new(LeaveCode::Leave)));
+    let new = room.join(JoinOptions::application("m.call")).await.expect("replacement");
+    let before = new.membership_event_id().await.expect("replacement event");
+    issue_leave(&old.state, &old.sessions, &old.end, SLOT, "old".to_owned(),
+        LeaveSessionParams::new()).await;
+    assert_eq!(new.membership_event_id().await.as_deref(), Some(before.as_str()));
+    assert!(new.is_live());
+    new.leave(LeaveSessionParams::new()).await.expect("leave replacement");
+}
+
+#[tokio::test(start_paused = true)]
+async fn legacy_rejoin_waits_for_previous_detached_leave() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = client.room(ROOM, RoomOptions { format: MembershipFormat::RoomState })
+        .await.expect("legacy room");
+    let sink = mock.room_subscription(ROOM).expect("subscribed").sink.clone();
+    sink.on_encryption(false);
+    sink.on_joined_members(vec![mock.user_id.clone()]);
+    sink.on_state_events(SLOT_EVENT_TYPE.to_owned(), vec![EventIn {
+        event_id: "$slot".to_owned(), sender: BOB.to_owned(),
+        event_type: SLOT_EVENT_TYPE.to_owned(), state_key: Some(SLOT.to_owned()),
+        origin_server_ts: 1, content: json!({"status":"open", "application":{"type":"m.call"}}),
+        encryption: EventEncryption::Cleartext,
+    }]);
+    sink.on_state_events(matrix_rtc_core::compat::STATE_MEMBER_EVENT_TYPE.to_owned(), vec![]);
+    room.seeded().await;
+    let old = room.join(JoinOptions::application("m.call")).await.expect("legacy join");
+    mock.script(MockMethod::StateEvent, [MockOutcome::After(Duration::from_secs(2), Box::new(MockOutcome::Ok))]);
+    old.leave(LeaveSessionParams::new()).await.expect("detach leave");
+    let started = tokio::time::Instant::now();
+    let new = room.join(JoinOptions::application("m.call")).await.expect("legacy rejoin");
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    let events = mock.state_events.lock().unwrap();
+    let member_events: Vec<_> = events.iter().filter(|(_, event_type, _, _)|
+        event_type == matrix_rtc_core::compat::STATE_MEMBER_EVENT_TYPE).collect();
+    assert!(member_events.len() >= 3);
+    assert_eq!(member_events[member_events.len()-2].3, json!({}));
+    assert_ne!(member_events.last().unwrap().3, json!({}));
+    assert!(new.is_live());
+}
+
+async fn open_legacy_for_fence(client: &RtcClient<MockBackend>, mock: &MockBackend) -> RtcRoom<MockBackend> {
+    let room = client.room(ROOM, RoomOptions { format: MembershipFormat::RoomState })
+        .await.expect("legacy room");
+    let sink = mock.room_subscription(ROOM).expect("subscribed").sink.clone();
+    sink.on_encryption(false);
+    sink.on_joined_members(vec![mock.user_id.clone()]);
+    sink.on_state_events(SLOT_EVENT_TYPE.to_owned(), vec![EventIn {
+        event_id: "$slot".to_owned(), sender: BOB.to_owned(),
+        event_type: SLOT_EVENT_TYPE.to_owned(), state_key: Some(SLOT.to_owned()),
+        origin_server_ts: 1, content: json!({"status":"open", "application":{"type":"m.call"}}),
+        encryption: EventEncryption::Cleartext,
+    }]);
+    sink.on_state_events(matrix_rtc_core::compat::STATE_MEMBER_EVENT_TYPE.to_owned(), vec![]);
+    room.seeded().await;
+    room
+
+}
+
+#[tokio::test(start_paused = true)]
+async fn legacy_failed_leave_blocks_reopened_room() {
+    let mock = mock();
+    let outbox = matrix_rtc_core::Outbox::new();
+    let client = RtcClient::with_outbox(mock.clone(), outbox.clone());
+    let room = open_legacy_for_fence(&client, &mock).await;
+    let old = room.join(JoinOptions::application("m.call")).await.expect("legacy join");
+    mock.script(MockMethod::StateEvent, [offline()]);
+    old.leave(LeaveSessionParams::new()).await.expect("detach leave");
+    assert!(matches!(room.join(JoinOptions::application("m.call")).await,
+        Err(RtcError::Join(matrix_rtc_core::JoinError::Refused { .. }))));
+    drop(room);
+    let client = RtcClient::with_outbox(mock.clone(), outbox);
+    let room = open_legacy_for_fence(&client, &mock).await;
+    let before = mock.state_events.lock().unwrap().len();
+    assert!(matches!(room.join(JoinOptions::application("m.call")).await,
+        Err(RtcError::Join(matrix_rtc_core::JoinError::Refused { .. }))));
+    assert_eq!(mock.state_events.lock().unwrap().len(), before);
+}
+
+#[tokio::test(start_paused = true)]
+async fn legacy_uncertain_cancellation_blocks_rejoin() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open_legacy_for_fence(&client, &mock).await;
+    let old = room.join(JoinOptions::application("m.call")).await.expect("legacy join");
+    mock.script(MockMethod::CancelDelayedEvent, [offline()]);
+    old.leave(LeaveSessionParams::new()).await.expect("detach leave");
+    assert!(matches!(room.join(JoinOptions::application("m.call")).await,
+        Err(RtcError::Join(matrix_rtc_core::JoinError::Refused { .. }))));
 }
 
 #[tokio::test]
@@ -689,24 +873,31 @@ fn restarts(mock: &MockBackend) -> usize {
     mock.restarted_events.lock().unwrap().len()
 }
 
+fn assert_restarts(mock: &MockBackend, expected: usize) {
+    assert_eq!(restarts(mock), expected, "successful delayed leave restarts");
+    assert_eq!(mock.calls_to(MockMethod::RestartDelayedEvent).len(), expected,
+        "no hidden failed restart attempts");
+}
+
+async fn await_initial_restart(mock: &MockBackend) {
+    for _ in 0..32 {
+        if restarts(mock) != 0 { break; }
+        tokio::task::yield_now().await;
+    }
+    assert_restarts(mock, 1);
+    assert_eq!(mock.delayed_events.lock().unwrap().len(), 1, "renew the original delay");
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_joined_session_keeps_itself_alive() {
     let mock = mock();
     let client = RtcClient::new(mock.clone());
     let room = open(&client, &mock, ROOM).await;
     let _call = room.join_call(CallJoinOptions::new()).await.expect("join");
-    assert_eq!(
-        restarts(&mock),
-        0,
-        "the join itself armed the delayed leave"
-    );
+    await_initial_restart(&mock).await;
 
     tokio::time::sleep(DEFAULT_KEEP_ALIVE_INTERVAL * 3 + Duration::from_millis(1)).await;
-    assert_eq!(
-        restarts(&mock),
-        3,
-        "one restart per interval, nobody ticking"
-    );
+    assert_restarts(&mock, 4); // initial renewal plus three intervals
 }
 
 #[tokio::test(start_paused = true)]
@@ -718,9 +909,9 @@ async fn the_keep_alive_interval_is_capped_at_half_the_timeout() {
     options.join.keep_alive_timeout_ms = Some(4_000);
     options.join.keep_alive_interval_ms = Some(60_000);
     let _call = room.join_call(options).await.expect("join");
-
+    await_initial_restart(&mock).await;
     tokio::time::sleep(Duration::from_millis(4_001)).await;
-    assert_eq!(restarts(&mock), 2);
+    assert_restarts(&mock, 3);
 }
 
 #[tokio::test(start_paused = true)]
@@ -729,12 +920,13 @@ async fn leaving_stops_the_keep_alive() {
     let client = RtcClient::new(mock.clone());
     let room = open(&client, &mock, ROOM).await;
     let call = room.join_call(CallJoinOptions::new()).await.expect("join");
+    await_initial_restart(&mock).await;
     tokio::time::sleep(DEFAULT_KEEP_ALIVE_INTERVAL + Duration::from_millis(1)).await;
-    assert_eq!(restarts(&mock), 1);
+    assert_restarts(&mock, 2);
 
     call.leave(LeaveSessionParams::new()).await.expect("leave");
     tokio::time::sleep(DEFAULT_KEEP_ALIVE_INTERVAL * 3).await;
-    assert_eq!(restarts(&mock), 1, "nothing restarted after the leave");
+    assert_restarts(&mock, 2);
 }
 
 #[tokio::test(start_paused = true)]

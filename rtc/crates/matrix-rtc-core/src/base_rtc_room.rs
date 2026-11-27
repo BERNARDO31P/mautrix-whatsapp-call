@@ -572,6 +572,10 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         &self,
         received: ReceivedEncryptionKey,
     ) -> Result<(), CommandError> {
+        if !crate::encryption::inbound_key_fits_budget(&received) {
+            log::warn!("Ignoring oversized room media key or provenance");
+            return Ok(());
+        }
         if received.room_id != self.room_id {
             log::warn!(
                 "[{}] dropping a media key for another room ({})",

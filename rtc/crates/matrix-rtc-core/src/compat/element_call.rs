@@ -306,18 +306,15 @@ pub struct LegacyKeyMessage {
 /// not exist, so they share the one function rather than the one format string.
 ///
 /// Both `keys` spellings are accepted: an object (2025) or an array of them
-/// (pre-sticky), in which case the **highest** index wins, that being the most
-/// recent key the sender is offering.
+/// (pre-sticky), in which case the unique newest rolling index wins, provided
+/// all offered indices fit within a 127-step retention window.
 ///
 /// Note the key material is 16 bytes here where MSC4143 uses 32. Nothing needs
 /// to convert it: both sides feed the raw bytes to the same LiveKit HKDF, so
 /// they only have to agree, and the core already accepts either length.
 pub fn parse_key_message(sender: &str, content: &Value) -> Option<LegacyKeyMessage> {
     let keys = match content.get("keys")? {
-        Value::Array(entries) => entries
-            .iter()
-            .filter(|entry| entry.get("key").is_some())
-            .max_by_key(|entry| entry.get("index").and_then(Value::as_u64).unwrap_or(0))?,
+        Value::Array(entries) => newest_legacy_key(entries)?,
         object => object,
     };
 
@@ -335,6 +332,35 @@ pub fn parse_key_message(sender: &str, content: &Value) -> Option<LegacyKeyMessa
         key_b64: keys.get("key")?.as_str()?.to_owned(),
         key_index: u8::try_from(keys.get("index")?.as_u64()?).ok()?,
     })
+}
+
+// A rolling u8 sequence cannot be ordered unambiguously across half its range.
+// Reject ambiguous batches rather than guess which epoch owns the key.
+fn newest_legacy_key(entries: &[Value]) -> Option<&Value> {
+    if entries.is_empty() || entries.len() > 256 {
+        return None;
+    }
+    let mut by_index = [None; 256];
+    for entry in entries {
+        let index = u8::try_from(entry.get("index")?.as_u64()?).ok()? as usize;
+        let key = entry.get("key")?.as_str()?;
+        if let Some(previous) = by_index[index] {
+            let previous: &Value = previous;
+            if previous.get("key")?.as_str()? != key { return None; }
+        } else {
+            by_index[index] = Some(entry);
+        }
+    }
+    let mut newest = None;
+    for (index, entry) in by_index.iter().enumerate() {
+        if entry.is_some() && by_index.iter().enumerate().all(|(other, value)| {
+            value.is_none() || (index as u8).wrapping_sub(other as u8) < 128
+        }) {
+            if newest.is_some() { return None; }
+            newest = *entry;
+        }
+    }
+    newest
 }
 
 /// Whether `event_type` is a membership, stable or unstable.
@@ -653,11 +679,38 @@ mod tests {
                 // `member.id`; if these diverged the key would be filed against
                 // a membership that does not exist.
                 member_id: "@alice:example.io:V5cP8FErcB".to_owned(),
-                // The highest index wins: that is the most recent key on offer.
+                // The newest rolling index is the most recent key on offer.
                 key_b64: "36/SXoTd/H/DnPU1NNzS1g==".to_owned(),
                 key_index: 2,
             })
         );
+    }
+
+    #[test]
+    fn rolling_legacy_keys_choose_newest_across_wrap() {
+        let entries = vec![json!({"index": 0, "key": "new"}),
+            json!({"index": 255, "key": "old"}), json!({"index": 254, "key": "older"})];
+        assert_eq!(newest_legacy_key(&entries), Some(&entries[0]));
+        let reversed: Vec<_> = entries.into_iter().rev().collect();
+        assert_eq!(newest_legacy_key(&reversed), Some(&reversed[2]));
+    }
+
+    #[test]
+    fn rolling_legacy_keys_reject_ambiguous_batches() {
+        for indices in [vec![0, 128], vec![0, 90, 180]] {
+            let entries: Vec<_> = indices.into_iter().map(|index| json!({"index": index, "key": "key"})).collect();
+            assert!(newest_legacy_key(&entries).is_none());
+        }
+    }
+
+    #[test]
+    fn rolling_legacy_keys_validate_all_entries_and_duplicates() {
+        let first = json!({"index": 1, "key": "a"});
+        assert_eq!(newest_legacy_key(&[first.clone(), first.clone()]), Some(&first));
+        for other in [json!({"index": 1, "key": "b"}), json!({"index": 256, "key": "a"}), json!({"index": 2})] {
+            assert!(newest_legacy_key(&[first.clone(), other]).is_none());
+        }
+        assert!(newest_legacy_key(&vec![first; 257]).is_none());
     }
 
     /// An explicit `member.id` always wins over the sender-derived fallback,

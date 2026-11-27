@@ -53,8 +53,11 @@ func TestGroupAnswerSendsImmediateCallScopedAccept(t *testing.T) {
 	if attrs.String("call-id") != "GROUP" || attrs.JID("call-creator") != creator {
 		t.Fatalf("accept identity = %#v", children[0].Attrs)
 	}
-	if eng.calls["GROUP"].acceptPending {
-		t.Fatal("group accept was incorrectly deferred to mute_v2")
+	if !eng.calls["GROUP"].acceptPending {
+		t.Fatal("group accept submission was not reserved")
+	}
+	if err := call.Answer(); err == nil {
+		t.Fatal("duplicate group pickup was allowed")
 	}
 }
 
@@ -62,6 +65,7 @@ func TestInitialGroupAckPublishesAuthoritativeRoster(t *testing.T) {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/7cb6045001dafd2514f53e85cd8c3e419c13adbe/datasheets/voip-initial-group-call.md#L27-L33
 	eng, call, creator := testGroupEngine("GROUP")
 	eng.calls["GROUP"].direction = CallDirectionOutgoing
+	eng.calls["GROUP"].offerNodeID = "REQUEST"
 	participant := types.NewJID("200", types.HiddenUserServer)
 	device := types.NewADJID("200", 0, 3)
 	ack := &waBinary.Node{
@@ -91,7 +95,23 @@ func TestInitialGroupAckPublishesAuthoritativeRoster(t *testing.T) {
 		}},
 	}
 
+	for _, id := range []string{"OLD", ""} {
+		ack.Attrs["id"] = id
+		eng.onCallAck(ack)
+		if eng.calls["GROUP"].offerNodeID != "REQUEST" || eng.calls["GROUP"].groupUpdate != nil {
+			t.Fatal("uncorrelated group ACK committed")
+		}
+	}
+	ack.Attrs["id"] = "REQUEST"
 	eng.onCallAck(ack)
+	if eng.calls["GROUP"].offerNodeID != "" {
+		t.Fatal("group offer remains pending")
+	}
+	stored := eng.calls["GROUP"].groupUpdate
+	eng.onCallAck(ack)
+	if eng.calls["GROUP"].groupUpdate != stored {
+		t.Fatal("duplicate group ACK replaced roster")
+	}
 
 	state, ok := call.GroupState()
 	if !ok || state.TransactionID != 7 || len(state.Participants) != 1 {
@@ -110,7 +130,7 @@ func TestUnknownCallControlsUpdateHandScreenAndWaitingRoom(t *testing.T) {
 	participant := types.NewJID("200", types.HiddenUserServer)
 	call.setGroupState(GroupCallState{
 		TransactionID: 1,
-		Participants:  []GroupCallParticipant{{JID: participant}},
+		Participants:  []GroupCallParticipant{{JID: participant, State: "connected"}},
 	})
 
 	handNode := signaling.BuildRaiseHand(
@@ -180,6 +200,7 @@ func TestRawGroupControlSendsTypedAckWithoutUpstreamDoubleHandling(t *testing.T)
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/36d54857c74e45ccb08f6444a32d2afa13f20be9/datasheets/group-video-reactions.md#L31-L56
 	eng, call, creator := testGroupEngine("GROUP")
 	participant := types.NewJID("200", types.HiddenUserServer)
+	call.setGroupState(GroupCallState{TransactionID: 1, Participants: []GroupCallParticipant{{JID: participant, State: "connected"}}})
 	var sent waBinary.Node
 	var order []string
 	call.OnHandRaise(func(HandRaiseState) {
@@ -286,5 +307,39 @@ func TestInviteDeviceCapabilityCopiesNegotiatedValue(t *testing.T) {
 	raw[0] = 0xff
 	if got.Capability[0] != 1 {
 		t.Fatal("negotiated capability aliases stanza bytes")
+	}
+}
+
+func TestGroupRekeyAdmissionBindsSenderRosterAndCallOwner(t *testing.T) {
+	eng, call, creator := testGroupEngine("GROUP-REKEY")
+	m := eng.calls[call.ID()]
+	sender := types.JID{User: "200", Server: types.HiddenUserServer, Device: 3}
+	other := types.JID{User: "200", Server: types.HiddenUserServer, Device: 4}
+	m.groupUpdate = &groupCallUpdate{CallID: call.ID(), TransactionID: 8, Participants: []groupCallParticipant{{State: "connected", Devices: []groupCallDevice{{JID: sender, HasPID: true}}}}}
+	envelope := &signaling.CallControlEnvelope{CallID: call.ID(), CallCreator: creator, From: sender}
+	rekey := &signaling.GroupCallEncRekey{CallID: call.ID(), CallCreator: creator, TransactionID: 8}
+	if !groupRemoteRekeyAllowed(m, envelope, rekey) {
+		t.Fatal("roster distributor rejected")
+	}
+	envelope.From = other
+	if groupRemoteRekeyAllowed(m, envelope, rekey) {
+		t.Fatal("unlisted device allowed for committed roster")
+	}
+	rekey.TransactionID = 9
+	if !groupRemoteRekeyAllowed(m, envelope, rekey) {
+		t.Fatal("future distributor cannot be staged")
+	}
+	envelope.From = sender
+	rekey.TransactionID = 8
+	m.groupUpdate.RekeyRequested = true
+	if groupRemoteRekeyAllowed(m, envelope, rekey) {
+		t.Fatal("remote key accepted for locally elected transaction")
+	}
+	m.groupUpdate.RekeyRequested = false
+	if err := eng.installGroupEpoch(call.ID(), 8, make([]byte, 32), &engineCall{}, sender, envelope, rekey); err == nil {
+		t.Fatal("stale call owner accepted")
+	}
+	if m.hasGroupEpoch {
+		t.Fatal("stale call owner mutated epoch")
 	}
 }

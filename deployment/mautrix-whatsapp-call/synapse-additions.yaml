@@ -5,6 +5,7 @@
 #   - /data/matrixrtc-registration.yaml
 experimental_features:
   msc4143_enabled: true
+  msc4354_enabled: true
   msc4222_enabled: true
   msc4502_enabled: true
   msc4512_enabled: true

@@ -155,3 +155,33 @@ func frameLengths(frames [][]float32) []int {
 	}
 	return lengths
 }
+
+func TestAudioPlayoutDuplicateDoesNotResetPrefillOrReplacePCM(t *testing.T) {
+	p := newAudioPlayoutBuffer()
+	s := &playoutTestSink{}
+	for _, ts := range []uint32{0, FrameSamples} {
+		if _, err := p.Push(ts, constantPCM(FrameSamples, 0.25), s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if started, err := p.Push(FrameSamples, constantPCM(FrameSamples, 0.9), s); started || err != nil {
+		t.Fatal("duplicate changed prefill")
+	}
+	if started, err := p.Push(2*FrameSamples, constantPCM(FrameSamples, 0.25), s); !started || err != nil {
+		t.Fatal("prefill was reset")
+	}
+	if started, err := p.Push(2*FrameSamples, constantPCM(FrameSamples, 0.9), s); started || err != nil {
+		t.Fatal("duplicate changed steady playout")
+	}
+	if _, err := p.Push(3*FrameSamples, constantPCM(FrameSamples, 0.25), s); err != nil {
+		t.Fatal(err)
+	}
+	if !p.started || len(s.frames) != 3 {
+		t.Fatal("duplicate altered sink writes")
+	}
+	for _, frame := range s.frames {
+		if frame[0] != 0.25 {
+			t.Fatal("duplicate replaced original PCM")
+		}
+	}
+}

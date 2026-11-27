@@ -5,51 +5,9 @@ import re
 from pathlib import Path
 
 
-from config_files import load
-
-
-def template_regex(template: str, server: str) -> str:
-    marker = "{{.}}"
-    if template.count(marker) != 1:
-        raise ValueError("unsupported mautrix-whatsapp username_template")
-    prefix, suffix = template.split(marker, 1)
-    if not (prefix or suffix) or any(c in prefix + suffix for c in "@:\r\n"):
-        raise ValueError("username_template must define a distinct ghost namespace")
-    return rf"^@{re.escape(prefix)}[^:]+{re.escape(suffix)}:{re.escape(server)}$"
-
-
-def resolve(registration: Path, config: Path | None, server: str) -> dict:
-    reg = load(registration.read_text(encoding="utf-8"))
-    token, sender = reg.get("as_token"), reg.get("sender_localpart")
-    if not isinstance(token, str) or not token or any(c.isspace() for c in token):
-        raise ValueError("invalid appservice token")
-    entries = reg.get("namespaces", {}).get("users", [])
-    patterns = [entry["regex"] for entry in entries
-                if isinstance(entry, dict) and entry.get("exclusive") is True
-                and isinstance(entry.get("regex"), str)]
-    bot = sender
-    template = None
-    if config is not None:
-        cfg = load(config.read_text(encoding="utf-8"))
-        appservice = cfg.get("appservice", {})
-        bot = appservice.get("bot", {}).get("username") or sender
-        template = appservice.get("username_template")
-        if not isinstance(template, str):
-            raise ValueError("appservice.username_template is required")
-    if not isinstance(bot, str) or not bot or any(c in bot for c in "@:\r\n"):
-        raise ValueError("invalid appservice bot username")
-    source = "registration" if patterns else "username_template"
-    if template:
-        scope = template_regex(template, server)
-        patterns = [rf"^(?=(?:{p})){scope[1:]}" for p in patterns] or [scope]
-    else:
-        # Without a config only explicitly exclusive, anchored namespaces are usable.
-        patterns = [p for p in patterns if p.startswith("^@") and p.endswith("$")]
-    if not patterns:
-        raise ValueError("no usable ghost namespace")
-    for pattern in patterns:
-        re.compile(pattern)
-    return {"as_token": token, "bot_localpart": bot, "ghost_regexes": patterns, "source": source}
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent / "worker"))
+from ghost_namespace import resolve_metadata as resolve
 
 
 def self_test() -> None:
@@ -74,10 +32,17 @@ def self_test() -> None:
             "  username_template: wa-custom-{{.}}\n",
             encoding="utf-8",
         )
+        try:
+            resolve(reg, cfg, "example.org")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("template alone must not grant ownership")
+        reg.write_text(json.dumps({"as_token":"test-token", "sender_localpart":"customwhatsappbot", "namespaces":{"users":[{"exclusive":True,"regex":"^@.*$"}]}}))
         result = resolve(reg, cfg, "example.org")
         assert result["as_token"] == "test-token"
         assert result["bot_localpart"] == "customwhatsappbot"
-        assert result["source"] == "username_template"
+        assert result["source"] == "registration"
         regex = re.compile(result["ghost_regexes"][0])
         assert regex.fullmatch("@wa-custom-lid-123:example.org")
         assert not regex.fullmatch("@whatsapp_lid-123:example.org")
@@ -98,7 +63,8 @@ def self_test() -> None:
         assert re.fullmatch(scoped, "@wa-custom-123:example.org")
         assert not re.fullmatch(scoped, "@alice:example.org")
         reg.write_text(json.dumps({"as_token":"quoted-token", "sender_localpart":"whatsappbot", "namespaces":{"users":[{"exclusive":True,"regex":r"^@whatsapp_.+:example\.org$"}]}}))
-        result = resolve(reg, None, "example.org")
+        cfg.write_text(json.dumps({"appservice": {"username_template": "whatsapp_{{.}}"}}))
+        result = resolve(reg, cfg, "example.org")
         assert result["bot_localpart"] == "whatsappbot"
         assert result["source"] == "registration"
         assert re.compile(result["ghost_regexes"][0]).fullmatch("@whatsapp_123:example.org")
@@ -117,8 +83,8 @@ def main() -> None:
     if args.self_test:
         self_test()
         return
-    if not args.registration or not args.server:
-        parser.error("--registration and --server are required unless --self-test is used")
+    if not args.registration or not args.config or not args.server:
+        parser.error("--registration, --config and --server are required unless --self-test is used")
 
     try:
         result = resolve(args.registration, args.config, args.server)

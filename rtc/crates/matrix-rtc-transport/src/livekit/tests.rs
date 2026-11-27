@@ -135,3 +135,27 @@ fn our_identity_on_a_target_is_what_its_flow_mints() {
     );
     assert!(!sfu_get.same_flow(&cs_api));
 }
+
+#[test]
+fn unusable_focus_does_not_skew_connection_and_identity_selection() {
+    let invalid = RtcTransport::LiveKit(LiveKitTransport::new(
+        Some("wss://sfu.example.com".into()), Some("invalid".into()), None,
+    ).unwrap());
+    let valid = RtcTransport::LiveKit(LiveKitTransport::sfu("wss://sfu.example.com"));
+    assert!(connection_key(&invalid, ALICE).is_none());
+    assert!(identity_for(&subject(&[invalid.clone()], Some("DEVICE"))).is_none());
+    assert_eq!(identity_for(&subject(&[invalid, valid.clone()], Some("DEVICE"))),
+               identity_for(&subject(&[valid.clone()], Some("DEVICE"))));
+    assert!(connection_key(&valid, ALICE).is_some());
+}
+
+#[test]
+fn endpoint_validation_preserves_legacy_precedence_and_local_test_endpoints() {
+    assert!(valid_service_url("http://localhost:8080"));
+    assert!(valid_sfu_url("ws://localhost:7880"));
+    for value in ["", "relative", "https://host/?query=1", "https://host/#fragment",
+                  "https://user:pass@host", "https://host:0"] {
+        assert!(!valid_service_url(value), "{value}");
+    }
+    assert!(!valid_sfu_token(&SfuToken { url: "wss://host".into(), jwt: " ".into() }));
+}

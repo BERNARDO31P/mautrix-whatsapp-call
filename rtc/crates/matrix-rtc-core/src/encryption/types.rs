@@ -45,7 +45,7 @@ impl ParticipantDeviceInfo {
     /// Whether `other` is the same *join*, not merely the same member id.
     ///
     /// Key bookkeeping must compare participations by
-    /// `(member_id, membership_ts)`: under the pre-sticky Element Call dialect
+    /// `(user_id, device_id, member_id, membership_ts)`: under the pre-sticky Element Call dialect
     /// a device that leaves and rejoins comes back under the member id it had
     /// before, with a fresh session holding no keys — matching on `member_id`
     /// alone would read the return as "already holds the key" and never send
@@ -53,7 +53,7 @@ impl ParticipantDeviceInfo {
     /// the two participations apart (the js-sdk compares `membershipTs` the
     /// same way).
     pub fn same_join(&self, other: &ParticipantDeviceInfo) -> bool {
-        self.member_id == other.member_id && self.membership_ts == other.membership_ts
+        self == other
     }
 }
 
@@ -161,6 +161,8 @@ pub struct ReceivedEncryptionKey {
 pub(crate) struct PendingInboundKey {
     pub key: InboundEncryptionKey,
     pub origin: KeyOrigin,
+    /// Local admission time, never extended by an exact retransmission.
+    pub first_seen_ms: u64,
 }
 
 /// An inbound encryption key received from another participant.

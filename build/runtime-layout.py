@@ -11,20 +11,20 @@ from zipfile import ZipFile
 DEPLOY = "deployment/mautrix-whatsapp-call/"
 DEPLOY_FILES = tuple("""INSTALLATION.md OPERATIONS.md README.md
 bridge/Dockerfile bridge/.dockerignore compose.yml config_files.py configure-bridge.py
-install-or-upgrade.sh merge-synapse.py migrate-rooms.sh nginx-443-locations.conf
+inspect-delayed-membership.py install-or-upgrade.sh merge-synapse.py migrate-rooms.sh nginx-443-locations.conf
 preflight.sh prepare.sh provision-ghost.sh reconcile-credentials.py render-hostname.py
 resolve-appservice.py server-cleanup.sh synapse-additions.yaml sync-direct-chats.sh
-verify-worker.sh verify.sh worker/Dockerfile worker/.dockerignore
-worker/auto-provision-whatsapp-ghosts.py worker/provision-ghost.py worker/session_files.py""".split())
+validate-candidate.py verify-worker.sh verify.sh worker/Dockerfile worker/.dockerignore
+worker/auto-provision-whatsapp-ghosts.py worker/provision-ghost.py worker/session_files.py worker/ghost_namespace.py worker/portal_kind.py""".split())
 LICENSE_FILES = tuple("""LICENSES.md licenses/AGPL-3.0.txt licenses/MAUTRIX-LICENSE-EXCEPTIONS.txt
-licenses/MATRIX-RUST-RTC-COMMERCIAL-NOTICE.txt licenses/MEOWCALLER-MIT.txt""".split())
+licenses/MATRIX-RUST-RTC-COMMERCIAL-NOTICE.txt licenses/MEOWCALLER-MIT.txt licenses/OPUS-BSD.txt""".split())
 BINARIES = {
     "mautrix-whatsapp-call-bridge": "bridge",
     "mautrix-whatsapp-call-worker": "worker",
     "mautrix-whatsapp-call-provision": "worker",
 }
 FILES = {DEPLOY + path for path in DEPLOY_FILES} | set(LICENSE_FILES) | {
-    "SOURCE-VERSIONS.env", "SHA256SUMS"
+    "SOURCE-VERSIONS.env", "BUILD-RECORD.json", "SHA256SUMS"
 } | {f"bin/{name}" for name in BINARIES} | {
     DEPLOY + f"{directory}/{name}" for name, directory in BINARIES.items()
 }

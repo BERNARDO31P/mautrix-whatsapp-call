@@ -2,6 +2,7 @@ package meowcaller
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"testing"
 
@@ -170,5 +171,25 @@ func TestCallSendReactionRequiresActiveAppDataStream(t *testing.T) {
 	_, call := testEngineWithOutgoingCall()
 	if err := call.SendReaction("👍"); !errors.Is(err, errAppDataUnavailable) {
 		t.Fatalf("SendReaction error = %v, want %v", err, errAppDataUnavailable)
+	}
+}
+
+func TestCallReactionContextStopsRetransmissionAfterCancel(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	call.setPhase(CallPhaseActive)
+	pipe, err := NewMediaPipeline(iota32(), "111111111111111:0@lid", "222222222222222:0@lid", 1234, FrameSamples)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sent := 0
+	sender := newAppDataSender(pipe, 1234, func(packet []byte) (int, error) { sent++; cancel(); return len(packet), nil })
+	eng.calls[call.ID()].appDataTx = sender
+	if err = call.SendReactionContext(ctx, "👍"); !errors.Is(err, context.Canceled) || sent != 1 {
+		t.Fatalf("got %v, packets %d", err, sent)
+	}
+	if err = call.SendReactionContext(ctx, ""); !errors.Is(err, context.Canceled) || sent != 1 {
+		t.Fatalf("cancelled action got %v, packets %d", err, sent)
 	}
 }

@@ -55,8 +55,8 @@ func (d *MlowDecoder) Reset() {
 func (d *MlowDecoder) Decode(payload []byte) []float32 {
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/ed12f359a086b28e807ba236f0977af1000859fe/wacore/src/voip/mlow/decoder.rs#L54-L72
 	if len(payload) == 0 {
-		d.log.Trace().Msg("decode: empty payload, emitting silence")
-		return make([]float32, opusFrameSamps)
+		d.log.Trace().Msg("decode: rejecting empty payload")
+		return nil
 	}
 	// SplitRed multi-frame container (0x92 <count>), seen in video calls with DTX on:
 	// WhatsApp packs several sequential 60 ms MLow frames into one RTP payload as
@@ -70,7 +70,12 @@ func (d *MlowDecoder) Decode(payload []byte) []float32 {
 		d.log.Trace().Int("sub_frames", len(subs)).Int("payload_bytes", len(payload)).Msg("decode: 0x92 SplitRed container")
 		var out []float32
 		for _, sf := range subs {
-			out = append(out, d.decodeFrame(sf)...)
+			pcm := d.decodeFrame(sf)
+			if len(pcm) == 0 {
+				d.Reset()
+				return nil
+			}
+			out = append(out, pcm...)
 		}
 		return out
 	}
@@ -78,8 +83,8 @@ func (d *MlowDecoder) Decode(payload []byte) []float32 {
 	if d.redundancy > 0 {
 		frames, err := DepackSplitRed(payload, d.log)
 		if err != nil {
-			d.log.Debug().Err(err).Int("payload_bytes", len(payload)).Msg("decode: RED depack failed, emitting silence")
-			return make([]float32, opusFrameSamps)
+			d.log.Debug().Err(err).Int("payload_bytes", len(payload)).Msg("decode: rejecting invalid RED payload")
+			return nil
 		}
 		var main []byte
 		if len(frames) > 0 {
@@ -129,8 +134,8 @@ func splitContainer(p []byte) ([][]byte, bool) {
 func (d *MlowDecoder) decodeFrame(frame []byte) []float32 {
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/ed12f359a086b28e807ba236f0977af1000859fe/wacore/src/voip/mlow/decoder.rs#L74-L99
 	if len(frame) == 0 {
-		d.log.Trace().Msg("decode frame: empty, emitting silence")
-		return make([]float32, opusFrameSamps)
+		d.log.Trace().Msg("decode frame: rejecting empty payload")
+		return nil
 	}
 	toc := ParseSmplTOC(frame[0], d.log)
 	var outLen int
@@ -144,8 +149,8 @@ func (d *MlowDecoder) decodeFrame(frame []byte) []float32 {
 		Bool("voiced", toc.Voiced).Int("frame_ms", toc.FrameMs).Int("sample_rate", toc.SampleRate).
 		Int("out_len", outLen).Msg("decode frame")
 	if toc.StdOpus {
-		d.log.Debug().Msg("decode frame: standard-Opus packet, not handled, emitting silence")
-		return make([]float32, outLen)
+		d.log.Debug().Msg("decode frame: standard-Opus packet rejected in MLow session")
+		return nil
 	}
 	if toc.SID || !toc.Active {
 		d.log.Trace().Bool("sid", toc.SID).Bool("active", toc.Active).Msg("decode frame: inactive/SID, emitting silence")
@@ -162,7 +167,7 @@ func (d *MlowDecoder) decodeFrame(frame []byte) []float32 {
 				Int("frame_ms", toc.FrameMs).
 				Msg("dropping unsupported active MLow frame")
 		}
-		return make([]float32, opusFrameSamps)
+		return nil
 	}
 	return d.decodeActiveFrame(frame, outLen)
 }

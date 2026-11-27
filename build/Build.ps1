@@ -54,7 +54,13 @@ try {
         $WslArgs = @("-d", $DistroName, "--user", "root", "--exec", "env", "MAUTRIX_WHATSAPP_CALL_CACHE=$CacheWsl", "MAUTRIX_WHATSAPP_CALL_DIST=$OutputWsl")
         if ($Jobs -gt 0) { $WslArgs += "MAUTRIX_WHATSAPP_CALL_BUILD_JOBS=$Jobs" }
         $WslArgs += @("bash", $BuildWsl)
-        Invoke-WslChecked -Arguments $WslArgs
+        # Preserve the native build status (including incomplete export 21).
+        & wsl.exe @WslArgs
+        $BuildExit = [int]$LASTEXITCODE
+        if ($BuildExit -ne 0) {
+            Write-Host "WINDOWS BUILD FAILED: native build exited $BuildExit. See the output above." -ForegroundColor Red
+            exit $BuildExit
+        }
     }
     if ($PrepareOnly) { Write-Host "WINDOWS PREPARATION: PASS" } else { Write-Host "WINDOWS BUILD: PASS" }
     exit 0

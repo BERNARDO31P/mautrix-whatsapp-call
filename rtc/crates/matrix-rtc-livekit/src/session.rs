@@ -45,6 +45,7 @@ impl LiveKitSession {
         token: &SfuToken,
         options: RoomOptions,
     ) -> Result<LiveKitConnection, Error> {
+        crate::token::validate_sfu_token(token)?;
         let (room, events) = Room::connect(&token.url, &token.jwt, options).await?;
         Ok(LiveKitConnection {
             session: LiveKitSession { room },

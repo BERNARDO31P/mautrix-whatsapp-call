@@ -10,12 +10,11 @@ import (
 )
 
 type groupRelayAllocateState struct {
-	mu            sync.RWMutex
-	packet        []byte
-	key           []byte
-	transactionID uint32
-	hasGroup      bool
-	hbhFECSSRCs   [2]uint32
+	mu          sync.RWMutex
+	packet      []byte
+	key         []byte
+	order       groupRelaySubscriptionOrder
+	hbhFECSSRCs [2]uint32
 }
 
 func newGroupRelayAllocateStateWithHBHFEC(
@@ -37,6 +36,21 @@ func (s *groupRelayAllocateState) Current() []byte {
 	return bytes.Clone(s.packet)
 }
 
+// Match only the successfully submitted current allocation; a response for
+// superseded credentials or subscriptions must never describe the new allocation.
+func (s *groupRelayAllocateState) matchesResponse(packet []byte) bool {
+	mt, ok := stun.StunMessageType(packet)
+	if !ok || (mt != stun.MsgAllocateSuccess && mt != stun.MsgAllocateError) {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	requestType, requestOK := stun.StunMessageType(s.packet)
+	want, wantOK := stun.StunTransactionID(s.packet)
+	got, gotOK := stun.StunTransactionID(packet)
+	return requestOK && requestType == stun.MsgAllocateRequest && wantOK && gotOK && bytes.Equal(want, got)
+}
+
 func (s *groupRelayAllocateState) SendCurrent(send func([]byte) error) error {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/bcfb7f0c076b131422c22f024dfff080448e70f4/datasheets/group-media-relay-refresh.md#L59-L67
 	if send == nil {
@@ -50,6 +64,7 @@ func (s *groupRelayAllocateState) SendCurrent(send func([]byte) error) error {
 func (s *groupRelayAllocateState) ApplyWithSubscriptions(
 	endpoint *relayEndpoint,
 	relayUpdate *groupCallRelay,
+	rosterTx uint32,
 	streamSSRCs [9]uint32,
 	appDataSSRC uint32,
 	participantPIDs []uint32,
@@ -62,7 +77,7 @@ func (s *groupRelayAllocateState) ApplyWithSubscriptions(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.hasGroup && relayUpdate.TransactionID <= s.transactionID {
+	if !s.order.accepts(relayUpdate.TransactionID, rosterTx) {
 		return false, nil
 	}
 	if endpoint == nil || endpoint.relayName == "" || len(endpoint.addresses) == 0 ||
@@ -109,8 +124,7 @@ func (s *groupRelayAllocateState) ApplyWithSubscriptions(
 	}
 	s.packet = append(s.packet[:0], packet...)
 	s.key = append(s.key[:0], relayUpdate.Key...)
-	s.transactionID = relayUpdate.TransactionID
-	s.hasGroup = true
+	s.order.commit(relayUpdate.TransactionID, rosterTx)
 	return true, nil
 }
 

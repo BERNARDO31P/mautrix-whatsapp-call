@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use matrix_rtc_core::{JoinedMembership, MaybeSend, RtcTransport};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::constraints::ResolvedConstraints;
 use crate::frame::{AudioFrame, VideoFrame};
@@ -404,6 +404,20 @@ pub trait TransportConnection: MaybeSend {
         ))
     }
 
+    /// Reserve a reconnect before the owner's task is scheduled. Native
+    /// implementations can invalidate that reservation synchronously on
+    /// take-over or close, even if the old future has never been polled.
+    fn reserve_reconnect(&self) -> Result<Option<u64>, TransportError> {
+        Ok(None)
+    }
+
+    /// Execute the reserved attempt. Backends without reservation support use
+    /// their existing reconnect implementation.
+    async fn reconnect_reserved(&self, fresh_token: bool, _reservation: Option<u64>)
+        -> Result<mpsc::UnboundedReceiver<ConnectionEvent>, TransportError> {
+        self.reconnect(fresh_token).await
+    }
+
     /// This connection's established session, for another handle of the
     /// same transport to [`take_over`](Self::take_over) (034 R25): opaque,
     /// and only meaningful to that transport. Changes nothing by itself; once
@@ -417,9 +431,11 @@ pub trait TransportConnection: MaybeSend {
     /// [handed over](Self::hand_over) (034 R25): its focus becomes this
     /// handle's, every publication made through this handle goes out there,
     /// and a later [`reconnect`](Self::reconnect) goes there too. A reconnect
-    /// still in flight is abandoned. Synchronous, so its owner decides
-    /// between it and such a reconnect in one step. The default refuses.
-    fn take_over(&self, _handover: Box<dyn Any>) -> Result<(), TransportError> {
+    /// still in flight is abandoned. Installation is synchronous, but a
+    /// backend restoring publications asynchronously returns a completion
+    /// receiver. None means restoration is already complete. Dropping the
+    /// receiver abandons the pending restoration. The default refuses.
+    fn take_over(&self, _handover: Box<dyn Any>) -> Result<Option<oneshot::Receiver<Result<(), TransportError>>>, TransportError> {
         Err(TransportError::Unsupported(
             "this connection cannot take another over".into(),
         ))

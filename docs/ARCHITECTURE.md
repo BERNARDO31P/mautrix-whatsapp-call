@@ -1,18 +1,35 @@
 # Architecture
 
-The existing mautrix-whatsapp process remains the owner of WhatsApp sessions, portals and message bridging. Calling is added as an extension rather than a second WhatsApp bridge.
+The existing mautrix-whatsapp bridge manages WhatsApp sessions, portals and messages. The call extension handles WhatsApp signalling and connects to the Rust MatrixRTC worker over a Unix socket. The worker joins LiveKit using persistent Matrix ghost identities.
 
-For a direct call, mautrix-whatsapp validates the Matrix room, caller, device and RTC slot, checks WhatsApp callability, starts or accepts the WhatsApp call, and exchanges media/control messages with the RTC worker over a private Unix socket. The Rust worker joins the MatrixRTC/LiveKit side with persistent encrypted Matrix ghost identities.
+```mermaid
+flowchart LR
+    WA[WhatsApp] <-->|Signalling and media| Bridge[mautrix-whatsapp]
+    Bridge <-->|Unix socket| Worker[MatrixRTC worker]
+    Worker <-->|Media| LK[LiveKit]
+    Worker <-->|Signalling| HS[Synapse]
+    Client[Matrix client] <-->|Signalling| HS
+    Client <-->|Media| LK
+    JWT[JWT service] --> LK
+```
 
-For WhatsApp groups, the bridge bot is one aggregate MatrixRTC participant. Group audio is mixed and one authenticated WhatsApp video source is selected at a time to avoid interleaving independent H264 encoders.
+## Services
 
-The deployment uses:
+| Service | Role |
+| --- | --- |
+| `mautrix-whatsapp` | Messaging, WhatsApp calling and portal management |
+| `mautrix-whatsapp-call-worker` | MatrixRTC signalling and encrypted media |
+| `mautrix-whatsapp-call-provisioner` | Persistent ghost identity provisioning |
+| `livekit` | Media forwarding (SFU) |
+| `lk-jwt-service` | LiveKit access tokens |
+| `synapse` | Existing Matrix homeserver |
 
-- `mautrix-whatsapp` — existing bridge service, rebuilt with `mautrix-whatsapp-call-bridge:local`.
-- `mautrix-whatsapp-call-worker` — encrypted MatrixRTC media worker.
-- `mautrix-whatsapp-call-provisioner` — persistent cross-signed ghost identity provisioning sidecar.
-- `livekit` — SFU.
-- `lk-jwt-service` — MatrixRTC LiveKit token service.
-- `synapse` — existing homeserver.
+The bridge and worker share `/run/mautrix-whatsapp-call/worker.sock` (mode `0660`). Only the provisioner receives the mautrix-whatsapp appservice registration.
 
-The bridge and worker communicate through `/run/mautrix-whatsapp-call/worker.sock` with mode `0660` and a shared numeric group. The main call worker never receives the mautrix-whatsapp appservice registration; only the provisioner does.
+## Group calls
+
+The default group topology uses one aggregate bridge participant and one admitted Matrix endpoint. Audio is mixed and one WhatsApp video source is selected at a time. Independent group media is experimental and disabled by default. See [client compatibility](CLIENT-CALL-COMPATIBILITY.md).
+
+## Storage
+
+The deployment stores generated credentials in `generated/` and persistent ghost identity state in `worker-state/`. Both must be preserved during upgrades.

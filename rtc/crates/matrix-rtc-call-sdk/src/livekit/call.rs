@@ -50,9 +50,9 @@ use matrix_rtc_call::{
 use matrix_rtc_core::RoomOptions;
 use matrix_rtc_core::compat::{self, MembershipFormat};
 use matrix_rtc_core::{
-    BaseRtcRoom, EncryptionConfig, LeaveError, LiveKitTransport, SlotEncryption,
+    BaseRtcRoom, EncryptionConfig, LeaveError, LiveKitTransport, Outbox, SlotEncryption,
 };
-use matrix_rtc_matrix_sdk::SdkMatrixBackend;
+use matrix_rtc_matrix_sdk::{CallKeyRecipients, SdkMatrixBackend};
 use matrix_rtc_transport::{
     LocalTrackHandle, MediaConstraints, MediaStreamKind, PublishOptions, ReceiveStats,
     RemoteTrackHandle,
@@ -60,7 +60,7 @@ use matrix_rtc_transport::{
 
 use matrix_rtc_livekit::{LiveKitSession, LiveKitTransportConnection, MediaKeyBridge};
 
-use super::{LiveKitAttachOptions, LiveKitAttachment, attach_livekit};
+use super::{LiveKitAttachOptions, LiveKitAttachment};
 
 /// Errors produced when joining, operating, or leaving a [`LiveKitCall`].
 #[derive(Debug, thiserror::Error)]
@@ -109,6 +109,10 @@ impl From<RtcError> for LiveKitCallError {
 /// discovery via the homeserver, and the core's default encryption policy.
 #[derive(Clone, Debug)]
 pub struct LiveKitCallOptions {
+    /// Optional deployment-specific restriction for service-account media.
+    pub trusted_focus: Option<matrix_rtc_livekit::TrustedFocus>,
+    /// Optional bridge-only media-key recipient gate, shared with the admitting host.
+    pub call_key_recipients: Option<CallKeyRecipients>,
     /// MatrixRTC slot to join.
     pub slot_id: String,
     /// MatrixRTC application of the slot.
@@ -201,6 +205,8 @@ impl Default for LiveKitCallOptions {
             slot_id: "m.call#room".to_owned(),
             application: "m.call".to_owned(),
             livekit_transport: None,
+            trusted_focus: None,
+            call_key_recipients: None,
             encryption_config: None,
             keep_alive_interval_ms: None,
             sticky_duration_ms: None,
@@ -234,6 +240,7 @@ pub struct LiveKitCall {
     raw_events: UnboundedReceiver<RoomEvent>,
     bridge: Arc<MediaKeyBridge>,
     own_identity: String,
+    key_recipients: Option<CallKeyRecipients>,
 }
 
 impl LiveKitCall {
@@ -257,6 +264,12 @@ impl LiveKitCall {
     /// Join with a shared setup deadline. If signalling has started, unwind it
     /// before releasing the room for a subsequent call.
     pub async fn join_until(room:&Room,options:LiveKitCallOptions,deadline:Option<tokio::time::Instant>)->Result<Self,LiveKitCallError>{
+        Self::join_until_with_outbox(room, options, deadline, Outbox::new()).await
+    }
+
+    /// Bridge workers reuse one outbox across calls made by the same device,
+    /// including the legacy state-key ownership journal.
+    pub async fn join_until_with_outbox(room:&Room,options:LiveKitCallOptions,deadline:Option<tokio::time::Instant>,outbox:Outbox)->Result<Self,LiveKitCallError>{
         async fn bounded<F:std::future::Future>(deadline:Option<tokio::time::Instant>,work:F)->Result<F::Output,LiveKitCallError>{
             match deadline {
                 Some(end)=>tokio::time::timeout_at(end,work).await.map_err(|_|LiveKitCallError::Signalling("RTC join timed out".into())),
@@ -293,7 +306,8 @@ impl LiveKitCall {
         // One client for this call: it opens the room (the feeder subscribes to
         // what the mode needs and seeds room state before membership) and the
         // to-device key subscription; the library runs both feeds.
-        let client = RtcClient::new(Arc::new(SdkMatrixBackend::new(client.clone())));
+        let client = RtcClient::with_outbox(Arc::new(SdkMatrixBackend::new(client.clone())
+            .with_call_key_recipients(options.call_key_recipients.clone())), outbox);
         let room = bounded(deadline, client.room(
             room_id.clone(),
             RoomOptions { format: options.format },
@@ -301,6 +315,11 @@ impl LiveKitCall {
         if let Err(error) = bounded(deadline, room.seeded()).await {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), room.close()).await;
             return Err(error);
+        }
+
+        if !room.is_seeded() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), room.close()).await;
+            return Err(LiveKitCallError::Signalling("RTC room feed unavailable".into()));
         }
 
         // The join picks the `member.id` this mode joins with (a fresh one per
@@ -344,7 +363,7 @@ impl LiveKitCall {
         // The media layer: the engine reconciling memberships with connection
         // events, and the own focus connected synchronously so a failed join
         // can be reported (and signalled away) immediately.
-        let attached = bounded(deadline,attach_livekit(
+        let attached = bounded(deadline,super::attach::attach_livekit_with_trusted_focus(
             &call,
             room.backend().clone(),
             LiveKitAttachOptions {
@@ -354,6 +373,7 @@ impl LiveKitCall {
                 own_reconnect_budget: None,
                 sfu_fallback: options.sfu_fallback,
             },
+            options.trusted_focus.clone(),
         )).await;
         let attached=match attached {
             Ok(result)=>result,
@@ -421,6 +441,11 @@ impl LiveKitCall {
             }
         };
 
+        if !room.is_seeded() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), room.close()).await;
+            return Err(LiveKitCallError::Signalling("RTC room feed unavailable".into()));
+        }
+
         // Transition-period raw stream; subscribed immediately after connect,
         // so only events racing the connect itself can be missed here.
         let raw_events = session.room().subscribe();
@@ -433,7 +458,14 @@ impl LiveKitCall {
             raw_events,
             bridge,
             own_identity,
+            key_recipients: options.call_key_recipients.clone(),
         })
+    }
+
+    /// Group admission activates the exact closed scope used by this SDK
+    /// membership, never a second caller-created scope.
+    pub fn group_recipient_scope(&self) -> Option<CallKeyRecipients> {
+        self.key_recipients.as_ref().filter(|scope| scope.is_group()).cloned()
     }
 
     /// Sends an Element Call emoji reaction. `name` is what peers pick a sound
@@ -587,10 +619,20 @@ impl LiveKitCall {
         self.call.member_id()
     }
 
+    /// Room and slot of this membership, for callers binding an admission proof.
+    pub fn room_id(&self) -> &str { self.call.room_id() }
+
+    pub fn slot_id(&self) -> &str { self.call.slot_id() }
+
     /// Number of members (including ourselves) currently joined to the slot,
     /// as signalled over sticky membership events.
     pub async fn subscribe_memberships(&self) -> watch::Receiver<Vec<matrix_rtc_core::JoinedMembership>> {
         self.call.subscribe_memberships().await
+    }
+
+    /// False if the signalling feed has stopped, lost ordered inputs, or its last complete snapshot is no longer fresh.
+    pub fn room_feed_ready(&self) -> bool {
+        self.room.is_seeded()
     }
 
     pub async fn member_count(&self) -> usize {
@@ -601,7 +643,31 @@ impl LiveKitCall {
     /// received and imported into this call's frame decryptor. See
     /// [`LiveKitCall::local_identity`] for the identity peers know us by.
     pub fn imported_key_for(&self, identity: &str) -> bool {
-        self.bridge.key_for(identity).is_some()
+        self.bridge.is_key_installed(identity)
+    }
+
+    /// Test-only evidence of the actual active sender index, not a queued key.
+    #[cfg(feature = "testing")]
+    pub fn testing_active_outbound_index(&self) -> Option<u8> {
+        let (index, _) = matrix_rtc_core::EncryptionKeySignalHandler::active_outbound_key(
+            self.bridge.as_ref(), self.local_identity())?;
+        let session = self.connection.session()?;
+        let cryptors = session.room().e2ee_manager().frame_cryptors();
+        let mut own = cryptors.iter().filter(|((identity, _), _)| identity.as_str() == self.local_identity());
+        let (_, first) = own.next()?;
+        (first.key_index() == i32::from(index) && own.all(|(_, cryptor)| cryptor.key_index() == i32::from(index)))
+            .then_some(index)
+    }
+
+    /// Test-only comparison of the sender's active key with the receiver's
+    /// installed key. Never returns or prints the key material.
+    #[cfg(feature = "testing")]
+    pub fn testing_has_active_key_from(&self, sender: &Self) -> bool {
+        let Some((index, key)) = matrix_rtc_core::EncryptionKeySignalHandler::active_outbound_key(
+            sender.bridge.as_ref(), sender.local_identity()) else { return false; };
+        self.bridge.accepted_key_for(sender.local_identity()).is_some_and(|received|
+            received.key_index == index && received.key == key)
+            && self.bridge.is_key_installed(sender.local_identity())
     }
 
     /// Leave the call cleanly: send the leave event (cancelling the delayed
@@ -614,6 +680,7 @@ impl LiveKitCall {
     /// ([`CallStatus::Ended`] with `CallEnd::SlotClosed`); leaving it then only
     /// releases what is left, and succeeds.
     pub async fn leave(self) -> Result<(), LiveKitCallError> {
+        if let Some(scope) = self.group_recipient_scope() { scope.revoke(); }
         let LiveKitCall {
             call,
             room,

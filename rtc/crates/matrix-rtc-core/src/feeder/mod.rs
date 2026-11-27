@@ -57,6 +57,7 @@ pub struct RoomRegistry<M>(Arc<StdMutex<HashMap<String, RegisteredRoom<M>>>>);
 struct RegisteredRoom<M> {
     dialect: Arc<dyn IngestDialect>,
     room: Weak<Mutex<M>>,
+    generation: Arc<()>,
 }
 
 impl<M> Clone for RoomRegistry<M> {
@@ -97,6 +98,7 @@ impl<M> RoomRegistry<M> {
             RegisteredRoom {
                 dialect,
                 room: Arc::downgrade(room),
+                generation: Arc::new(()),
             },
         );
         Ok(())
@@ -117,6 +119,24 @@ impl<M> RoomRegistry<M> {
     /// The live room for `room_id`, if one is held.
     pub fn room(&self, room_id: &str) -> Option<Arc<Mutex<M>>> {
         self.lock().get(room_id)?.room.upgrade()
+    }
+
+    // A queue entry carries only a weak generation token: it cannot keep a
+    // closed room alive, and re-registering even the same room handle creates
+    // a distinct admission generation.
+    fn generation(&self, room_id: &str) -> Option<Weak<()>> {
+        let rooms = self.lock();
+        let entry = rooms.get(room_id)?;
+        (entry.room.strong_count() > 0).then(|| Arc::downgrade(&entry.generation))
+    }
+
+    fn room_for_generation(&self, room_id: &str, generation: &Weak<()>) -> Option<Arc<Mutex<M>>> {
+        let rooms = self.lock();
+        let entry = rooms.get(room_id)?;
+        if !generation.ptr_eq(&Arc::downgrade(&entry.generation)) {
+            return None;
+        }
+        entry.room.upgrade()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -242,46 +262,160 @@ fn to_slot_event(room_id: &str, event: EventIn) -> Option<RawSlotEvent> {
 enum RoomInput {
     Sticky(Vec<EventIn>),
     State(String, Vec<EventIn>),
-    Snapshot(bool, Vec<(String, Vec<EventIn>)>, Vec<String>, Vec<EventIn>),
+    Snapshot(Arc<RoomSnapshot>),
     Members(Vec<String>),
     Encryption(bool),
     Timeline(Vec<EventIn>),
     Redaction(String),
-    Stop,
+}
+
+#[derive(Clone, PartialEq)]
+struct RoomSnapshot {
+    generation: u64,
+    encrypted: bool,
+    state: Vec<(String, Vec<EventIn>)>,
+    members: Vec<String>,
+    sticky: Vec<EventIn>,
+}
+
+// Ordered transitions cannot safely be dropped or coalesced across events.
+// An overloaded feed is invalid until the room is reopened and reseeded.
+const ROOM_INPUT_CAPACITY: usize = 128;
+// Bound distinct queued snapshots in serialized size and collection count.
+// Losing an ordered input requires reopening and reseeding the feed.
+const MAX_ROOM_INPUT_BYTES: usize = 512 * 1024;
+const MAX_ROOM_INPUT_ENTRIES: usize = 4096;
+
+impl RoomInput {
+    fn fits_queue(&self) -> bool {
+        fn fits(value: &impl serde::Serialize) -> bool {
+            serde_json::to_writer(EnvelopeSizeBudget(MAX_ROOM_INPUT_BYTES), value).is_ok()
+        }
+        match self {
+            Self::Sticky(events) | Self::Timeline(events) =>
+                events.len() <= MAX_ROOM_INPUT_ENTRIES && fits(events),
+            Self::State(kind, events) =>
+                events.len() <= MAX_ROOM_INPUT_ENTRIES && fits(&(kind, events)),
+            Self::Snapshot(snapshot) => {
+                let entries = snapshot.state.iter().fold(
+                    snapshot.members.len().saturating_add(snapshot.sticky.len()),
+                    |count, (_, events)| count.saturating_add(1).saturating_add(events.len()),
+                );
+                entries <= MAX_ROOM_INPUT_ENTRIES && fits(&(
+                    snapshot.encrypted, &snapshot.state, &snapshot.members, &snapshot.sticky,
+                ))
+            }
+            Self::Members(members) => members.len() <= MAX_ROOM_INPUT_ENTRIES && fits(members),
+            Self::Redaction(id) => fits(id),
+            Self::Encryption(_) => true,
+        }
+    }
+}
+
+// Separate from the initial seeding flag: an incomplete read invalidates
+// readiness immediately, even while old snapshots are still queued.
+#[derive(Clone, Copy)]
+struct SnapshotHealth {
+    generation: u64,
+    fresh: bool,
+}
+
+fn recover_snapshot(health: &watch::Sender<SnapshotHealth>, generation: u64) {
+    health.send_if_modified(|current| {
+        if current.generation != generation || current.fresh { return false; }
+        current.fresh = true;
+        true
+    });
 }
 
 struct ChannelRoomSink {
-    tx: mpsc::UnboundedSender<RoomInput>,
+    health: watch::Sender<SnapshotHealth>,
+    tx: mpsc::Sender<RoomInput>,
+    stop: watch::Sender<bool>,
+    // Only the last queued input may be deduplicated. A weak reference
+    // avoids retaining a second snapshot or suppressing a later retry.
+    tail_snapshot: StdMutex<Weak<RoomSnapshot>>,
+}
+
+impl ChannelRoomSink {
+    fn new(tx: mpsc::Sender<RoomInput>, stop: watch::Sender<bool>) -> Self {
+        let (health, _) = watch::channel(SnapshotHealth { generation: 0, fresh: true });
+        Self { health, tx, stop, tail_snapshot: StdMutex::new(Weak::new()) }
+    }
+
+    // Called with the tail mutex held, so all producer inputs and overflow
+    // decisions are ordered. Never wait for a consumer from a host callback.
+    fn enqueue(&self, input: RoomInput) {
+        if *self.stop.borrow() { return; }
+        if !input.fits_queue() {
+            log::warn!("RTC room feed unavailable: input exceeds queue budget");
+            self.stop.send_replace(true);
+            return;
+        }
+        if self.tx.try_send(input).is_err() {
+            log::warn!("RTC room feed unavailable: queue full or receiver closed");
+            self.stop.send_replace(true);
+        }
+    }
+
+    fn send(&self, input: RoomInput) {
+        let mut tail = self.tail_snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        *tail = Weak::new();
+        self.enqueue(input);
+    }
 }
 
 impl RoomSink for ChannelRoomSink {
     fn on_sticky_events(&self, events: Vec<EventIn>) {
-        let _ = self.tx.send(RoomInput::Sticky(events));
+        self.send(RoomInput::Sticky(events));
     }
 
     fn on_state_events(&self, event_type: String, events: Vec<EventIn>) {
-        let _ = self.tx.send(RoomInput::State(event_type, events));
+        self.send(RoomInput::State(event_type, events));
     }
 
     fn on_room_snapshot(&self, encrypted: bool, state: Vec<(String, Vec<EventIn>)>,
                         members: Vec<String>, sticky: Vec<EventIn>) {
-        let _ = self.tx.send(RoomInput::Snapshot(encrypted, state, members, sticky));
+        let mut tail = self.tail_snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        if *self.stop.borrow() { return; }
+        let generation = self.health.borrow().generation;
+        let snapshot = Arc::new(RoomSnapshot { generation, encrypted, state, members, sticky });
+        if tail.upgrade().is_some_and(|previous| previous.as_ref() == snapshot.as_ref()) {
+            return;
+        }
+        *tail = Arc::downgrade(&snapshot);
+        self.enqueue(RoomInput::Snapshot(snapshot));
+    }
+
+    fn on_room_snapshot_failed(&self) {
+        let mut tail = self.tail_snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        *tail = Weak::new();
+        if *self.stop.borrow() { return; }
+        self.health.send_modify(|current| {
+            if let Some(next) = current.generation.checked_add(1) {
+                current.generation = next;
+            } else {
+                // Never permit reuse of a freshness generation.
+                self.stop.send_replace(true);
+            }
+            current.fresh = false;
+        });
     }
 
     fn on_joined_members(&self, user_ids: Vec<String>) {
-        let _ = self.tx.send(RoomInput::Members(user_ids));
+        self.send(RoomInput::Members(user_ids));
     }
 
     fn on_encryption(&self, encrypted: bool) {
-        let _ = self.tx.send(RoomInput::Encryption(encrypted));
+        self.send(RoomInput::Encryption(encrypted));
     }
 
     fn on_timeline_events(&self, events: Vec<EventIn>) {
-        let _ = self.tx.send(RoomInput::Timeline(events));
+        self.send(RoomInput::Timeline(events));
     }
 
     fn on_redaction(&self, event_id: String) {
-        let _ = self.tx.send(RoomInput::Redaction(event_id));
+        self.send(RoomInput::Redaction(event_id));
     }
 }
 
@@ -290,8 +424,9 @@ impl RoomSink for ChannelRoomSink {
 pub struct RoomAttachment {
     room_id: String,
     subscription: Arc<dyn Subscription>,
-    stop: mpsc::UnboundedSender<RoomInput>,
+    stop: watch::Sender<bool>,
     seeded: watch::Receiver<bool>,
+    health: watch::Receiver<SnapshotHealth>,
 }
 
 impl RoomAttachment {
@@ -303,23 +438,33 @@ impl RoomAttachment {
     /// afterwards sees them. Also resolves if the feeder stops first.
     pub async fn seeded(&self) {
         let mut seeded = self.seeded.clone();
-        while !*seeded.borrow_and_update() {
-            if seeded.changed().await.is_err() {
-                return;
+        let mut stop = self.stop.subscribe();
+        let mut health = self.health.clone();
+        loop {
+            let has_seed = *seeded.borrow_and_update();
+            let fresh = health.borrow_and_update().fresh;
+            if *stop.borrow() || (has_seed && fresh) { return; }
+            tokio::select! {
+                _ = stop.changed() => return,
+                result = seeded.changed() => if result.is_err() { return; },
+                result = health.changed() => if result.is_err() { return; },
             }
         }
     }
 
     pub fn is_seeded(&self) -> bool {
-        *self.seeded.borrow()
+        let ready = *self.seeded.borrow();
+        ready && self.seeded.has_changed().is_ok() && !*self.stop.borrow() && self.health.borrow().fresh
     }
 }
 
 impl Drop for RoomAttachment {
     fn drop(&mut self) {
         log::info!("[{}] detaching", self.room_id);
+        // Signal separately from room inputs before cancelling the producer.
+        // A full backlog must not postpone detachment.
+        self.stop.send_replace(true);
         self.subscription.cancel();
-        let _ = self.stop.send(RoomInput::Stop);
     }
 }
 
@@ -350,8 +495,10 @@ impl RoomFeeder {
         let subjects = subjects_for(dialect.as_ref(), timeline_event_types);
         log::info!("[{room_id}] attaching: {subjects:?}");
 
-        let (tx, rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn RoomSink> = Arc::new(ChannelRoomSink { tx: tx.clone() });
+        let (tx, rx) = mpsc::channel(ROOM_INPUT_CAPACITY);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let sink = Arc::new(ChannelRoomSink::new(tx, stop_tx.clone()));
+        let health = sink.health.clone();
         let subscription = backend
             .subscribe_room(room_id.clone(), subjects, sink)
             .await?;
@@ -359,9 +506,10 @@ impl RoomFeeder {
 
         let attachment = RoomAttachment {
             room_id: room_id.clone(),
-            subscription,
-            stop: tx,
+            subscription: subscription.clone(),
+            stop: stop_tx,
             seeded: seeded_rx,
+            health: health.subscribe(),
         };
         let run = RoomFeederRun {
             backend,
@@ -370,7 +518,10 @@ impl RoomFeeder {
             dialect,
             sticky_event_types,
             rx,
+            subscription,
+            stop: stop_rx,
             seeded: seeded_tx,
+            health,
             state: FeedState::default(),
         };
         Ok((attachment, run))
@@ -391,6 +542,7 @@ struct FeedState {
     /// reads it from.
     membership_state: HashMap<String, Vec<EventIn>>,
     membership_dirty: bool,
+    membership_expiry: Option<crate::executor::Instant>,
 }
 
 /// The future that applies a room's inputs. Ends when the attachment drops.
@@ -402,8 +554,11 @@ pub struct RoomFeederRun<B, M> {
     /// The application's sticky types, read once at attach like its timeline
     /// types.
     sticky_event_types: Vec<String>,
-    rx: mpsc::UnboundedReceiver<RoomInput>,
+    rx: mpsc::Receiver<RoomInput>,
+    subscription: Arc<dyn Subscription>,
+    stop: watch::Receiver<bool>,
     seeded: watch::Sender<bool>,
+    health: watch::Sender<SnapshotHealth>,
     state: FeedState,
 }
 
@@ -413,42 +568,93 @@ where
     M: ApplicationIntake<B>,
 {
     pub async fn run(mut self) {
+        enum Wake {
+            Input(Option<RoomInput>),
+            ExpireMembership,
+            ExpireHolds,
+            SeedingWarning,
+            Stop,
+        }
         loop {
-            let input = if *self.seeded.borrow() {
+            if *self.stop.borrow() { break; }
+            let expiry_in = self.state.membership_expiry.map(|at|
+                at.saturating_duration_since(crate::executor::Instant::now()));
+            let wake = if *self.seeded.borrow() {
                 // A delayed-leave hold ending is an input of its own (034 R21).
-                let hold = self.room.lock().await.rtc().hold_expires_at();
+                // Detachment must also wake a feeder waiting for the room lock.
+                let hold = tokio::select! {
+                    _ = self.stop.changed() => break,
+                    mut room = self.room.lock() => room.rtc().hold_expires_at(),
+                };
                 let hold_in =
                     hold.map(|at| at.saturating_duration_since(crate::executor::Instant::now()));
                 tokio::select! {
-                    input = self.rx.recv() => input,
-                    () = crate::executor::sleep(hold_in.unwrap_or_default()), if hold_in.is_some() => {
-                        self.room.lock().await.rtc().expire_holds().await;
-                        continue;
-                    }
+                    _ = self.stop.changed() => Wake::Stop,
+                    input = self.rx.recv() => Wake::Input(input),
+                    () = crate::executor::sleep(expiry_in.unwrap_or_default()), if expiry_in.is_some() => Wake::ExpireMembership,
+                    () = crate::executor::sleep(hold_in.unwrap_or_default()), if hold_in.is_some() => Wake::ExpireHolds,
                 }
             } else {
                 tokio::select! {
-                    input = self.rx.recv() => input,
-                    () = crate::executor::sleep(SEEDING_WARN_AFTER) => {
-                        log::warn!(
-                            "[{}] not seeded: nothing delivered for {}s, still waiting on {}",
-                            self.room_id,
-                            SEEDING_WARN_AFTER.as_secs(),
-                            self.missing_subjects().join(", "),
-                        );
-                        continue;
-                    }
+                    _ = self.stop.changed() => Wake::Stop,
+                    input = self.rx.recv() => Wake::Input(input),
+                    () = crate::executor::sleep(expiry_in.unwrap_or_default()), if expiry_in.is_some() => Wake::ExpireMembership,
+                    () = crate::executor::sleep(SEEDING_WARN_AFTER) => Wake::SeedingWarning,
                 }
             };
-            let Some(input) = input else { break };
+            // select is deliberately fair between input and timers. Recheck
+            // stop even when a ready input won the race with detachment.
+            if *self.stop.borrow() { break; }
+            let input = match wake {
+                Wake::Stop | Wake::Input(None) => break,
+                Wake::Input(Some(input)) => input,
+                Wake::ExpireMembership => {
+                    self.state.membership_dirty = true;
+                    self.apply_membership().await;
+                    continue;
+                }
+                Wake::ExpireHolds => {
+                    self.room.lock().await.rtc().expire_holds().await;
+                    continue;
+                }
+                Wake::SeedingWarning => {
+                    log::warn!(
+                        "[{}] not seeded: nothing delivered for {}s, still waiting on {}",
+                        self.room_id,
+                        SEEDING_WARN_AFTER.as_secs(),
+                        self.missing_subjects().join(", "),
+                    );
+                    continue;
+                }
+            };
+            let mut applied_generation = None;
             match input {
-                RoomInput::Stop => break,
                 RoomInput::Encryption(encrypted) => self.on_encryption(encrypted).await,
                 RoomInput::State(event_type, events) => self.on_state(event_type, events).await,
-                RoomInput::Snapshot(encrypted, state, members, sticky) => {
+                RoomInput::Snapshot(snapshot) => {
+                    // Release the queue-owned Arc before awaiting network work,
+                    // so equal subsequent snapshots can retry failed application.
+                    let RoomSnapshot { generation, encrypted, state, members, sticky } =
+                        Arc::unwrap_or_clone(snapshot);
+                    // A newer failed read invalidates older queued snapshots.
+                    // Do not apply them as if they represented current room state.
+                    if self.health.borrow().generation != generation { continue; }
+                    applied_generation = Some(generation);
                     self.on_encryption(encrypted).await;
+                    // A complete snapshot may move a slot between aliases.
+                    // Stage all slot spellings before publishing any resolved
+                    // slot state: an intermediate absence would auto-leave.
+                    let mut slots_changed = false;
                     for (event_type, events) in state {
-                        self.on_state(event_type, events).await;
+                        if SLOT_EVENT_TYPES.contains(&event_type.as_str()) {
+                            replace_slot_events(&mut self.state.slots, event_type == SLOT_EVENT_TYPE, events);
+                            slots_changed = true;
+                        } else {
+                            self.on_state(event_type, events).await;
+                        }
+                    }
+                    if slots_changed {
+                        self.publish_slots().await;
                     }
                     self.on_members(members).await;
                     self.on_sticky(sticky).await;
@@ -467,10 +673,22 @@ where
                 }
             }
 
+            // Do not start another membership apply after detachment. An
+            // already-running input is allowed to finish its own transaction.
+            if *self.stop.borrow() { break; }
             if self.state.membership_dirty && self.gate_open() {
                 self.apply_membership().await;
             }
+            if let Some(generation) = applied_generation {
+                if !*self.stop.borrow() && *self.seeded.borrow() && !self.state.membership_dirty {
+                    recover_snapshot(&self.health, generation);
+                }
+            }
         }
+        // On overflow the attachment may still exist. Cancel the producer
+        // here as well; ordinary attachment drop already cancels it.
+        self.rx.close();
+        self.subscription.cancel();
         log::info!("[{}] feeder stopped", self.room_id);
     }
 
@@ -503,15 +721,7 @@ where
     async fn on_state(&mut self, event_type: String, events: Vec<EventIn>) {
         if SLOT_EVENT_TYPES.contains(&event_type.as_str()) {
             replace_slot_events(&mut self.state.slots, event_type == SLOT_EVENT_TYPE, events);
-            let slots: Vec<RawSlotEvent> = self
-                .state
-                .slots
-                .values()
-                .filter_map(SlotEvents::current)
-                .filter_map(|event| to_slot_event(&self.room_id, event.clone()))
-                .collect();
-            self.room.lock().await.rtc().on_slots_received(slots).await;
-            self.state.seen_slots = true;
+            self.publish_slots().await;
         } else if self
             .dialect
             .membership_state_event_types()
@@ -526,6 +736,18 @@ where
                 events.len(),
             );
         }
+    }
+
+    async fn publish_slots(&mut self) {
+        let slots: Vec<RawSlotEvent> = self
+            .state
+            .slots
+            .values()
+            .filter_map(SlotEvents::current)
+            .filter_map(|event| to_slot_event(&self.room_id, event.clone()))
+            .collect();
+        self.room.lock().await.rtc().on_slots_received(slots).await;
+        self.state.seen_slots = true;
     }
 
     /// A joined-members set without the account itself cannot be the room's
@@ -590,16 +812,22 @@ where
 
     async fn apply_membership(&mut self) {
         let sticky = self.state.sticky.clone().unwrap_or_default();
-        let state = self
+        let state: Vec<EventIn> = self
             .state
             .membership_state
             .values()
             .flatten()
             .cloned()
             .collect();
-        let current = self
-            .dialect
-            .current_membership(&self.room_id, sticky, state);
+        // Capture the deadline before translation or awaiting network work.
+        // A membership expiring during either operation gets another pass.
+        let sampled_at = crate::executor::Instant::now();
+        // Share the process epoch anchor with other local deadlines. Neither
+        // wall-clock adjustments nor room reattachment reset this estimate.
+        let now_ms = crate::own_membership::now_ms();
+        let (current, expiry_in) = self.dialect
+            .current_membership_with_expiry_at(&self.room_id, sticky, state, now_ms);
+        let next_expiry = expiry_in.map(|delay| sampled_at + delay);
         if let Err(error) = self
             .room
             .lock()
@@ -614,9 +842,20 @@ where
             );
             // Keep the failed snapshot dirty so a later delivery retries it,
             // but do not report readiness when it has not been applied.
+            // If an expiry already armed the timer, retry with a delay rather
+            // than spinning on the expired deadline or losing the wakeup.
+            if self.state.membership_expiry.is_some() {
+                self.state.membership_expiry = Some(crate::executor::Instant::now()
+                    + std::time::Duration::from_secs(1));
+            } else {
+                // The first failed application can still have a live legacy
+                // deadline. Keep its wakeup even before the room is seeded.
+                self.state.membership_expiry = next_expiry;
+            }
             return;
         }
         self.state.membership_dirty = false;
+        self.state.membership_expiry = next_expiry;
         if !*self.seeded.borrow() {
             log::info!("[{}] seeded", self.room_id);
             let _ = self.seeded.send(true);
@@ -686,6 +925,10 @@ pub fn parse_key_message(
     dialect_of: impl Fn(&str) -> Option<Arc<dyn IngestDialect>>,
     message: ToDeviceMessageIn,
 ) -> Option<ReceivedEncryptionKey> {
+    if !key_message_fits_queue(&message) {
+        log::warn!("Ignoring oversized media key envelope");
+        return None;
+    }
     let room_id = message
         .content
         .get("room_id")
@@ -698,12 +941,16 @@ pub fn parse_key_message(
         );
         return None;
     };
-    dialect.parse_key(&message)
+    dialect.parse_key(&message).filter(crate::encryption::inbound_key_fits_budget)
 }
 
 /// A media key in MSC4143's body (`room_id`, `member_id`, `media_key`), the
 /// default every [`IngestDialect`] reads.
 pub fn parse_msc_key(message: &ToDeviceMessageIn) -> Option<ReceivedEncryptionKey> {
+    if !key_message_fits_queue(message) {
+        log::warn!("Ignoring oversized MSC media key envelope");
+        return None;
+    }
     let content: KeyMessageContent = serde_json::from_value(message.content.clone())
         .inspect_err(|error| {
             log::warn!(
@@ -715,6 +962,10 @@ pub fn parse_msc_key(message: &ToDeviceMessageIn) -> Option<ReceivedEncryptionKe
         .ok()?;
     // LiveKit needs 32 bytes (spec 038 R16). Only an MSC room is this strict:
     // Element Call's room-state keys, read by its own parser, may be 16.
+    if content.media_key.key.len() > crate::encryption::MAX_ENCODED_MEDIA_KEY_LEN {
+        log::warn!("Ignoring oversized MSC media key");
+        return None;
+    }
     let key_len = MEDIA_KEY_BASE64
         .decode(&content.media_key.key)
         .map(|key| key.len())
@@ -736,20 +987,81 @@ pub fn parse_msc_key(message: &ToDeviceMessageIn) -> Option<ReceivedEncryptionKe
     })
 }
 
-struct ChannelToDeviceSink {
-    tx: mpsc::UnboundedSender<Option<ToDeviceMessageIn>>,
+// The backend callback is synchronous, so it must never block waiting for the
+// consumer (which can itself be waiting on a room lock).
+const MAX_QUEUED_TO_DEVICE_KEYS: usize = 4096;
+
+// Bound the entire raw envelope, including ignored extension fields and
+// sender metadata, rather than just the encoded media key. Counting JSON
+// output avoids allocating a second copy of the message before enqueueing.
+const MAX_QUEUED_TO_DEVICE_KEY_BYTES: usize = 16 * 1024;
+
+struct EnvelopeSizeBudget(usize);
+
+impl std::io::Write for EnvelopeSizeBudget {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.checked_sub(bytes.len()).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "RTC envelope exceeds budget")
+        })?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
-impl ToDeviceSink for ChannelToDeviceSink {
+pub(crate) fn key_message_fits_queue(message: &ToDeviceMessageIn) -> bool {
+    serde_json::to_writer(EnvelopeSizeBudget(MAX_QUEUED_TO_DEVICE_KEY_BYTES), message).is_ok()
+}
+
+struct QueuedKey {
+    message: ToDeviceMessageIn,
+    generation: Weak<()>,
+}
+
+struct ChannelToDeviceSink<M> {
+    tx: mpsc::Sender<QueuedKey>,
+    registry: RoomRegistry<M>,
+    event_types: Vec<String>,
+    dropped: std::sync::atomic::AtomicU64,
+    oversized: std::sync::atomic::AtomicU64,
+}
+
+impl<M: crate::MaybeSend + 'static> ToDeviceSink for ChannelToDeviceSink<M> {
     fn on_to_device_message(&self, message: ToDeviceMessageIn) {
-        let _ = self.tx.send(Some(message));
+        if !self.event_types.contains(&message.event_type) {
+            return;
+        }
+        let Some(room_id) = message.content.get("room_id").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(generation) = self.registry.generation(room_id) else {
+            return;
+        };
+        if !key_message_fits_queue(&message) {
+            let count = self.oversized.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .wrapping_add(1);
+            if count.is_power_of_two() {
+                log::warn!("To-device media key envelope too large; {count} messages dropped");
+            }
+            return;
+        }
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(QueuedKey { message, generation }) {
+            let count = self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .wrapping_add(1);
+            // Report sustained overflow without one log message per dropped key.
+            if count.is_power_of_two() {
+                log::warn!("To-device media key queue full; {count} keys dropped");
+            }
+        }
     }
 }
 
 /// The client-wide to-device subscription. Dropping it stops it.
 pub struct ToDeviceFeeder {
     subscription: Arc<dyn Subscription>,
-    stop: mpsc::UnboundedSender<Option<ToDeviceMessageIn>>,
+    stop: watch::Sender<bool>,
 }
 
 impl ToDeviceFeeder {
@@ -763,25 +1075,33 @@ impl ToDeviceFeeder {
     ) -> Result<(ToDeviceFeeder, ToDeviceFeederRun<B, M>), BackendError>
     where
         B: MatrixBackend + 'static,
-        M: ApplicationIntake<B>,
+        M: ApplicationIntake<B> + crate::MaybeSend + 'static,
     {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn ToDeviceSink> = Arc::new(ChannelToDeviceSink { tx: tx.clone() });
+        let (tx, rx) = mpsc::channel(MAX_QUEUED_TO_DEVICE_KEYS);
+        let (stop, stopped) = watch::channel(false);
         let mut event_types: Vec<String> =
             KEY_EVENT_TYPES.iter().map(|t| (*t).to_owned()).collect();
         event_types.extend(extra_key_event_types);
+        let sink: Arc<dyn ToDeviceSink> = Arc::new(ChannelToDeviceSink {
+            tx,
+            registry: registry.clone(),
+            event_types: event_types.clone(),
+            dropped: std::sync::atomic::AtomicU64::new(0),
+            oversized: std::sync::atomic::AtomicU64::new(0),
+        });
         let subscription = backend
             .subscribe_to_device(event_types.clone(), sink)
             .await?;
         Ok((
             ToDeviceFeeder {
                 subscription,
-                stop: tx,
+                stop,
             },
             ToDeviceFeederRun {
                 registry,
                 event_types,
                 rx,
+                stopped,
                 _backend: backend,
             },
         ))
@@ -795,7 +1115,7 @@ impl ToDeviceFeeder {
 impl Drop for ToDeviceFeeder {
     fn drop(&mut self) {
         self.subscription.cancel();
-        let _ = self.stop.send(None);
+        let _ = self.stop.send(true);
     }
 }
 
@@ -803,7 +1123,8 @@ impl Drop for ToDeviceFeeder {
 pub struct ToDeviceFeederRun<B, M> {
     registry: RoomRegistry<M>,
     event_types: Vec<String>,
-    rx: mpsc::UnboundedReceiver<Option<ToDeviceMessageIn>>,
+    rx: mpsc::Receiver<QueuedKey>,
+    stopped: watch::Receiver<bool>,
     _backend: Arc<B>,
 }
 
@@ -813,8 +1134,26 @@ where
     M: ApplicationIntake<B>,
 {
     pub async fn run(mut self) {
-        while let Some(Some(message)) = self.rx.recv().await {
+        loop {
+            if *self.stopped.borrow() {
+                break;
+            }
+            let message = tokio::select! {
+                biased;
+                _ = self.stopped.changed() => break,
+                message = self.rx.recv() => match message {
+                    Some(message) => message,
+                    None => break,
+                },
+            };
+            let QueuedKey { message, generation } = message;
             if !self.event_types.contains(&message.event_type) {
+                continue;
+            }
+            let Some(room_id) = message.content.get("room_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if self.registry.room_for_generation(room_id, &generation).is_none() {
                 continue;
             }
             let Some(key) = parse_key_message(|room_id| self.registry.dialect(room_id), message)
@@ -823,14 +1162,28 @@ where
             };
             // A key for a room no live room object holds is dropped: nothing
             // could use it, and keeping it would be state spanning rooms.
-            let Some(room) = self.registry.room(&key.room_id) else {
+            let Some(room) = self.registry.room_for_generation(&key.room_id, &generation) else {
                 log::debug!(
                     "[{}] dropping a media key for a room that is not open",
                     key.room_id
                 );
                 continue;
             };
-            if let Err(error) = room.lock().await.rtc().receive_encryption_key(key).await {
+            let mut room = tokio::select! {
+                biased;
+                _ = self.stopped.changed() => break,
+                room = room.lock() => room,
+            };
+            if *self.stopped.borrow() {
+                break;
+            }
+            // A room could have closed or reopened while we waited for its
+            // async lock. Never route that queued event into the new registration.
+            if self.registry.room_for_generation(&key.room_id, &generation).is_none() {
+                continue;
+            }
+            // Do not cancel an admitted receive half way through key application.
+            if let Err(error) = room.rtc().receive_encryption_key(key).await {
                 log::warn!("a media key was rejected: {error}");
             }
         }

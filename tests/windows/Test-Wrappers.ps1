@@ -85,6 +85,26 @@ function Invoke-WslSystemSetup { param([string]`$ScriptPath) if (`$env:MATRIXRTC
     $Result = Get-Content -Raw -LiteralPath (Join-Path $Temp "result.json") | ConvertFrom-Json
     if ($Result.OutputRoot -ne (Join-Path $Target "dist") -or $Result.DistroName -ne "test-distro" -or $Result.Jobs -ne 2 -or -not $Result.PrepareOnly) { throw "Actual bootstrap failed to forward build parameters" }
     Remove-Item Env:MATRIXRTC_TEST_EXISTING
+    # Execute the actual build wrapper; simulate only WSL operations.
+    Copy-Item -LiteralPath (Join-Path $Root "build\Build.ps1") -Destination (Join-Path $Temp "build\Build.ps1") -Force
+    $FakeBuildCommon = @"
+function Assert-WindowsBuilder { param([switch]`$RequireWsl) }
+function Get-WslDistributions { "test-distro" }
+function Invoke-WslChecked { param([string[]]`$Arguments) }
+function wsl.exe {
+    if (`$args -contains "uname") { "x86_64"; `$global:LASTEXITCODE = 0; return }
+    if (`$args -contains "wslpath") { "/fixture/path with spaces"; `$global:LASTEXITCODE = 0; return }
+    if (`$args -contains "env") { `$global:LASTEXITCODE = [int]`$env:MATRIXRTC_TEST_BUILD_EXIT; return }
+    throw "Unexpected fixture WSL invocation"
+}
+"@
+    Set-Content -LiteralPath (Join-Path $Temp "bootstrap\Windows.Common.ps1") -Value $FakeBuildCommon -Encoding UTF8
+    foreach ($Expected in @(0, 20, 21, 26)) {
+        $env:MATRIXRTC_TEST_BUILD_EXIT = [string]$Expected
+        & $PowerShell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Temp "Build.ps1") -DistroName "test-distro" -OutputRoot $Target
+        if ($LASTEXITCODE -ne $Expected) { throw "Actual build wrapper lost native status $Expected; got $LASTEXITCODE" }
+    }
+    Remove-Item Env:MATRIXRTC_TEST_BUILD_EXIT
     Write-Host "Windows wrapper regression tests: PASS"
 } finally {
     Remove-Item -LiteralPath $Temp -Recurse -Force

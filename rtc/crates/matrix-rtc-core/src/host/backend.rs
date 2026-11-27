@@ -236,7 +236,7 @@ impl EventEncryption {
 }
 
 /// A room event as the client handed it over: content as raw JSON.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EventIn {
     pub event_id: String,
     pub sender: String,
@@ -293,6 +293,10 @@ pub trait RoomSink: MaybeSend {
         self.on_joined_members(members);
         self.on_sticky_events(sticky);
     }
+    /// A complete snapshot could not be read. Retain the last known state,
+    /// but do not use it as fresh evidence for call admission. A subsequent
+    /// complete snapshot can restore readiness after it has been applied.
+    fn on_room_snapshot_failed(&self) {}
     fn on_joined_members(&self, user_ids: Vec<String>);
     fn on_encryption(&self, encrypted: bool);
     fn on_timeline_events(&self, events: Vec<EventIn>);
@@ -753,6 +757,9 @@ pub enum MockOutcome {
     Ok,
     /// Fails with this error and records nothing.
     Fail(BackendError),
+    /// The server applied the mutation but its answer was lost.
+    /// Used by delayed operations and to-device sends.
+    AcceptedThenFail(BackendError),
     /// Never answers, as a send the host holds open for ever.
     Hang,
     /// Waits this long on the executor's timer, then does the inner outcome.
@@ -767,6 +774,31 @@ pub struct MockCall {
     /// Since the mock was created, on the executor's clock (paused test time
     /// moves it).
     pub at: std::time::Duration,
+}
+
+/// Server-side lifecycle of a modelled delayed operation. Expiry is evaluated
+/// against the executor clock even when the client is offline.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MockDelayState { Pending, Fired, Cancelled }
+
+#[cfg(any(test, feature = "testing"))]
+struct MockDelay {
+    room: String,
+    id: String,
+    duration: std::time::Duration,
+    expires_at: std::time::Duration,
+    state: MockDelayState,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl MockDelay {
+    fn observe(&mut self, now: std::time::Duration) -> MockDelayState {
+        if self.state == MockDelayState::Pending && now >= self.expires_at {
+            self.state = MockDelayState::Fired;
+        }
+        self.state
+    }
 }
 
 /// A backend that records every send and keeps the sinks it was given, so a
@@ -822,7 +854,12 @@ pub struct MockBackend {
     pub undeliverable: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
     /// While set, every send answers this, before any scripted outcome: an
     /// outage of the homeserver ([`Self::set_outage`]).
-    pub outage: std::sync::Mutex<Option<MockOutcome>>,
+    outage: std::sync::Mutex<(u64, Option<MockOutcome>)>,
+    // Opt in so old unit fixtures relying on a synthetic constant ID retain
+    // their semantics. Scenario tests and debug host fixtures enable this.
+    delayed_model: std::sync::Mutex<Option<Vec<MockDelay>>>,
+    /// Per-recipient attempted sends, including failed or cancelled requests.
+    pub to_device_attempts: std::sync::Mutex<Vec<(String, String, String, Value)>>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -854,6 +891,8 @@ impl Default for MockBackend {
             created_at: crate::executor::Instant::now(),
             undeliverable: Default::default(),
             outage: Default::default(),
+            delayed_model: Default::default(),
+            to_device_attempts: Default::default(),
         }
     }
 }
@@ -912,7 +951,51 @@ impl MockBackend {
     /// Every send answers `outcome` from now until `None` ends the outage;
     /// the scripted queues are left for after it. `rtc_transports` included.
     pub fn set_outage(&self, outcome: Option<MockOutcome>) {
-        *self.outage.lock().unwrap() = outcome;
+        self.begin_outage(outcome);
+    }
+
+    /// Supersedes a previous outage; its timer can only clear this generation.
+    pub fn begin_outage(&self, outcome: Option<MockOutcome>) -> u64 {
+        let mut outage = self.outage.lock().unwrap();
+        outage.0 = outage.0.checked_add(1).expect("outage generation exhausted");
+        outage.1 = outcome;
+        outage.0
+    }
+
+    pub fn end_outage(&self, generation: u64) -> bool {
+        let mut outage = self.outage.lock().unwrap();
+        if outage.0 != generation || outage.1.is_none() { return false; }
+        outage.1 = None;
+        true
+    }
+
+    /// Enable unique IDs, restart, cancellation and expiry before any sends.
+    pub fn enable_delayed_model(&self) {
+        let mut model = self.delayed_model.lock().unwrap();
+        if model.is_none() { *model = Some(Vec::new()); }
+    }
+
+    /// Includes IDs whose create succeeded server-side but lost its answer.
+    pub fn delayed_states(&self) -> Vec<(String, String, MockDelayState)> {
+        let now = self.created_at.elapsed();
+        self.delayed_model.lock().unwrap().as_mut().map(|model| {
+            model.iter_mut().map(|delay| {
+                let state = delay.observe(now);
+                (delay.room.clone(), delay.id.clone(), state)
+            }).collect()
+        }).unwrap_or_default()
+    }
+
+    fn update_delay(&self, room: &str, id: &str, cancel: bool) -> Result<(), CommandError> {
+        let now = self.created_at.elapsed();
+        let mut model = self.delayed_model.lock().unwrap();
+        let Some(model) = model.as_mut() else { return Ok(()); };
+        let missing = || BackendError::with_matrix_error(Some("M_NOT_FOUND".into()), Some(404), "delayed operation not pending");
+        let delay = model.iter_mut().find(|delay| delay.room == room && delay.id == id).ok_or_else(|| missing())?;
+        if delay.observe(now) != MockDelayState::Pending { return Err(missing().into()); }
+        if cancel { delay.state = MockDelayState::Cancelled; }
+        else { delay.expires_at = now.saturating_add(delay.duration); }
+        Ok(())
     }
 
     /// Every call received so far, in order.
@@ -938,7 +1021,17 @@ impl MockBackend {
         content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
-        self.attempt(MockMethod::DelayedEvent).await?;
+        let lost = self.attempt_with_receipt(MockMethod::DelayedEvent).await?;
+        let id = {
+            let mut model = self.delayed_model.lock().unwrap();
+            if let Some(model) = model.as_mut() {
+                let id = format!("mock-delay-{}", model.len() + 1);
+                let duration = std::time::Duration::from_millis(delay_ms);
+                model.push(MockDelay { room: room_id.clone(), id: id.clone(), duration,
+                    expires_at: self.created_at.elapsed().saturating_add(duration), state: MockDelayState::Pending });
+                id
+            } else { format!("delayed-{}-{}", room_id, event_type) }
+        };
         self.delayed_events.lock().unwrap().push((
             room_id.clone(),
             event_type.clone(),
@@ -946,17 +1039,26 @@ impl MockBackend {
             content,
             delay_ms,
         ));
-        Ok(format!("delayed-{}-{}", room_id, event_type))
+        if let Some(error) = lost { return Err(error.into()); }
+        Ok(id)
     }
 
     /// Logs a call to `method` and plays its next scripted outcome: `Ok(())`
     /// to go on as unscripted, the error to fail with, or never for a hang.
     async fn attempt(&self, method: MockMethod) -> Result<(), BackendError> {
+        match self.attempt_with_receipt(method).await? {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    // None: acknowledged acceptance; Some: acceptance with lost response.
+    async fn attempt_with_receipt(&self, method: MockMethod) -> Result<Option<BackendError>, BackendError> {
         self.call_log.lock().unwrap().push(MockCall {
             method,
             at: self.created_at.elapsed(),
         });
-        let outage = self.outage.lock().unwrap().clone();
+        let outage = self.outage.lock().unwrap().1.clone();
         let mut outcome = outage.unwrap_or_else(|| {
             self.scripted
                 .lock()
@@ -967,8 +1069,9 @@ impl MockBackend {
         });
         loop {
             match outcome {
-                MockOutcome::Ok => return Ok(()),
+                MockOutcome::Ok => return Ok(None),
                 MockOutcome::Fail(error) => return Err(error),
+                MockOutcome::AcceptedThenFail(error) => return Ok(Some(error)),
                 MockOutcome::Hang => std::future::pending::<()>().await,
                 MockOutcome::After(delay, then) => {
                     crate::executor::sleep(delay).await;
@@ -1063,11 +1166,13 @@ impl MatrixBackend for MockBackend {
         room_id: String,
         delay_id: String,
     ) -> Result<(), CommandError> {
-        self.attempt(MockMethod::RestartDelayedEvent).await?;
+        let lost = self.attempt_with_receipt(MockMethod::RestartDelayedEvent).await?;
+        self.update_delay(&room_id, &delay_id, false)?;
         self.restarted_events
             .lock()
             .unwrap()
             .push((room_id, delay_id));
+        if let Some(error) = lost { return Err(error.into()); }
         Ok(())
     }
 
@@ -1076,11 +1181,13 @@ impl MatrixBackend for MockBackend {
         room_id: String,
         delay_id: String,
     ) -> Result<(), CommandError> {
-        self.attempt(MockMethod::CancelDelayedEvent).await?;
+        let lost = self.attempt_with_receipt(MockMethod::CancelDelayedEvent).await?;
+        self.update_delay(&room_id, &delay_id, true)?;
         self.cancelled_events
             .lock()
             .unwrap()
             .push((room_id, delay_id));
+        if let Some(error) = lost { return Err(error.into()); }
         Ok(())
     }
 
@@ -1090,7 +1197,10 @@ impl MatrixBackend for MockBackend {
         message_type: String,
         content: Value,
     ) -> Result<Vec<ToDeviceDelivery>, CommandError> {
-        self.attempt(MockMethod::ToDevice).await?;
+        self.to_device_attempts.lock().unwrap().extend(recipients.iter().map(|recipient| (
+            recipient.user_id.clone(), recipient.device_id.clone(), message_type.clone(), content.clone(),
+        )));
+        let lost = self.attempt_with_receipt(MockMethod::ToDevice).await?;
         let undeliverable = self.undeliverable.lock().unwrap().clone();
         let mut guard = self.to_device_messages.lock().unwrap();
         let mut deliveries = Vec::with_capacity(recipients.len());
@@ -1107,6 +1217,7 @@ impl MatrixBackend for MockBackend {
             ));
             deliveries.push(ToDeviceDelivery::sent(recipient));
         }
+        if let Some(error) = lost { return Err(error.into()); }
         Ok(deliveries)
     }
 
@@ -1294,6 +1405,53 @@ mod mock_tests {
         let start = executor::Instant::now();
         assert!(send(&mock).await.is_ok());
         assert_eq!(start.elapsed(), Duration::from_secs(40));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_model_preserves_lost_create_and_cancel_and_expiry() {
+        let mock = MockBackend::new();
+        mock.enable_delayed_model();
+        mock.script(MockMethod::DelayedEvent, [MockOutcome::AcceptedThenFail(BackendError::new("lost"))]);
+        assert!(mock.send_delayed_sticky_event("!r".into(), "m.rtc.member".into(), Value::Null, 1000, 100).await.is_err());
+        let first = mock.delayed_states()[0].1.clone();
+        let second = mock.send_delayed_sticky_event("!r".into(), "m.rtc.member".into(), Value::Null, 1000, 100).await.unwrap();
+        assert_ne!(first, second);
+        executor::sleep(Duration::from_millis(50)).await;
+        mock.restart_delayed_event("!r".into(), second.clone()).await.unwrap();
+        executor::sleep(Duration::from_millis(50)).await;
+        assert_eq!(mock.delayed_states().iter().map(|d| d.2).collect::<Vec<_>>(), [MockDelayState::Fired, MockDelayState::Pending]);
+        assert!(mock.restart_delayed_event("!r".into(), first).await.is_err());
+        assert!(mock.cancel_delayed_event("!other".into(), second.clone()).await.is_err());
+        mock.script(MockMethod::CancelDelayedEvent, [MockOutcome::AcceptedThenFail(BackendError::new("lost"))]);
+        assert!(mock.cancel_delayed_event("!r".into(), second.clone()).await.is_err());
+        assert_eq!(mock.delayed_states()[1].2, MockDelayState::Cancelled);
+        assert!(mock.restart_delayed_event("!r".into(), second).await.is_err());
+        // A future dropped before server acceptance creates no operation.
+        mock.script(MockMethod::DelayedEvent, [MockOutcome::After(Duration::from_secs(2), Box::new(MockOutcome::Ok))]);
+        assert!(executor::timeout(Duration::from_secs(1), mock.send_delayed_sticky_event("!r".into(), "m.rtc.member".into(), Value::Null, 1000, 100)).await.is_err());
+        assert_eq!(mock.delayed_states().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn superseded_outage_and_partial_acceptance_do_not_falsify_delivery() {
+        let mock = MockBackend::new();
+        let old = mock.begin_outage(Some(offline()));
+        let new = mock.begin_outage(Some(offline()));
+        assert!(!mock.end_outage(old));
+        assert!(send(&mock).await.is_err());
+        assert!(mock.end_outage(new));
+        assert!(!mock.end_outage(new));
+        mock.undeliverable.lock().unwrap().insert(("@b".into(), "B".into()));
+        let recipients = || vec![ToDeviceRecipient::new("@a", "A"), ToDeviceRecipient::new("@b", "B")];
+        mock.script(MockMethod::ToDevice, [MockOutcome::AcceptedThenFail(BackendError::new("lost")), MockOutcome::Hang]);
+        assert!(mock.send_to_device_message(recipients(), "key".into(), Value::Null).await.is_err());
+        assert!(executor::timeout(Duration::from_secs(1), mock.send_to_device_message(recipients(), "key".into(), Value::Null)).await.is_err());
+        assert_eq!(mock.to_device_attempts.lock().unwrap().len(), 4);
+        assert_eq!(mock.to_device_messages_for("@a", "A").len(), 1);
+        assert!(mock.to_device_messages_for("@b", "B").is_empty());
+        let response = mock.send_to_device_message(recipients(), "key".into(), Value::Null).await.unwrap();
+        assert!(response[0].is_sent());
+        assert!(!response[1].is_sent());
     }
 
     #[tokio::test]

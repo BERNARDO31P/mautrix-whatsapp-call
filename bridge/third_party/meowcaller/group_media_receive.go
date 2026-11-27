@@ -17,7 +17,22 @@ type participantAudioDecoder interface {
 	Decode([]byte) []float32
 }
 
+// ParticipantMediaEpoch records the roster and installed key epoch under the
+// same registry read lock used to authenticate media. It carries no key bytes.
+// Valid is false for direct calls or before authoritative group keys are installed.
+type ParticipantMediaEpoch struct {
+	RosterTransaction uint32
+	KeyTransaction    uint32
+	Valid             bool
+}
+
+func (r *participantReceiveRegistry) participantMediaEpochLocked() ParticipantMediaEpoch {
+	return ParticipantMediaEpoch{RosterTransaction: r.transactionID, KeyTransaction: r.installedEpoch.transactionID,
+		Valid: !r.retired && r.hasGroupUpdate && r.hasEpoch && r.transactionID != 0 && r.installedEpoch.transactionID != 0 && r.installedEpoch.transactionID <= r.transactionID}
+}
+
 type decodedParticipantAudio struct {
+	Epoch         ParticipantMediaEpoch
 	ParticipantID string
 	UserJID       types.JID
 	DeviceJID     types.JID
@@ -29,6 +44,7 @@ type decodedParticipantAudio struct {
 }
 
 type unprotectedParticipantMedia struct {
+	Epoch         ParticipantMediaEpoch
 	ParticipantID string
 	UserJID       types.JID
 	DeviceJID     types.JID
@@ -40,21 +56,22 @@ type unprotectedParticipantMedia struct {
 }
 
 type participantAudioReceiver struct {
-	mu            sync.Mutex
-	userJID       types.JID
-	deviceJID     types.JID
-	participantID string
-	pid           uint32
-	hasPID        bool
-	ssrc          uint32
-	streamSSRCs   [9]uint32
-	videoSSRC     uint32
-	appDataSSRC   uint32
-	pipe          *MediaPipeline
-	videoPipe     *MediaPipeline
-	appDataPipe   *MediaPipeline
-	srtcp         *mediaSrtcpReceiver
-	decoder       participantAudioDecoder
+	mu             sync.Mutex
+	userJID        types.JID
+	deviceJID      types.JID
+	participantID  string
+	pid            uint32
+	hasPID         bool
+	ssrc           uint32
+	streamSSRCs    [9]uint32
+	videoSSRC      uint32
+	appDataSSRC    uint32
+	pipe           *MediaPipeline
+	videoPipe      *MediaPipeline
+	appDataPipe    *MediaPipeline
+	srtcp          *mediaSrtcpReceiver
+	decoder        participantAudioDecoder
+	audioTimestamp audioTimestampAdmission
 }
 
 type installedGroupRawEpoch struct {
@@ -94,28 +111,30 @@ type preparedParticipantReceiveUpdate struct {
 }
 
 type participantReceiveRegistry struct {
-	mu               sync.RWMutex
-	callID           string
-	callKey          []byte
-	selfLID          string
-	selfID           string
-	fallbackID       string
-	transactionID    uint32
-	rosterGeneration uint64
-	hasGroupUpdate   bool
-	decoderFactory   func() participantAudioDecoder
-	byDeviceID       map[string]*participantAudioReceiver
-	byPID            map[uint32]*participantAudioReceiver
-	bySSRC           map[uint32]*participantAudioReceiver
-	byVideoSSRC      map[uint32]*participantAudioReceiver
-	byAppDataSSRC    map[uint32]*participantAudioReceiver
-	bySRTCPSSRC      map[uint32]*participantAudioReceiver
-	sendPipes        []*MediaPipeline
-	srtcpSenders     []*mediaSrtcpSender
-	pendingEpochs    map[uint32][]byte
-	installedEpoch   installedGroupRawEpoch
-	hasEpoch         bool
-	log              zerolog.Logger
+	retired            bool
+	mu                 sync.RWMutex
+	callID             string
+	callKey            []byte
+	selfLID            string
+	selfID             string
+	fallbackID         string
+	transactionID      uint32
+	rosterGeneration   uint64
+	hasGroupUpdate     bool
+	decoderFactory     func() participantAudioDecoder
+	byDeviceID         map[string]*participantAudioReceiver
+	byPID              map[uint32]*participantAudioReceiver
+	bySSRC             map[uint32]*participantAudioReceiver
+	byVideoSSRC        map[uint32]*participantAudioReceiver
+	byAppDataSSRC      map[uint32]*participantAudioReceiver
+	bySRTCPSSRC        map[uint32]*participantAudioReceiver
+	sendPipes          []*MediaPipeline
+	srtcpSenders       []*mediaSrtcpSender
+	pendingEpochs      map[uint32][]byte
+	installedEpoch     installedGroupRawEpoch
+	hasEpoch           bool
+	mediaEpochObserver func(ParticipantMediaEpoch)
+	log                zerolog.Logger
 }
 
 func newParticipantReceiveRegistry(
@@ -217,6 +236,9 @@ func (r *participantReceiveRegistry) ApplyGroupUpdateTransaction(
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.retired {
+		return errMediaKeysRetired
+	}
 	if r.hasGroupUpdate && update.TransactionID <= r.transactionID {
 		return nil
 	}
@@ -408,6 +430,21 @@ func (r *participantReceiveRegistry) prepareGroupUpdateLocked(
 	return prepared, nil
 }
 
+// setMediaEpochObserver registers a synchronous, local-only fence on the
+// published registry. The observer must not call back into the provider.
+func (r *participantReceiveRegistry) setMediaEpochObserver(fn func(ParticipantMediaEpoch)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.mediaEpochObserver = fn
+	r.notifyMediaEpochLocked()
+}
+
+func (r *participantReceiveRegistry) notifyMediaEpochLocked() {
+	if r.mediaEpochObserver != nil {
+		r.mediaEpochObserver(r.participantMediaEpochLocked())
+	}
+}
+
 func (r *participantReceiveRegistry) commitGroupUpdateLocked(prepared *preparedParticipantReceiveUpdate) {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/65b1dbf33f365db7392e438c3e3bf3651decb6cf/datasheets/group-media-receive.md#L122-L137
 	for participantID, receiver := range r.byDeviceID {
@@ -447,6 +484,7 @@ func (r *participantReceiveRegistry) commitGroupUpdateLocked(prepared *preparedP
 		clear(r.pendingEpochs[transactionID])
 		delete(r.pendingEpochs, transactionID)
 	}
+	r.notifyMediaEpochLocked()
 	r.log.Info().
 		Str("call_id", r.callID).
 		Uint32("transaction_id", prepared.transactionID).
@@ -475,13 +513,14 @@ func clearParticipantReceiverKeys(receiver *participantAudioReceiver) {
 	if receiver == nil {
 		return
 	}
-	receiver.pipe.installSendKeys(srtp.E2eSrtpKeys{})
-	receiver.pipe.installRecvKeys(srtp.E2eSrtpKeys{})
-	receiver.videoPipe.installSendKeys(srtp.E2eSrtpKeys{})
-	receiver.videoPipe.installRecvKeys(srtp.E2eSrtpKeys{})
-	receiver.appDataPipe.installSendKeys(srtp.E2eSrtpKeys{})
-	receiver.appDataPipe.installRecvKeys(srtp.E2eSrtpKeys{})
-	receiver.srtcp.installKeys(srtp.E2eSrtpKeys{})
+	receiver.pipe.retire()
+	receiver.videoPipe.retire()
+	receiver.appDataPipe.retire()
+	receiver.srtcp.retire()
+	// Registry write ownership excludes in-flight decode (registry read lock).
+	if closer, ok := receiver.decoder.(interface{ Close() }); ok {
+		closer.Close()
+	}
 }
 
 func (r *participantReceiveRegistry) clear() {
@@ -491,6 +530,9 @@ func (r *participantReceiveRegistry) clear() {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.retired = true
+	r.notifyMediaEpochLocked()
+	r.mediaEpochObserver = nil
 	clear(r.callKey)
 	clear(r.installedEpoch.rawKey)
 	for transactionID, rawKey := range r.pendingEpochs {
@@ -501,11 +543,10 @@ func (r *participantReceiveRegistry) clear() {
 		clearParticipantReceiverKeys(receiver)
 	}
 	for _, sendPipe := range r.sendPipes {
-		sendPipe.installSendKeys(srtp.E2eSrtpKeys{})
-		sendPipe.installRecvKeys(srtp.E2eSrtpKeys{})
+		sendPipe.retire()
 	}
 	for _, sender := range r.srtcpSenders {
-		sender.installKeys(srtp.E2eSrtpKeys{})
+		sender.retire()
 	}
 	r.callKey = nil
 	r.installedEpoch = installedGroupRawEpoch{}
@@ -536,12 +577,17 @@ func (r *participantReceiveRegistry) attachSendPipeline(sendPipe *MediaPipeline)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.retired {
+		return errMediaKeysRetired
+	}
 	if r.hasEpoch {
 		keys, err := srtp.DeriveE2eKeysFromRaw(r.installedEpoch.rawKey, r.selfID, r.log)
 		if err != nil {
 			return fmt.Errorf("meowcaller: derive late group send epoch: %w", err)
 		}
-		sendPipe.installSendKeys(keys)
+		if err = sendPipe.installSendKeys(keys); err != nil {
+			return err
+		}
 	}
 	r.sendPipes = append(r.sendPipes, sendPipe)
 	return nil
@@ -554,12 +600,17 @@ func (r *participantReceiveRegistry) attachSRTCPSender(sender *mediaSrtcpSender)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.retired {
+		return errMediaKeysRetired
+	}
 	if r.hasEpoch {
 		keys, err := srtp.DeriveE2eSRTCPKeysFromRaw(r.installedEpoch.rawKey, r.selfID, r.log)
 		if err != nil {
 			return fmt.Errorf("meowcaller: derive late group SRTCP send epoch: %w", err)
 		}
-		sender.installKeys(keys)
+		if err = sender.installKeys(keys); err != nil {
+			return err
+		}
 	}
 	r.srtcpSenders = append(r.srtcpSenders, sender)
 	return nil
@@ -574,6 +625,9 @@ func (r *participantReceiveRegistry) ApplyGroupRawEpoch(transactionID uint32, ra
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.retired {
+		return errMediaKeysRetired
+	}
 	if !r.hasGroupUpdate || transactionID > r.transactionID {
 		if existing, ok := r.pendingEpochs[transactionID]; ok {
 			if bytes.Equal(existing, rawKey) {
@@ -609,6 +663,7 @@ func (r *participantReceiveRegistry) applyGroupRawEpochLocked(transactionID uint
 		rawKey:        bytes.Clone(rawKey),
 	}
 	r.hasEpoch = true
+	r.notifyMediaEpochLocked()
 	return nil
 }
 
@@ -703,6 +758,9 @@ func (r *participantReceiveRegistry) RekeyFallback(peerLID string) error {
 	participantID := rtp.FormatE2ESrtpParticipantID(peerJID.String())
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.retired {
+		return errMediaKeysRetired
+	}
 	if r.hasGroupUpdate {
 		if _, ok := r.byDeviceID[participantID]; ok {
 			r.fallbackID = participantID
@@ -713,6 +771,9 @@ func (r *participantReceiveRegistry) RekeyFallback(peerLID string) error {
 	receiver, err := r.newReceiver(peerJID.ToNonAD(), peerJID, 0, false)
 	if err != nil {
 		return err
+	}
+	for _, previous := range r.byDeviceID {
+		clearParticipantReceiverKeys(previous)
 	}
 	r.byDeviceID = map[string]*participantAudioReceiver{participantID: receiver}
 	r.bySSRC = map[uint32]*participantAudioReceiver{receiver.ssrc: receiver}
@@ -747,7 +808,9 @@ func (r *participantReceiveRegistry) UnprotectVideo(packet []byte) (unprotectedP
 	if !ok {
 		return unprotectedParticipantMedia{}, false
 	}
-	return receiver.unprotectedMedia(authenticatedHeader, payload), true
+	media := receiver.unprotectedMedia(authenticatedHeader, payload)
+	media.Epoch = r.participantMediaEpochLocked()
+	return media, true
 }
 
 func (r *participantReceiveRegistry) UnprotectAppData(packet []byte) (unprotectedParticipantMedia, bool) {
@@ -869,11 +932,36 @@ func (r *participantReceiveRegistry) DecodeAudio(packet []byte) (decodedParticip
 			Msg("participant audio failed authentication")
 		return decodedParticipantAudio{}, false
 	}
+	// Only authenticated, forward media reaches the stateful decoder.
+	// The receiver mutex serializes this per-stream playout cursor.
+	if !receiver.audioTimestamp.accept(authenticatedHeader.Timestamp) {
+		return decodedParticipantAudio{}, false
+	}
 	pcm := receiver.decoder.Decode(payload)
+	if len(pcm) == 0 {
+		return decodedParticipantAudio{}, false
+	}
 	return decodedParticipantAudio{
+		Epoch:         r.participantMediaEpochLocked(),
 		ParticipantID: receiver.participantID,
 		UserJID:       receiver.userJID, DeviceJID: receiver.deviceJID,
 		PID: receiver.pid, HasPID: receiver.hasPID, SSRC: authenticatedHeader.Ssrc,
 		Timestamp: authenticatedHeader.Timestamp, PCM: pcm,
 	}, true
+}
+
+// audioTimestampAdmission is a playout cursor, not a cryptographic replay window.
+// RTP timestamps wrap modulo 2^32. Late and repeated audio is not decoded.
+type audioTimestampAdmission struct {
+	seen bool
+	last uint32
+}
+
+func (a *audioTimestampAdmission) accept(timestamp uint32) bool {
+	if a.seen && int32(timestamp-a.last) <= 0 {
+		return false
+	}
+	a.seen = true
+	a.last = timestamp
+	return true
 }

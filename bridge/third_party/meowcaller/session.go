@@ -1,6 +1,7 @@
 package meowcaller
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 
@@ -156,9 +157,12 @@ func phaseName(p CallPhase) string {
 	}
 }
 
+var errMediaKeysRetired = errors.New("meowcaller: media keys retired")
+
 // MediaPipeline composes the outbound (protect) and inbound (unprotect) E2E 1:1
 // media path. SFrame is omitted (plain Opus inside WAHKDF SRTP).
 type MediaPipeline struct {
+	retired      bool // written under both sendMu and recvMu; read under either
 	sendMu       sync.Mutex
 	sendKeys     srtp.E2eSrtpKeys
 	recvKeys     srtp.E2eSrtpKeys
@@ -181,8 +185,7 @@ func (p *MediaPipeline) RekeyRecv(callKey []byte, peerJID string) error {
 	if err != nil {
 		return err
 	}
-	p.installRecvKeys(recvKeys)
-	return nil
+	return p.installRecvKeys(recvKeys)
 }
 
 // RekeyRecvFromRaw switches the receive keystream to a participant's keygen-v2
@@ -193,8 +196,7 @@ func (p *MediaPipeline) RekeyRecvFromRaw(rawE2E []byte, peerJID string) error {
 	if err != nil {
 		return err
 	}
-	p.installRecvKeys(recvKeys)
-	return nil
+	return p.installRecvKeys(recvKeys)
 }
 
 // RekeySendFromRaw switches the send keystream to a shared keygen-v2 raw epoch
@@ -205,8 +207,7 @@ func (p *MediaPipeline) RekeySendFromRaw(rawE2E []byte, selfJID string) error {
 	if err != nil {
 		return err
 	}
-	p.installSendKeys(sendKeys)
-	return nil
+	return p.installSendKeys(sendKeys)
 }
 
 // RekeyRecvFromRawPreservingROC switches the receive keystream to a shared
@@ -217,30 +218,54 @@ func (p *MediaPipeline) RekeyRecvFromRawPreservingROC(rawE2E []byte, peerJID str
 	if err != nil {
 		return err
 	}
-	p.installRecvKeysPreservingROC(recvKeys)
+	return p.installRecvKeysPreservingROC(recvKeys)
+}
+
+func (p *MediaPipeline) installSendKeys(sendKeys srtp.E2eSrtpKeys) error {
+	// Source of truth: https://github.com/purpshell/meowcaller/blob/cbe1446dabb5842362b1a4362d4100ec15d8254f/datasheets/group-media-key-epoch.md#L122-L136
+	p.sendMu.Lock()
+	defer p.sendMu.Unlock()
+	if p.retired {
+		return errMediaKeysRetired
+	}
+	p.sendKeys = sendKeys
 	return nil
 }
 
-func (p *MediaPipeline) installSendKeys(sendKeys srtp.E2eSrtpKeys) {
-	// Source of truth: https://github.com/purpshell/meowcaller/blob/cbe1446dabb5842362b1a4362d4100ec15d8254f/datasheets/group-media-key-epoch.md#L122-L136
-	p.sendMu.Lock()
-	p.sendKeys = sendKeys
-	p.sendMu.Unlock()
-}
-
-func (p *MediaPipeline) installRecvKeysPreservingROC(recvKeys srtp.E2eSrtpKeys) {
+func (p *MediaPipeline) installRecvKeysPreservingROC(recvKeys srtp.E2eSrtpKeys) error {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/cbe1446dabb5842362b1a4362d4100ec15d8254f/datasheets/group-media-key-epoch.md#L122-L136
 	p.recvMu.Lock()
+	defer p.recvMu.Unlock()
+	if p.retired {
+		return errMediaKeysRetired
+	}
 	p.recvKeys = recvKeys
-	p.recvMu.Unlock()
+	return nil
 }
 
-func (p *MediaPipeline) installRecvKeys(recvKeys srtp.E2eSrtpKeys) {
+func (p *MediaPipeline) installRecvKeys(recvKeys srtp.E2eSrtpKeys) error {
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/aafac5cf46e770f59a1ef2f842d2404154038692/wacore/src/voip/session.rs#L171-L187
 	p.recvMu.Lock()
+	defer p.recvMu.Unlock()
+	if p.retired {
+		return errMediaKeysRetired
+	}
 	p.recvKeys = recvKeys
 	p.recvRoc = srtp.RecvRocTracker{}
-	p.recvMu.Unlock()
+	return nil
+}
+
+// retire permanently invalidates both directions, including references retained
+// by in-flight media tasks. No later rekey can reactivate this handle.
+func (p *MediaPipeline) retire() {
+	p.sendMu.Lock()
+	defer p.sendMu.Unlock()
+	p.recvMu.Lock()
+	defer p.recvMu.Unlock()
+	p.retired = true
+	p.sendKeys = srtp.E2eSrtpKeys{}
+	p.recvKeys = srtp.E2eSrtpKeys{}
+	p.recvRoc = srtp.RecvRocTracker{}
 }
 
 // NewMediaPipeline derives both directions from the 32-byte callKey: send keys from
@@ -277,6 +302,9 @@ func (p *MediaPipeline) ProtectAudio(opusPayload []byte) ([]byte, error) {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/cbe1446dabb5842362b1a4362d4100ec15d8254f/datasheets/group-media-key-epoch.md#L122-L136
 	p.sendMu.Lock()
 	defer p.sendMu.Unlock()
+	if p.retired {
+		return nil, errMediaKeysRetired
+	}
 	header := p.stream.NextPacket(opusPayload, false)
 	roc := p.sendRoc.Advance(header.SequenceNumber)
 	packet := rtp.EncodeRtpHeader(&header)
@@ -304,6 +332,9 @@ func (p *MediaPipeline) ProtectRTP(header *rtp.RtpHeader, payload []byte) ([]byt
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/cbe1446dabb5842362b1a4362d4100ec15d8254f/datasheets/group-media-key-epoch.md#L122-L136
 	p.sendMu.Lock()
 	defer p.sendMu.Unlock()
+	if p.retired {
+		return nil, errMediaKeysRetired
+	}
 	roc := p.sendRoc.Advance(header.SequenceNumber)
 	packet := rtp.EncodeRtpHeader(header)
 	encrypted, err := srtp.CryptPayload(&p.sendKeys, header.Ssrc, header.SequenceNumber, roc, payload)
@@ -349,6 +380,10 @@ func (p *MediaPipeline) UnprotectAudio(packet []byte) (rtp.RtpHeader, []byte, bo
 		return rtp.RtpHeader{}, nil, false
 	}
 	p.recvMu.Lock()
+	if p.retired {
+		p.recvMu.Unlock()
+		return rtp.RtpHeader{}, nil, false
+	}
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/2f001b5a3d6374cc5cf7177792c2a81f87a54080/wacore/src/voip/session.rs#L239-L250
 	roc := p.recvRoc.EstimateRoc(header.SequenceNumber)
 	tag := packet[len(withoutTag):]

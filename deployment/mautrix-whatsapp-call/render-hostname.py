@@ -10,7 +10,7 @@ PLACEHOLDER = "__MATRIXRTC_SERVER_NAME__"
 TEMPLATES = ("synapse-additions.yaml", "verify.sh", "provision-ghost.sh", "nginx-443-locations.conf")
 
 
-def render(root, server):
+def plan_render(root, server):
     server = server.strip().lower()
     if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?", server) or ".." in server or "." not in server:
         raise ValueError("invalid fully-qualified Matrix server name")
@@ -30,6 +30,10 @@ def render(root, server):
                 raise ValueError(f"hostname mismatch in {rel}; restore the shipped template")
         elif not re.search(r"https://" + re.escape(server) + r"(?:/|[\s\"'}]|$)", text):
             raise ValueError(f"hostname mismatch in {rel}; restore the shipped template")
+    return updates
+
+def render(root, server):
+    updates = plan_render(root, server)
     for path, updated in updates:
         st = path.stat()
         atomic_write(path, updated.encode(), st, st.st_mode & 0o777)

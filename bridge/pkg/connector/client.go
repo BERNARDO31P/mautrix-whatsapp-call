@@ -51,6 +51,8 @@ func (wa *WhatsAppConnector) LoadUserLogin(ctx context.Context, login *bridgev2.
 		UserLogin:   login,
 		callManager: voipbridge.NewManager(),
 		MC:          noopMCInstance,
+		// RunOnce marks the bridge as background before loading logins.
+		rtcForegroundCalls: wa.Config.ExperimentalWhatsAppVoIP && !wa.Bridge.Background,
 
 		historySyncWakeup:         make(chan struct{}, 1),
 		historySyncQueued:         exsync.NewMap[types.JID, time.Time](),
@@ -82,7 +84,11 @@ func (wa *WhatsAppConnector) LoadUserLogin(ctx context.Context, login *bridgev2.
 
 	if w.Device != nil {
 		log := w.UserLogin.Log.With().Str("component", "whatsmeow").Logger()
-		w.Client = whatsmeow.NewClient(w.Device, waLog.Zerolog(log))
+		logger := waLog.Zerolog(log)
+		if w.rtcForegroundCalls {
+			logger = rtcCallLinkLogger{logger}
+		}
+		w.Client = whatsmeow.NewClient(w.Device, logger)
 		w.Client.AddEventHandlerWithSuccessStatus(w.handleWAEvent)
 		w.Client.SynchronousAck = true
 		w.Client.EnableDecryptedEventBuffer = wa.Bridge.Config.PortalEventBuffer == 0
@@ -96,7 +102,7 @@ func (wa *WhatsAppConnector) LoadUserLogin(ctx context.Context, login *bridgev2.
 		w.Client.SetForceActiveDeliveryReceipts(wa.Config.ForceActiveDeliveryReceipts)
 		w.Client.InitialAutoReconnect = wa.Config.InitialAutoReconnect
 		w.Client.UseRetryMessageStore = wa.Config.UseWhatsAppRetryStore
-		if wa.Config.ExperimentalWhatsAppVoIP {
+		if w.rtcForegroundCalls {
 			// The raw call/ack interception must be installed before ConnectContext.
 			// No calls are answered unless an RTC media session is explicitly attached.
 			w.initExperimentalVoIP()
@@ -114,19 +120,33 @@ type resyncQueueItem struct {
 }
 
 type WhatsAppClient struct {
-	Main              *WhatsAppConnector
-	UserLogin         *bridgev2.UserLogin
-	Client            *whatsmeow.Client
-	Device            *store.Device
-	JID               types.JID
-	LID               types.JID
-	MC                mClient
-	callManager       *voipbridge.Manager
-	voipClient        *meowcaller.Client
-	voipCallsMu       sync.RWMutex
-	voipCalls         map[string]*meowcaller.Call
-	voipMedia         map[string]*voipbridge.MediaBus
-	voipGatewayCancel map[string]context.CancelFunc
+	Main                    *WhatsAppConnector
+	UserLogin               *bridgev2.UserLogin
+	Client                  *whatsmeow.Client
+	Device                  *store.Device
+	JID                     types.JID
+	LID                     types.JID
+	MC                      mClient
+	callManager             *voipbridge.Manager
+	voipClient              *meowcaller.Client
+	voipCallsMu             sync.RWMutex
+	voipGeneration          uint64
+	voipAdmissionOpen       bool
+	voipExplicitStop        bool
+	voipConnectionWork      map[*voipDialAttempt]struct{}
+	voipDialAttempts        map[*voipDialAttempt]struct{}
+	voipCalls               map[string]*meowcaller.Call
+	voipReactionFeeds       map[string]*rtcReactionFeed
+	voipMedia               map[string]*voipbridge.MediaBus
+	voipGatewayCancel       map[string]context.CancelFunc
+	rtcReconnectRefresh     rtcRefreshCoalescer
+	rtcProbeLifetime        rtcProbeLifetime
+	rtcCallLinkBusy         atomic.Bool
+	rtcGroupParticipantBusy atomic.Bool
+	rtcGroupHandBusy        atomic.Bool
+	// Immutable for this loaded login: background sync must never own a
+	// socket which was configured to serve foreground calls.
+	rtcForegroundCalls bool
 
 	historySyncWakeup  chan struct{}
 	historySyncQueued  *exsync.Map[types.JID, time.Time]
@@ -276,6 +296,7 @@ func (wa *WhatsAppClient) connect(ctx context.Context) bool {
 	if ctx.Err() != nil {
 		return false
 	}
+	wa.allowVoIPReconnect()
 	wa.initMC()
 	wa.startLoops()
 	wa.Client.BackgroundEventCtx = wa.UserLogin.Log.WithContext(wa.Main.Bridge.BackgroundCtx)
@@ -322,6 +343,12 @@ type wrappedPushNotificationData struct {
 }
 
 func (wa *WhatsAppClient) ConnectBackground(ctx context.Context, params *bridgev2.ConnectBackgroundParams) error {
+	// This method owns a temporary socket and defers Disconnect, which
+	// also tears down all VoIP calls. Reject mixed-mode use before changing
+	// the shared client payload, waiter, proxy, or socket.
+	if wa.rtcForegroundCalls {
+		return fmt.Errorf("background sync cannot take ownership of a foreground calling login")
+	}
 	if wa.Client == nil {
 		return bridgev2.ErrNotLoggedIn
 	}
@@ -435,17 +462,18 @@ func (wa *WhatsAppClient) callStopLoops() {
 }
 
 func (wa *WhatsAppClient) Disconnect() {
+	wa.stopVoIPAdmission()
+	wa.rtcProbeLifetime.stop()
+	wa.rtcReconnectRefresh.stop()
 	wa.callStopLoops()
 	wa.teardownVoIP()
-	if wa.callManager != nil {
-		wa.callManager.EndLogin(string(wa.UserLogin.ID), "whatsapp-disconnect")
-	}
 	if cli := wa.Client; cli != nil {
 		cli.Disconnect()
 	}
 }
 
 func (wa *WhatsAppClient) LogoutRemote(ctx context.Context) {
+	wa.rtcProbeLifetime.stop()
 	if cli := wa.Client; cli != nil {
 		err := cli.Logout(ctx)
 		if err != nil {

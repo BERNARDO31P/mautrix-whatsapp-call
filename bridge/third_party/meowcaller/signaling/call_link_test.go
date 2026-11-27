@@ -118,3 +118,28 @@ func TestWaitingRoomUpdateAndAck(t *testing.T) {
 		t.Fatalf("ACK = %+v", ack)
 	}
 }
+
+func TestCallLinkPreviewRequiresExplicitApprovalState(t *testing.T) {
+	for _, test := range []struct {
+		enabled, admin string
+		valid          bool
+	}{
+		{"1", "0", true}, {"0", "1", true}, {"", "0", false}, {"1", "", false}, {"maybe", "0", false}, {"0", "true", false},
+	} {
+		attrs := waBinary.Attrs{}
+		if test.enabled != "" {
+			attrs["enabled"] = test.enabled
+		}
+		if test.admin != "" {
+			attrs["is_admin"] = test.admin
+		}
+		node := waBinary.Node{Tag: "ack", Attrs: waBinary.Attrs{"class": "call", "type": "link_query"}, Content: []waBinary.Node{{Tag: "link_query", Attrs: waBinary.Attrs{"media": "video", "token": "TOKEN", "link_creator": types.NewJID("100001", types.HiddenUserServer)}, Content: []waBinary.Node{{Tag: "waiting_room", Attrs: attrs}}}}}
+		preview, err := ParseCallLinkQueryAck(&node)
+		if (err == nil) != test.valid {
+			t.Fatalf("valid=%v, err=%v", test.valid, err)
+		}
+		if test.valid && (preview.WaitingRoomEnabled != (test.enabled == "1") || preview.IsAdmin != (test.admin == "1")) {
+			t.Fatal("incorrect preview state")
+		}
+	}
+}

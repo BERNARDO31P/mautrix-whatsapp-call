@@ -6,6 +6,9 @@
 //! persistent device is cross-signed before it can ever be used for MSC4153
 //! media-key exchange.
 
+#[path = "../file_lock.rs"]
+mod file_lock;
+
 use matrix_sdk::{
     Client,
     authentication::matrix::MatrixSession,
@@ -14,6 +17,7 @@ use matrix_sdk::{
 use sha2::{Digest, Sha256};
 use std::{
     env, fs, io,
+    io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
@@ -66,8 +70,11 @@ fn read_recovery_key(folder: &Path) -> io::Result<Option<String>> {
         }
     }
     let path = folder.join("recovery-key.txt");
-    if !path.exists() {
-        return Ok(None);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {},
+        Ok(_) => return Err(error("recovery-key.txt must be a regular file")),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
     }
     strict_file(&path)?;
     let key = fs::read_to_string(path)?.trim().to_owned();
@@ -77,16 +84,42 @@ fn read_recovery_key(folder: &Path) -> io::Result<Option<String>> {
     Ok(Some(key))
 }
 
-fn write_recovery_key(folder: &Path, key: &str) -> io::Result<PathBuf> {
+// The SDK can use a passphrase supplied before the first server mutation.
+// Keep the existing filename: recover() accepts either a recovery key or a
+// passphrase. Never overwrite a previously stored recovery credential.
+fn prepare_recovery_passphrase(folder: &Path) -> io::Result<String> {
+    let mut entropy = [0u8; 32];
+    fs::File::open("/dev/urandom")?.read_exact(&mut entropy)?;
+    let passphrase = hex::encode(entropy);
     let path = folder.join("recovery-key.txt");
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true).mode(0o600);
-    use std::io::Write;
-    let mut file = options.open(&path)?;
-    file.write_all(key.as_bytes())?;
+    let mut file = fs::OpenOptions::new()
+        .write(true).create_new(true).mode(0o600).open(&path)?;
+    file.write_all(passphrase.as_bytes())?;
     file.write_all(b"\n")?;
     file.sync_all()?;
-    Ok(path)
+    // Persist the directory entry as well as the file contents. If any write
+    // fails, do not call enable(); retain the file as evidence for diagnosis.
+    fs::File::open(folder)?.sync_all()?;
+    Ok(passphrase)
+}
+
+#[cfg(test)]
+mod recovery_file_tests {
+    use super::*;
+
+    #[test]
+    fn credential_is_persisted_before_use_and_never_replaced() {
+        let folder = env::temp_dir().join(format!("matrixrtc-recovery-test-{}", std::process::id()));
+        fs::create_dir(&folder).unwrap();
+        let passphrase = prepare_recovery_passphrase(&folder).unwrap();
+        let path = folder.join("recovery-key.txt");
+        assert_eq!(passphrase.len(), 64);
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), passphrase);
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(prepare_recovery_passphrase(&folder).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), passphrase);
+        fs::remove_dir_all(folder).unwrap();
+    }
 }
 
 async fn wait_for_cross_signed_device(client: &Client) -> io::Result<()> {
@@ -122,6 +155,7 @@ async fn main() -> io::Result<()> {
     }
     let passphrase = required_secret("RTC_WORKER_STORE_PASSPHRASE")?;
     let folder = identity_dir(&state_root, &ghost_mxid);
+    let _crypto_owner = file_lock::lock_crypto(&folder)?;
     let session_path = folder.join("session.json");
     strict_file(&session_path)?;
     fs::create_dir_all(folder.join("crypto"))?;
@@ -147,25 +181,39 @@ async fn main() -> io::Result<()> {
     client.encryption().wait_for_e2ee_initialization_tasks().await;
 
     let recovery = client.encryption().recovery();
-    match recovery.state() {
-        RecoveryState::Enabled => {}
-        RecoveryState::Disabled => {
-            if let Some(key) = read_recovery_key(&folder)? {
-                recovery.recover(&key).await.map_err(io::Error::other)?;
-            } else {
-                let key = recovery.enable().await.map_err(io::Error::other)?;
-                let path = write_recovery_key(&folder, &key.to_string())?;
-                eprintln!("Matrix recovery key stored securely at {}", path.display());
+    let secret_storage = client.encryption().secret_storage();
+    let credential = match read_recovery_key(&folder)? {
+        Some(key) => key,
+        None if recovery.state() == RecoveryState::Disabled => {
+            // A cached Disabled state alone is not authorization to replace
+            // secret storage. Any existing default-key event, even malformed,
+            // requires operator reconciliation rather than automatic rotation.
+            if secret_storage.fetch_default_key_id().await.map_err(io::Error::other)?.is_some() {
+                return Err(error("existing secret storage needs its original recovery credential"));
             }
-        }
-        RecoveryState::Incomplete | RecoveryState::Unknown => {
-            let key = read_recovery_key(&folder)?.ok_or_else(|| {
-                error(
-                    "existing ghost recovery is incomplete; set RTC_GHOST_RECOVERY_KEY or restore recovery-key.txt",
-                )
+            let passphrase = prepare_recovery_passphrase(&folder)?;
+            // The passphrase is already durable, including on response loss or
+            // process death after the server accepts the default-key update.
+            recovery.enable().with_passphrase(&passphrase).await.map_err(|_| {
+                error("recovery enablement incomplete; preserve recovery-key.txt and reconcile existing server recovery before retry")
             })?;
-            recovery.recover(&key).await.map_err(io::Error::other)?;
+            passphrase
         }
+        None => return Err(error(
+            "existing ghost recovery needs its credential; set RTC_GHOST_RECOVERY_KEY or restore recovery-key.txt",
+        )),
+    };
+    // Even an Enabled cached SDK state does not prove the saved credential
+    // opens the current server-side secret store. Do not mark such an identity
+    // ready until that check succeeds. Never reset recovery automatically.
+    secret_storage.open_secret_store(&credential).await.map_err(|_| {
+        error("cannot open existing ghost secret storage; preserve the credential and reconcile recovery")
+    })?;
+    if recovery.state() != RecoveryState::Enabled {
+        recovery.recover(&credential).await.map_err(|_| error("ghost recovery incomplete; preserve the recovery credential"))?;
+    }
+    if recovery.state() != RecoveryState::Enabled {
+        return Err(error("ghost recovery remains incomplete; refusing readiness"));
     }
 
     client

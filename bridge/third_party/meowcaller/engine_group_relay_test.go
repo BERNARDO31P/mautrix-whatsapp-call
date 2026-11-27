@@ -61,6 +61,7 @@ func TestGroupRelayAllocateStateCarriesParticipantSubscriptions(t *testing.T) {
 	changed, err := state.ApplyWithSubscriptions(
 		endpoint,
 		relayUpdate,
+		1,
 		streamSSRCs,
 		appDataSSRC,
 		pids,
@@ -98,7 +99,7 @@ func TestGroupRelayAllocateSendFailureDoesNotCommitRotation(t *testing.T) {
 	}
 	sendErr := errors.New("relay unavailable")
 	changed, err := state.ApplyWithSubscriptions(
-		endpoint, relayUpdate, [9]uint32{}, 0, nil, [12]byte{},
+		endpoint, relayUpdate, 1, [9]uint32{}, 0, nil, [12]byte{},
 		func([]byte) error { return sendErr },
 	)
 	if !errors.Is(err, sendErr) || changed {
@@ -121,5 +122,87 @@ func TestConnectedRemoteParticipantPIDsExcludesSelfAndInactive(t *testing.T) {
 	got := connectedRemoteParticipantPIDs(update, rtp.FormatE2ESrtpParticipantID(self.String()))
 	if len(got) != 1 || got[0] != 22 {
 		t.Fatalf("connected remote PIDs = %v, want [22]", got)
+	}
+}
+
+func TestGroupRelaySubscriptionsRefreshWithoutCredentialRotation(t *testing.T) {
+	key := bytes.Repeat([]byte{0x24}, 16)
+	token := bytes.Repeat([]byte{0x42}, 174)
+	state := newGroupRelayAllocateStateWithHBHFEC(nil, key, [2]uint32{})
+	endpoint := &relayEndpoint{relayName: "relay", addresses: []relayAddress{{ipv4: "192.0.2.1", port: 3478}}}
+	relay := &groupCallRelay{TransactionID: 4, Key: key, Tokens: [][]byte{token}, Endpoints: []groupCallRelayEndpoint{{RelayName: "relay"}}}
+	var sent []byte
+	apply := func(roster uint32, pids []uint32, sendErr error) (bool, error) {
+		return state.ApplyWithSubscriptions(endpoint, relay, roster, [9]uint32{}, 0, pids, [12]byte{byte(roster)}, func(packet []byte) error {
+			if sendErr != nil {
+				return sendErr
+			}
+			sent = bytes.Clone(packet)
+			return nil
+		})
+	}
+	if changed, err := apply(7, []uint32{31, 47}, nil); !changed || err != nil {
+		t.Fatalf("initial: %v %v", changed, err)
+	}
+	initial := state.Current()
+	failure := errors.New("send failed")
+	if changed, err := apply(8, []uint32{47}, failure); changed || !errors.Is(err, failure) {
+		t.Fatalf("failure: %v %v", changed, err)
+	}
+	if !bytes.Equal(initial, state.Current()) {
+		t.Fatal("failed send changed packet")
+	}
+	if changed, err := apply(8, []uint32{47}, nil); !changed || err != nil {
+		t.Fatalf("retry: %v %v", changed, err)
+	}
+	xor, _ := stun.EncodeXorRelayEndpoint("192.0.2.1", 3478)
+	want := stun.BuildWasmStunAllocateRequestWithGroupSubscriptionsAndHBHFEC([12]byte{8}, token, xor, [9]uint32{}, 0, [2]uint32{}, []uint32{47}, key)
+	if !bytes.Equal(sent, want) || !bytes.Equal(state.Current(), want) {
+		t.Fatal("updated subscription packet incorrect")
+	}
+	if changed, err := apply(7, []uint32{31, 47}, nil); changed || err != nil {
+		t.Fatalf("stale roster: %v %v", changed, err)
+	}
+	if changed, err := apply(9, nil, nil); !changed || err != nil {
+		t.Fatalf("empty roster: %v %v", changed, err)
+	}
+}
+
+func TestGroupRelaySnapshotRetainsCredentialsOnRosterOnlyUpdate(t *testing.T) {
+	previous := &groupCallRelay{TransactionID: 4}
+	for _, next := range []*groupCallRelay{nil, {TransactionID: 3}, {TransactionID: 4}} {
+		if selectGroupRelaySnapshot(previous, next) != previous {
+			t.Fatal("credentials replaced without rotation")
+		}
+	}
+	next := &groupCallRelay{TransactionID: 5}
+	if selectGroupRelaySnapshot(previous, next) != next || selectGroupRelaySnapshot(nil, next) != next {
+		t.Fatal("new credentials refused")
+	}
+}
+
+func TestRelayBindingAndAllocationResponseCorrelation(t *testing.T) {
+	key := []byte("test-key")
+	tx := [12]byte{1}
+	other := [12]byte{2}
+	request := stun.EncodeStunRequest(stun.MsgAllocateRequest, tx, nil, key, false)
+	state := newGroupRelayAllocateStateWithHBHFEC(request, key, [2]uint32{})
+	for _, kind := range []uint16{stun.MsgAllocateSuccess, stun.MsgAllocateError} {
+		match := stun.EncodeStunRequest(kind, tx, nil, nil, false)
+		wrong := stun.EncodeStunRequest(kind, other, nil, nil, false)
+		if !state.matchesResponse(match) || state.matchesResponse(wrong) || state.matchesResponse(match[:19]) {
+			t.Fatal("allocation response correlation failed")
+		}
+	}
+	binding := stun.EncodeStunRequest(stun.MsgBindingRequest, tx, nil, nil, false)
+	if _, ok := buildRelayBindingSuccess(binding, key); !ok {
+		t.Fatal("valid binding rejected")
+	}
+	if state.matchesResponse(stun.EncodeStunRequest(stun.MsgBindingSuccess, tx, nil, nil, false)) {
+		t.Fatal("wrong response method")
+	}
+	binding[4] ^= 1
+	if _, ok := buildRelayBindingSuccess(binding, key); ok {
+		t.Fatal("invalid binding cookie accepted")
 	}
 }

@@ -841,6 +841,14 @@ fn notifications_sent(sender: &MockBackend) -> Vec<(Value, u64)> {
         .collect()
 }
 
+/// The modern visual path is a plain timeline event, never a sticky invite.
+fn visual_room_notifications(sender: &MockBackend) -> Vec<Value> {
+    sender.room_events.lock().unwrap().iter()
+        .filter(|(_, event_type, _)| event_type == wire_event_type(NOTIFICATION_EVENT_TYPE))
+        .map(|(_, _, content)| content.clone())
+        .collect()
+}
+
 /// Starting a call is what summons the room, and MSC4075 ties the
 /// notification to the membership that justifies it — so the event id the
 /// join's sticky send reported has to come back out as the relation target.
@@ -920,7 +928,7 @@ async fn our_own_membership_does_not_count_as_somebody_else() {
     join_and_notify(&mut call, "alice-a", Some(GroupNotify::default())).await;
 
     assert_eq!(
-        notifications_sent(&sender).len(),
+        visual_room_notifications(&sender).len(),
         1,
         "the only membership in the session is our own, so we are the one starting the call"
     );
@@ -953,7 +961,7 @@ async fn a_stale_participation_of_ours_does_not_count_either() {
     join_and_notify(&mut call, "alice-new", Some(GroupNotify::default())).await;
 
     assert_eq!(
-        notifications_sent(&sender).len(),
+        visual_room_notifications(&sender).len(),
         1,
         "the session held nothing but our own previous participation"
     );
@@ -979,7 +987,7 @@ async fn another_device_of_ours_already_in_the_call_counts() {
     join_and_notify(&mut call, "alice-a", Some(GroupNotify::default())).await;
 
     assert!(
-        notifications_sent(&sender).is_empty(),
+        visual_room_notifications(&sender).is_empty(),
         "our laptop was already in the call, so our phone is joining, not starting"
     );
 }
@@ -999,7 +1007,7 @@ async fn joining_an_occupied_session_notifies_nobody() {
     join_and_notify(&mut call, "alice-a", Some(GroupNotify::default())).await;
 
     assert!(
-        notifications_sent(&sender).is_empty(),
+        visual_room_notifications(&sender).is_empty(),
         "bob was already in the session, so he started the call, not us"
     );
 }
@@ -1011,7 +1019,7 @@ async fn joining_quietly_notifies_nobody() {
 
     join_and_notify(&mut call, "alice-a", None).await;
 
-    assert!(notifications_sent(&sender).is_empty());
+    assert!(visual_room_notifications(&sender).is_empty());
 }
 
 #[tokio::test]
@@ -1564,14 +1572,14 @@ async fn starting_a_call_without_an_intent_is_video() {
     assert_eq!(published_intent(&sender), "video");
 }
 
-/// Spec 038 R26, R27, R29: in MSC, starting a call sends an `m.rtc.invite`
-/// of exactly MSC4075's fields, relating to nothing, its sticky entry
-/// outliving the 90 s lifetime.
+/// Visual group notifications retain their explicit type and membership
+/// relation even when the membership itself is MSC sticky.
 #[tokio::test]
-async fn starting_a_call_invites_the_room_in_the_msc_format() {
+async fn starting_a_group_call_notifies_without_an_invite_in_msc() {
     let sender = alice_backend();
     let mut call = encrypted_call_manager(sender.clone()).await;
     let notify = GroupNotify {
+        intent: Some("audio".to_owned()),
         mentions: crate::Mentions {
             user_ids: vec![BOB.to_owned()],
             room: false,
@@ -1579,52 +1587,55 @@ async fn starting_a_call_invites_the_room_in_the_msc_format() {
         ..GroupNotify::default()
     };
     join_and_notify(&mut call, "alice-a", Some(notify)).await;
-
-    let sent = notifications_sent(&sender);
+    let sent = visual_room_notifications(&sender);
     assert_eq!(sent.len(), 1);
-    let (content, duration_ms) = &sent[0];
-    let sender_ts = content["sender_ts"].as_u64().expect("a sender_ts");
-    assert_eq!(
-        *content,
-        json!({
-            "slot_id": SLOT,
-            "sender_ts": sender_ts,
-            "lifetime": DEFAULT_RING_LIFETIME_MS,
-            "m.mentions": { "user_ids": [BOB], "room": false },
-            "msc4354_sticky_key": SLOT,
-        })
-    );
-    assert_eq!(*duration_ms, 2 * DEFAULT_RING_LIFETIME_MS);
+    assert_eq!(sent[0]["notification_type"], "notification");
+    assert_eq!(sent[0]["application"]["notification_type"], "notification");
+    assert_eq!(sent[0]["m.call.intent"], "audio");
+    assert_eq!(sent[0]["m.relates_to"]["event_id"], "$sticky-1");
+    assert_eq!(sent[0]["m.mentions"], json!({"user_ids": [BOB], "room": false}));
+    assert!(sent[0].get("msc4354_sticky_key").is_none());
+    assert!(notifications_sent(&sender).is_empty());
+    call.leave(SLOT, LeaveSessionParams::new()).await.expect("leave");
+    assert!(notifications_sent(&sender).is_empty(), "no phantom invite withdrawal");
+    assert_eq!(visual_room_notifications(&sender).len(), 1);
 }
 
-/// Spec 038 R30: leaving with nobody else joined withdraws our invite; with
-/// somebody in the call it stays.
-#[tokio::test]
-async fn a_lone_leave_withdraws_the_invite() {
+/// Direct MSC rings still use the sticky invite and withdraw it if unanswered.
+#[tokio::test(start_paused = true)]
+async fn a_lone_leave_withdraws_the_direct_invite() {
     for (others, withdrawn) in [(false, true), (true, false)] {
-        let sender = alice_backend();
-        let mut call = encrypted_call_manager(sender.clone()).await;
-        join_and_notify(&mut call, "alice-a", Some(GroupNotify::default())).await;
-        assert_eq!(notifications_sent(&sender).len(), 1, "invited");
-        if others {
-            set_roster(
-                &mut call,
-                vec![member_event(BOB, Some("BOBDEV"), BOB_MEMBER, "$bob")],
-            )
-            .await;
-        }
-
-        call.leave(SLOT, LeaveSessionParams::new())
-            .await
-            .expect("leave");
-
+        let (mut call, sender, mut joined) = dm(&[BOB], Vec::new(), ring()).await;
+        let _ring = start_ring(&call, &mut joined);
+        settle().await;
         let sent = notifications_sent(&sender);
-        assert_eq!(sent.len(), if withdrawn { 2 } else { 1 }, "others={others}");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0["slot_id"], SLOT);
+        assert_eq!(sent[0].0["msc4354_sticky_key"], SLOT);
+        assert_eq!(sent[0].1, 2 * DEFAULT_RING_LIFETIME_MS);
+        assert!(visual_room_notifications(&sender).is_empty());
+        if others {
+            set_roster(&mut call, vec![member_event(BOB, Some("BOBDEV"), BOB_MEMBER, "$bob")]).await;
+        }
+        call.leave(SLOT, LeaveSessionParams::new()).await.expect("leave");
+        let sent = notifications_sent(&sender);
+        assert_eq!(sent.len(), if withdrawn { 2 } else { 1 });
         if withdrawn {
             assert_eq!(sent[1].0, json!({ "msc4354_sticky_key": SLOT }));
-            assert_eq!(sent[1].1, sent[0].1, "under the invite's sticky duration");
+            assert_eq!(sent[1].1, sent[0].1);
         }
     }
+}
+
+/// A demoted MSC direct ring must also remain visual-only.
+#[tokio::test(start_paused = true)]
+async fn a_demoted_msc_ring_is_not_a_sticky_invite() {
+    let (mut call, sender, joined) = dm(&[BOB, CAROL], Vec::new(), ring()).await;
+    assert!(joined.direct.is_none() && joined.ring.is_none());
+    assert_eq!(visual_room_notifications(&sender)[0]["notification_type"], "notification");
+    assert!(notifications_sent(&sender).is_empty());
+    call.leave(SLOT, LeaveSessionParams::new()).await.expect("leave");
+    assert!(notifications_sent(&sender).is_empty());
 }
 
 /// Spec 038 R28: an invite targeting nobody is not sent.
@@ -1641,4 +1652,5 @@ async fn an_invite_targeting_nobody_is_not_sent() {
     };
     join_and_notify(&mut call, "alice-a", Some(notify)).await;
     assert!(notifications_sent(&sender).is_empty());
+    assert!(visual_room_notifications(&sender).is_empty());
 }

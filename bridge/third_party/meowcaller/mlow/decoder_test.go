@@ -68,3 +68,15 @@ func TestE2EDecodeMatchesUseSmpl(t *testing.T) {
 		t.Errorf("lag-0 corr %.4f <= 0.95 vs useSmpl reference", corr)
 	}
 }
+
+func TestUnsupportedAudioDoesNotBecomeReadySilence(t *testing.T) {
+	d := NewMlowDecoder()
+	for _, p := range [][]byte{nil, {0xc0, 0}, {0x42, 0}, {0x72, 0}} {
+		if pcm := d.Decode(p); len(pcm) != 0 {
+			t.Fatalf("unsupported packet %x produced %d samples", p, len(pcm))
+		}
+	}
+	if pcm := d.Decode([]byte{0x90}); len(pcm) == 0 {
+		t.Fatal("valid SID no longer produces silence")
+	}
+}

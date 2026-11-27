@@ -1,6 +1,7 @@
 package meowcaller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -196,17 +197,27 @@ func newAppDataSender(pipe *MediaPipeline, ssrc uint32, sendPacket func([]byte) 
 }
 
 func (s *appDataSender) sendReaction(emoji string) error {
+	return s.sendReactionContext(context.Background(), emoji)
+}
+
+func (s *appDataSender) sendReactionContext(ctx context.Context, emoji string) error {
 	if !utf8.ValidString(emoji) {
 		return errors.New("meowcaller: reaction is not valid UTF-8")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.pipe == nil || s.sendPacket == nil {
 		return errAppDataUnavailable
 	}
 	s.transactionID++
 	payload := encodeAppDataReaction(s.transactionID, emoji)
 	for i := 0; i < appDataRetransmitCount; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		s.sequenceNumber++
 		s.timestamp += appDataTimestampStep
 		header := &rtp.RtpHeader{
@@ -223,7 +234,13 @@ func (s *appDataSender) sendReaction(emoji string) error {
 			return fmt.Errorf("send call reaction: %w", err)
 		}
 		if i+1 < appDataRetransmitCount && s.retransmitInterval > 0 {
-			time.Sleep(s.retransmitInterval)
+			timer := time.NewTimer(s.retransmitInterval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
 		}
 	}
 	return nil

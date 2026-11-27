@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use matrix_rtc_core::{DiscardedKey, EncryptionKeySignalHandler, KeyMaterialSignal, MaybeSend};
+use matrix_rtc_core::{DiscardedKey, EncryptionKeySignalHandler, KeyMaterialSignal, MaybeSend, RtcClock};
 
 use matrix_rtc_core::executor as rt;
 
@@ -54,6 +54,12 @@ pub trait FrameKeyRing: MaybeSend {
     /// it — the handler then treats the key as rejected, exactly as if it had
     /// been out of range.
     async fn set_key(&self, identity: &str, index: u8, key: Vec<u8>) -> bool;
+
+    /// Confirm that the exact key is present in the live cryptor backing.
+    /// Implementations without synchronous readback cannot claim readiness.
+    fn is_key_installed(&self, _identity: &str, _index: u8, _key: &[u8]) -> bool {
+        false
+    }
 }
 
 /// A piece of media key material destined for the transport's frame cryptor.
@@ -84,12 +90,12 @@ impl From<KeyMaterialSignal> for ParticipantKey {
 // bound-carrying `Fn` alias cannot take a supertrait, so the pair is spelled
 // per target instead.
 
-/// Callback invoked after every signalled key has been recorded (and, with a
-/// ring, imported). Must not block: it runs on the signalling path.
+/// Callback invoked after an accepted key has been recorded (and, with a
+/// ring, accepted by its backing). Must not block: it runs on the signalling path.
 #[cfg(not(target_arch = "wasm32"))]
 pub type KeyImportListener = Box<dyn Fn(&ParticipantKey) + Send + Sync>;
-/// Callback invoked after every signalled key has been recorded (and, with a
-/// ring, imported). Must not block: it runs on the signalling path.
+/// Callback invoked after an accepted key has been recorded (and, with a
+/// ring, accepted by its backing). Must not block: it runs on the signalling path.
 #[cfg(target_arch = "wasm32")]
 pub type KeyImportListener = Box<dyn Fn(&ParticipantKey)>;
 
@@ -147,7 +153,7 @@ pub struct MediaKeyHandler {
     /// `Arc` so a delayed application (see [`KeyMaterialSignal::use_after_ms`])
     /// can own a handle that outlives the signalling call — and, if it comes to
     /// it, the handler.
-    keys: Arc<Mutex<HashMap<String, ParticipantKey>>>,
+    keys: Arc<Mutex<HashMap<String, (ParticipantKey, bool)>>>,
     ring: Option<Arc<dyn FrameKeyRing>>,
     listener: Arc<Mutex<Option<KeyImportListener>>>,
     discard_listener: Arc<Mutex<Option<KeyDiscardListener>>>,
@@ -156,6 +162,25 @@ pub struct MediaKeyHandler {
     /// Our own transport identity and how to re-index our sender; `None` until
     /// the room is connected. See [`LocalKeyIndexHook`].
     local_sender: Arc<Mutex<Option<(String, LocalKeyIndexHook)>>>,
+    /// Serializes outbound ring writes, including tasks that wake together.
+    outbound_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Last accepted outbound key, not the latest attempted installation.
+    active_outbound: Arc<Mutex<Option<ParticipantKey>>>,
+    pending_outbound: Arc<Mutex<Option<ParticipantKey>>>,
+}
+
+/// A cancelled activation must not leave the core waiting for an acknowledgement
+/// that can never arrive. Exact material also fences an older task's drop.
+struct PendingOutbound {
+    slot: Arc<Mutex<Option<ParticipantKey>>>,
+    key: ParticipantKey,
+}
+
+impl Drop for PendingOutbound {
+    fn drop(&mut self) {
+        let mut slot = self.slot.lock().unwrap();
+        if slot.as_ref() == Some(&self.key) { *slot = None; }
+    }
 }
 
 impl MediaKeyHandler {
@@ -174,7 +199,7 @@ impl MediaKeyHandler {
         }
     }
 
-    /// Register a callback observing every signalled key (e.g. to surface
+    /// Register a callback observing every accepted key (e.g. to surface
     /// `KeyImported` on a call event stream). Replaces any previous listener.
     pub fn set_key_import_listener(&self, listener: KeyImportListener) {
         *self
@@ -222,7 +247,23 @@ impl MediaKeyHandler {
             .lock()
             .expect("key handler mutex poisoned")
             .get(rtc_backend_identity)
-            .cloned()
+            .map(|(key, _)| key.clone())
+    }
+
+    /// Latest key accepted by the backing ring (or recorded by a record-only
+    /// handler). A refused replacement must not be used to select a sender index.
+    pub fn accepted_key_for(&self, identity: &str) -> Option<ParticipantKey> {
+        self.keys.lock().expect("key handler mutex poisoned")
+            .get(identity).filter(|(_, accepted)| *accepted)
+            .map(|(key, _)| key.clone())
+    }
+
+    /// Stronger than key presence: require backing readback of the exact latest
+    /// accepted key, rather than treating a cached or staged key as installed.
+    pub fn is_key_installed(&self, identity: &str) -> bool {
+        let Some(key) = self.accepted_key_for(identity) else { return false; };
+        self.ring.as_ref().is_some_and(|ring|
+            ring.is_key_installed(identity, key.key_index, &key.key))
     }
 
     /// A snapshot of every recorded key.
@@ -231,7 +272,7 @@ impl MediaKeyHandler {
             .lock()
             .expect("key handler mutex poisoned")
             .values()
-            .cloned()
+            .map(|(key, _)| key.clone())
             .collect()
     }
 }
@@ -243,11 +284,14 @@ impl MediaKeyHandler {
     /// application can call it from a spawned task holding only cloned handles.
     async fn apply(
         ring: Option<&Arc<dyn FrameKeyRing>>,
-        keys: &Mutex<HashMap<String, ParticipantKey>>,
+        keys: &Mutex<HashMap<String, (ParticipantKey, bool)>>,
         listener: &Mutex<Option<KeyImportListener>>,
         local_sender: &Mutex<Option<(String, LocalKeyIndexHook)>>,
         key: ParticipantKey,
-    ) {
+        is_current: Option<&(dyn Fn() -> bool + Send + Sync)>,
+        active_outbound: Option<&Mutex<Option<ParticipantKey>>>,
+    ) -> bool {
+        if is_current.is_some_and(|check| !check()) { return false; }
         // Whether the key ring refused this index. Our sender must not be moved
         // onto an index it holds no key for — that would make our media
         // undecryptable for everyone, rather than for the one peer whose key
@@ -266,7 +310,7 @@ impl MediaKeyHandler {
                     .await
                 {
                     rejected = true;
-                    // TODO: surface set_key failures to the host.
+                    // Do not emit a successful import notification for a refusal.
                     log::warn!(
                         "frame key ring rejected key index {} for participant {}; \
                          its media will not decrypt",
@@ -285,6 +329,10 @@ impl MediaKeyHandler {
                 );
             }
         }
+        // An obsolete async ring installation must not move the sender or
+        // replace the current recorded key. Outbound writes are serialized so
+        // a newer installation cannot be overwritten by this completion.
+        if is_current.is_some_and(|check| !check()) { return false; }
         // Our own key: also move the sender onto the new index. `set_key` alone
         // only fills the ring, so without this we would advertise the rotation
         // and keep stamping the previous index.
@@ -300,14 +348,18 @@ impl MediaKeyHandler {
 
         keys.lock()
             .expect("key handler mutex poisoned")
-            .insert(key.rtc_backend_identity.clone(), key.clone());
-        if let Some(listener) = listener
+            .insert(key.rtc_backend_identity.clone(), (key.clone(), !rejected));
+        if !rejected && let Some(active) = active_outbound {
+            *active.lock().unwrap() = Some(key.clone());
+        }
+        if !rejected && let Some(listener) = listener
             .lock()
             .expect("key handler listener mutex poisoned")
             .as_ref()
         {
             listener(&key);
         }
+        !rejected
     }
 }
 
@@ -363,7 +415,7 @@ impl EncryptionKeySignalHandler for MediaKeyHandler {
             // must survive the signalling call.
             rt::spawn(async move {
                 rt::sleep(Duration::from_millis(use_after_ms)).await;
-                Self::apply(ring.as_ref(), &keys, &listener, &local_sender, key).await;
+                Self::apply(ring.as_ref(), &keys, &listener, &local_sender, key, None, None).await;
 
                 // The window the core asked us to wait out has just closed, and this
                 // task is the only thing that knew when that would be. A rotation may
@@ -390,8 +442,75 @@ impl EncryptionKeySignalHandler for MediaKeyHandler {
             &self.listener,
             &self.local_sender,
             key,
+            None,
+            None,
         )
         .await;
+    }
+
+    async fn on_outbound_key_material(
+        &self,
+        signal: KeyMaterialSignal,
+        activation_at_ms: u64,
+        clock: RtcClock,
+        is_current: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) {
+        if !is_current() { return; }
+        let delayed = activation_at_ms > clock();
+        if delayed && !rt::can_spawn() {
+            // Never activate before the shared deadline merely because a
+            // scheduler is absent. A subsequent replay may install it safely.
+            log::warn!("no runtime for outbound key activation; waiting for a replay");
+            return;
+        }
+        let key = ParticipantKey::from(signal);
+        let pending = {
+            let mut slot = self.pending_outbound.lock().unwrap();
+            if !is_current() || slot.as_ref() == Some(&key) { return; }
+            *slot = Some(key.clone());
+            PendingOutbound { slot: self.pending_outbound.clone(), key: key.clone() }
+        };
+        let ring = self.ring.clone();
+        let keys = self.keys.clone();
+        let listener = self.listener.clone();
+        let local_sender = self.local_sender.clone();
+        let switch_listener = self.switch_listener.clone();
+        let outbound_gate = self.outbound_gate.clone();
+        let active_outbound = self.active_outbound.clone();
+        let activate = async move {
+            let _pending = pending;
+            // Measure the original deadline on the task itself: scheduler
+            // admission latency must not add a second propagation interval.
+            loop {
+                if !is_current() { return; }
+                let remaining = activation_at_ms.saturating_sub(clock());
+                if remaining == 0 { break; }
+                rt::sleep(Duration::from_millis(remaining)).await;
+            }
+            let _gate = outbound_gate.lock().await;
+            if !is_current() { return; }
+            if active_outbound.lock().unwrap().as_ref() == Some(&key) { return; }
+            let accepted = Self::apply(ring.as_ref(), &keys, &listener, &local_sender,
+                key, Some(is_current.as_ref()), Some(active_outbound.as_ref())).await;
+            if accepted {
+                if delayed {
+                    if let Some(notify) = switch_listener.lock().unwrap().as_ref() { notify(); }
+                }
+            }
+        };
+        if delayed { rt::spawn(activate); } else { activate.await; }
+    }
+
+    fn active_outbound_key(&self, identity: &str) -> Option<(u8, Vec<u8>)> {
+        self.active_outbound.lock().unwrap().as_ref()
+            .filter(|key| key.rtc_backend_identity == identity)
+            .map(|key| (key.key_index, key.key.clone()))
+    }
+
+    fn outbound_activation_pending(&self, identity: &str, index: u8, key: &[u8]) -> bool {
+        self.pending_outbound.lock().unwrap().as_ref().is_some_and(|pending| {
+            pending.rtc_backend_identity == identity && pending.key_index == index && pending.key.as_slice() == key
+        })
     }
 
     /// Forwards a refusal straight through: there is nothing to install, and the
@@ -532,6 +651,61 @@ mod tests {
             })
         );
         assert!(handler.key_for("unknown").is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outbound_deadline_survives_task_admission_latency_and_replay() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let handler = MediaKeyHandler::new();
+        let now = Arc::new(AtomicU64::new(1000));
+        let clock: RtcClock = {
+            let now = now.clone();
+            Arc::new(move || now.load(Ordering::SeqCst))
+        };
+        let old = KeyMaterialSignal {
+            key: vec![1; 32], key_index: 1, rtc_backend_identity: "me".into(), use_after_ms: 0,
+        };
+        let next = KeyMaterialSignal {
+            key: vec![2; 32], key_index: 2, rtc_backend_identity: "me".into(), use_after_ms: 100,
+        };
+        handler.on_outbound_key_material(old, 1000, clock.clone(), Arc::new(|| true)).await;
+        handler.on_outbound_key_material(next.clone(), 1100, clock.clone(), Arc::new(|| true)).await;
+        assert_eq!(handler.active_outbound_key("me").unwrap().0, 1);
+        now.store(1100, Ordering::SeqCst);
+        // No Tokio time advances: the task begins after its core deadline.
+        tokio::task::yield_now().await;
+        assert_eq!(handler.active_outbound_key("me").unwrap().0, 2);
+        let applied = Arc::new(Mutex::new(0));
+        let imports = applied.clone();
+        handler.set_key_import_listener(Box::new(move |_| *imports.lock().unwrap() += 1));
+        handler.on_outbound_key_material(next, 1100, clock, Arc::new(|| true)).await;
+        assert_eq!(*applied.lock().unwrap(), 0, "replay must not reapply an activated key");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn superseded_outbound_task_cannot_restore_an_old_sender_index() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let handler = MediaKeyHandler::new();
+        let now = Arc::new(AtomicU64::new(1000));
+        let clock: RtcClock = {
+            let now = now.clone();
+            Arc::new(move || now.load(Ordering::SeqCst))
+        };
+        let valid = Arc::new(AtomicBool::new(true));
+        let probe = {
+            let valid = valid.clone();
+            Arc::new(move || valid.load(Ordering::SeqCst))
+        };
+        handler.on_outbound_key_material(KeyMaterialSignal {
+            key: vec![1; 32], key_index: 1, rtc_backend_identity: "me".into(), use_after_ms: 100,
+        }, 1100, clock.clone(), probe).await;
+        valid.store(false, Ordering::SeqCst);
+        handler.on_outbound_key_material(KeyMaterialSignal {
+            key: vec![2; 32], key_index: 2, rtc_backend_identity: "me".into(), use_after_ms: 0,
+        }, 1000, clock, Arc::new(|| true)).await;
+        now.store(1100, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_eq!(handler.active_outbound_key("me").unwrap().0, 2);
     }
 
     /// `use_after_ms` must be *scheduled*, not slept through: the signalling
@@ -727,6 +901,8 @@ mod tests {
             Some(16),
             "a rejected key is still recorded"
         );
+        assert!(handler.accepted_key_for("me").is_none());
+        assert!(!handler.is_key_installed("me"));
     }
 
     /// A ring returning `false` marks the key rejected: recorded, but the sender
@@ -746,6 +922,7 @@ mod tests {
         }
 
         let handler = MediaKeyHandler::with_ring(Arc::new(RefusingRing));
+        handler.set_key_import_listener(Box::new(|_| panic!("refused key reported imported")));
         let switched: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&switched);
         handler.set_local_sender(
@@ -764,5 +941,7 @@ mod tests {
 
         assert!(switched.lock().unwrap().is_empty());
         assert!(handler.key_for("me").is_some());
+        assert!(handler.accepted_key_for("me").is_none());
+        assert!(!handler.is_key_installed("me"));
     }
 }

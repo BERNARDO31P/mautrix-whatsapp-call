@@ -19,7 +19,8 @@
 
 use std::any::Any;
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
@@ -48,7 +49,7 @@ use livekit::webrtc::video_stream::native::NativeVideoStream;
 use livekit_signaling::SignalError;
 use matrix_rtc_transport::livekit::TokenServiceError;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use matrix_rtc_core::MatrixBackend;
 use matrix_rtc_core::{IdentitySubject, JoinedMembership, RtcIdentityMapper, RtcTransport};
@@ -63,7 +64,7 @@ use matrix_rtc_transport::{
 use crate::session::LiveKitSession;
 use crate::video_encoding::{supported_video_codecs, video_publish_options};
 use crate::{
-    LiveKitTarget, LiveKitTransportConfig, SfuToken, acquire_token, identity_mapper, room_options,
+    LiveKitTarget, LiveKitTransportConfig, SfuToken, TrustedFocus, acquire_token, identity_mapper, room_options,
 };
 
 /// Sample rate remote audio is resampled to before crossing the transport
@@ -85,6 +86,7 @@ pub struct LiveKitMediaTransport {
     http: reqwest::Client,
     backend: Arc<dyn MatrixBackend>,
     key_providers: crate::Msc4195KeyProviders,
+    trusted_focus: Option<TrustedFocus>,
     auto_subscribe: bool,
     /// How a member becomes an SFU participant identity: the one its published
     /// transport's token flow mints, by default.
@@ -108,9 +110,22 @@ impl LiveKitMediaTransport {
             http,
             backend,
             key_providers,
+            trusted_focus: None,
             auto_subscribe: true,
             identity_mapper: identity_mapper(),
         }
+    }
+
+    /// Restrict credential exchanges to deployment-owned endpoints. A fresh
+    /// client deliberately disables redirects; a caller's generic HTTP client
+    /// must not forward the service-account OpenID exchange to another URL.
+    pub fn with_trusted_focus(mut self, policy: TrustedFocus) -> Result<Self, TransportError> {
+        self.http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| TransportError::Connect(error.to_string()))?;
+        self.trusted_focus = Some(policy);
+        Ok(self)
     }
 
     /// Make every connection of this transport publish-only: remote tracks are
@@ -189,6 +204,7 @@ impl OwnFocusTransport for LiveKitMediaTransport {
                 connector: Connector {
                     http: self.http.clone(),
                     backend: self.backend.clone(),
+                    trusted_focus: self.trusted_focus.clone(),
                     key_provider: self.key_providers.connection_provider(),
                     e2ee: ctx.e2ee,
                     auto_subscribe: self.auto_subscribe,
@@ -196,7 +212,8 @@ impl OwnFocusTransport for LiveKitMediaTransport {
                     token: Mutex::new(None),
                 },
                 wanted: Mutex::new(Default::default()),
-                installs: Mutex::new(0),
+                installs: Mutex::new(Some(0)),
+                installed_generation: AtomicU64::new(0),
                 source_sizes: Mutex::new(Default::default()),
             }),
         }
@@ -210,7 +227,13 @@ impl MediaTransport for LiveKitMediaTransport {
     }
 
     fn connection_key(&self, transport: &RtcTransport, publisher_user_id: &str) -> Option<String> {
-        matrix_rtc_transport::livekit::connection_key(transport, publisher_user_id)
+        let key = matrix_rtc_transport::livekit::connection_key(transport, publisher_user_id)?;
+        if let Some(policy) = &self.trusted_focus {
+            if !policy.allows_target(&LiveKitTarget::from_connection_key(&key)?) {
+                return None;
+            }
+        }
+        Some(key)
     }
 
     fn shares_identity(&self, a: &str, b: &str) -> bool {
@@ -283,14 +306,50 @@ struct ConnectionShared {
     /// The remote identities this connection subscribes to
     /// ([`TransportConnection::set_wanted`]); nobody until the pool says.
     wanted: Mutex<std::collections::HashSet<String>>,
-    /// Bumped by every take-over, under which a connected room is installed:
-    /// a reconnect that started before one is abandoned (034 R25).
-    installs: Mutex<u64>,
+    /// Bumped for every reconnect or take-over. None is terminal; neither a
+    /// late connection nor a new attempt can install a room after close.
+    installs: Mutex<Option<u64>>,
+    // The installed room may precede a reserved but not yet installed attempt.
+    // Read/write this only under the installation fence.
+    installed_generation: AtomicU64,
     /// Each remote video publication's full size, by track sid, as the
     /// publisher announced it: livekit overwrites `dimension()` with the last
     /// size we asked for, so it is read before our first request. One entry
     /// per publication this connection was asked to constrain.
     source_sizes: Mutex<std::collections::HashMap<String, (u32, u32)>>,
+}
+
+/// Once a room is installed, cancellation of its restoration must not leave
+/// it advertising a partially restored set of local tracks.
+struct RestorationGuard {
+    connection: LiveKitTransportConnection,
+    generation: u64,
+    session: Arc<LiveKitSession>,
+    armed: bool,
+}
+
+impl RestorationGuard {
+    fn new(connection: &LiveKitTransportConnection, generation: u64, session: &Arc<LiveKitSession>) -> Self {
+        Self { connection: connection.clone(), generation, session: session.clone(), armed: true }
+    }
+
+    fn finish(mut self, result: Result<(), TransportError>) -> Result<(), TransportError> {
+        let result = self.connection.finish_reconnect(self.generation, &self.session, result);
+        self.armed = false;
+        if result.is_ok() {
+            self.connection.reassert_local_key_index();
+        }
+        result
+    }
+}
+
+impl Drop for RestorationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.connection.finish_reconnect(self.generation, &self.session,
+                Err(TransportError::Closed("publication restoration cancelled".into())));
+        }
+    }
 }
 
 /// What [`TransportConnection::hand_over`] gives: the connected room and how
@@ -305,6 +364,7 @@ struct Handover {
 struct Connector {
     http: reqwest::Client,
     backend: Arc<dyn MatrixBackend>,
+    trusted_focus: Option<TrustedFocus>,
     /// This connection's own: a reconnect sets the SFU's trailer on it again.
     key_provider: crate::ConnectionKeyProvider,
     /// Whether frames are encrypted (spec 038 R11); when they are, a track
@@ -320,18 +380,67 @@ struct Connector {
     token: Mutex<Option<SfuToken>>,
 }
 
-impl Connector {
-    async fn token(&self, fresh: bool) -> Result<SfuToken, TransportError> {
-        let cached = self.token.lock().expect("token mutex poisoned").clone();
-        if let Some(token) = cached.filter(|_| !fresh) {
-            return Ok(token);
+fn begin_install(installs: &Mutex<Option<u64>>) -> Result<u64, TransportError> {
+    let mut generation = installs.lock().expect("installs mutex poisoned");
+    let next = generation
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| TransportError::Closed("connection closed or generation exhausted".into()))?;
+    *generation = Some(next);
+    Ok(next)
+}
+
+// Use the same installation generation as the room commit. Take-over holds
+// this lock while replacing the configuration, cached token and room. Never
+// hold it across the HTTP exchange, but reject a stale result before caching it.
+async fn token_for_generation<F, Fut>(
+    installs: &Mutex<Option<u64>>,
+    started: u64,
+    config: &Mutex<LiveKitTransportConfig>,
+    cache: &Mutex<Option<SfuToken>>,
+    fresh: bool,
+    acquire: F,
+) -> Result<SfuToken, TransportError>
+where
+    F: FnOnce(LiveKitTransportConfig) -> Fut,
+    Fut: std::future::Future<Output = Result<SfuToken, TransportError>>,
+{
+    let abandoned = || TransportError::Closed("abandoned: focus changed during token exchange".into());
+    let snapshot = {
+        let generation = installs.lock().expect("installs mutex poisoned");
+        if *generation != Some(started) {
+            return Err(abandoned());
         }
-        let config = self.config.lock().expect("config mutex poisoned").clone();
-        let acquired = acquire_token(&self.http, &config, self.backend.as_ref())
-            .await
-            .map_err(classify_token_error)?;
-        *self.token.lock().expect("token mutex poisoned") = Some(acquired.clone());
-        Ok(acquired)
+        if !fresh {
+            if let Some(token) = cache.lock().expect("token mutex poisoned").clone() {
+                return Ok(token);
+            }
+        }
+        config.lock().expect("config mutex poisoned").clone()
+    };
+    let result = acquire(snapshot).await;
+    let generation = installs.lock().expect("installs mutex poisoned");
+    if *generation != Some(started) {
+        return Err(abandoned());
+    }
+    let acquired = result?;
+    *cache.lock().expect("token mutex poisoned") = Some(acquired.clone());
+    Ok(acquired)
+}
+
+impl Connector {
+    async fn token(&self, installs: &Mutex<Option<u64>>, started: u64, fresh: bool) -> Result<SfuToken, TransportError> {
+        token_for_generation(installs, started, &self.config, &self.token, fresh, |config| async move {
+            if self.trusted_focus.as_ref().is_some_and(|policy| !policy.allows_target(&config.target)) {
+                return Err(TransportError::Refused("focus is not authorized by deployment policy".into()));
+            }
+            let token = acquire_token(&self.http, &config, self.backend.as_ref())
+                .await
+                .map_err(classify_token_error)?;
+            if self.trusted_focus.as_ref().is_some_and(|policy| !policy.allows_sfu_url(&token.url)) {
+                return Err(TransportError::Refused("SFU token names an unauthorized endpoint".into()));
+            }
+            Ok(token)
+        }).await
     }
 }
 
@@ -458,14 +567,17 @@ impl LiveKitTransportConnection {
     /// Re-assert the current index on our senders, for a track published after a
     /// rotation: its cryptor is new, and new cryptors start at index 0.
     fn reassert_local_key_index(&self) {
-        let current = *self
+        let current = self
             .shared
             .local_key_index
             .lock()
             .expect("local key index mutex poisoned");
-        if let Some(key_index) = current {
+        if let Some(key_index) = *current {
             self.apply_local_key_index(key_index);
         }
+        // Serialize the SDK updates as well as the stored index. A stale
+        // reassertion must not run after a concurrent rotation commits.
+        drop(current);
     }
 
     fn apply_local_key_index(&self, key_index: u8) {
@@ -491,9 +603,24 @@ impl LiveKitTransportConnection {
         }
     }
 
+    /// Called with the installation fence held, before replacing the room.
+    /// Keep the old handle for retraction, but stop feeding its publication
+    /// while the asynchronous room close and new publish are pending.
+    fn mute_replaced_publications(&self, replacement: &Arc<LiveKitSession>) {
+        let tracks = self.shared.local_tracks.lock().expect("local tracks mutex poisoned");
+        for track in tracks.iter().filter_map(Weak::upgrade) {
+            let published = track.published.lock().expect("published mutex poisoned");
+            if let Some((local, owner)) = published.as_ref() {
+                if !publication_on_current_room(owner, Some(replacement)) {
+                    LiveKitLocalTrack::apply_mute(local, true);
+                }
+            }
+        }
+    }
+
     /// Carries every live publication onto the room just connected, with the
     /// mute it holds.
-    async fn republish_local_tracks(&self, session: &Arc<LiveKitSession>) {
+    async fn republish_local_tracks(&self, session: &Arc<LiveKitSession>) -> Result<(), TransportError> {
         let tracks: Vec<Arc<LiveKitLocalTrack>> = {
             let mut tracks = self
                 .shared
@@ -504,13 +631,69 @@ impl LiveKitTransportConnection {
             tracks.iter().filter_map(Weak::upgrade).collect()
         };
         for track in tracks {
-            if track.closed.load(Ordering::Acquire) {
+            if track.closed.load(Ordering::Acquire) || track.stop_requested.load(Ordering::Acquire) {
                 continue;
             }
-            if let Err(error) = track.publish_on(session).await {
-                log::warn!("could not republish our {:?}: {error}", track.kind);
-            }
+            track.publish_on(session, false).await?;
         }
+        Ok(())
+    }
+
+    /// Commit a reconnect or handover result only while its generation owns this
+    /// room. A partial publication failure must not report a healthy room.
+    fn finish_reconnect(
+        &self,
+        started: u64,
+        session: &Arc<LiveKitSession>,
+        result: Result<(), TransportError>,
+    ) -> Result<(), TransportError> {
+        let failed = {
+            let installs = self.shared.installs.lock().expect("installs mutex poisoned");
+            let current = self.current_session();
+            let owns_room = self.shared.installed_generation.load(Ordering::Relaxed) == started
+                && current.as_ref().is_some_and(|current| Arc::ptr_eq(current, session));
+            let result = reconnect_publication_result(*installs == Some(started) && owns_room, result);
+            // A new reservation may precede installation of its room. Retire
+            // an abandoned partial restoration while it still owns the room,
+            // but never detach a room installed by a subsequent take-over.
+            if !owns_room || installs.is_none() {
+                return result;
+            }
+            if let Err(error) = result {
+                // Prevent capture or mute changes from making a partially
+                // restored room transmit while its asynchronous close runs.
+                let tracks = self.shared.local_tracks.lock().expect("local tracks mutex poisoned");
+                for track in tracks.iter().filter_map(Weak::upgrade) {
+                    let mut published = track.published.lock().expect("published mutex poisoned");
+                    if let Some((local, room)) = published.as_ref() {
+                        if Arc::ptr_eq(room, session) {
+                            LiveKitLocalTrack::apply_mute(local, true);
+                            *published = None;
+                        }
+                    }
+                }
+                self.shared.session.send_replace(None);
+                Some(error)
+            } else {
+                None
+            }
+        };
+        if let Some(error) = failed {
+            close_room(session.clone());
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+fn reconnect_publication_result(
+    current: bool,
+    result: Result<(), TransportError>,
+) -> Result<(), TransportError> {
+    if current {
+        result
+    } else {
+        Err(TransportError::Closed("abandoned: reconnect superseded or closed".into()))
     }
 }
 
@@ -537,12 +720,14 @@ impl TransportConnection for LiveKitTransportConnection {
     /// `set_key` only fills the key *ring*; the index a sender stamps lives on
     /// its frame cryptor and changes only here.
     fn set_local_key_index(&self, key_index: u8) {
-        *self
+        let mut current = self
             .shared
             .local_key_index
             .lock()
-            .expect("local key index mutex poisoned") = Some(key_index);
+            .expect("local key index mutex poisoned");
+        *current = Some(key_index);
         self.apply_local_key_index(key_index);
+        drop(current);
     }
 
     /// Connects a new room with the token of the last connect (or a fresh one)
@@ -552,13 +737,22 @@ impl TransportConnection for LiveKitTransportConnection {
         &self,
         fresh_token: bool,
     ) -> Result<UnboundedReceiver<ConnectionEvent>, TransportError> {
+        let reservation = self.reserve_reconnect()?;
+        self.reconnect_reserved(fresh_token, reservation).await
+    }
+
+    fn reserve_reconnect(&self) -> Result<Option<u64>, TransportError> {
+        begin_install(&self.shared.installs).map(Some)
+    }
+
+    async fn reconnect_reserved(
+        &self,
+        fresh_token: bool,
+        reservation: Option<u64>,
+    ) -> Result<UnboundedReceiver<ConnectionEvent>, TransportError> {
+        let started = reservation.ok_or_else(|| TransportError::Closed("missing reconnect reservation".into()))?;
         let connector = &self.shared.connector;
-        let started = *self
-            .shared
-            .installs
-            .lock()
-            .expect("installs mutex poisoned");
-        let token = connector.token(fresh_token).await?;
+        let token = connector.token(&self.shared.installs, started, fresh_token).await?;
         let connection = LiveKitSession::connect_with_options(
             &token,
             room_options(
@@ -569,24 +763,30 @@ impl TransportConnection for LiveKitTransportConnection {
                 false,
             ),
         )
-        .await
-        .map_err(classify_room_error)?;
-
-        let session = Arc::new(connection.session);
-        let previous = {
+        .await;
+        // A refusal from a superseded attempt must not stop the current call.
+        let (connection, session, previous) = {
             let installs = self
                 .shared
                 .installs
                 .lock()
                 .expect("installs mutex poisoned");
-            if *installs != started {
+            if *installs != Some(started) {
                 drop(installs);
-                close_room(session);
+                if let Ok(connection) = connection {
+                    close_room(Arc::new(connection.session));
+                }
                 return Err(TransportError::Closed(
-                    "abandoned: the handle took another connection over".into(),
+                    "abandoned: connection attempt superseded or closed".into(),
                 ));
             }
-            self.shared.session.send_replace(Some(session.clone()))
+            let connection = connection.map_err(classify_room_error)?;
+            // Move the event receiver separately; the session is not Clone.
+            let session = Arc::new(connection.session);
+            self.mute_replaced_publications(&session);
+            self.shared.installed_generation.store(started, Ordering::Relaxed);
+            let previous = self.shared.session.send_replace(Some(session.clone()));
+            (connection.events, session, previous)
         };
         if let Some(previous) = previous {
             close_room(previous);
@@ -595,18 +795,24 @@ impl TransportConnection for LiveKitTransportConnection {
         // very beginning (nothing can be missed); hand it to the translator.
         let (events_tx, events_rx) = unbounded_channel();
         tokio::spawn(translate_room_events(
-            connection.events,
+            connection,
             events_tx,
             self.clone(),
             Arc::downgrade(&session),
         ));
+        let restoration = RestorationGuard::new(self, started, &session);
         self.subscribe_wanted(&session);
-        self.republish_local_tracks(&session).await;
-        self.reassert_local_key_index();
+        let result = self.republish_local_tracks(&session).await;
+        restoration.finish(result)?;
         Ok(events_rx)
     }
 
     fn hand_over(&self) -> Option<Box<dyn Any>> {
+        // Snapshot the room, configuration and token under the same fence as take-over.
+        let generation = self.shared.installs.lock().expect("installs mutex poisoned");
+        if generation.is_none() {
+            return None;
+        }
         let session = self.current_session()?;
         let connector = &self.shared.connector;
         Some(Box::new(Handover {
@@ -627,7 +833,7 @@ impl TransportConnection for LiveKitTransportConnection {
     /// Installs the handed-over room as this handle's, abandoning any
     /// reconnect in flight; our publications are carried onto it in the
     /// background, as after a reconnect.
-    fn take_over(&self, handover: Box<dyn Any>) -> Result<(), TransportError> {
+    fn take_over(&self, handover: Box<dyn Any>) -> Result<Option<oneshot::Receiver<Result<(), TransportError>>>, TransportError> {
         let handover = handover.downcast::<Handover>().map_err(|_| {
             TransportError::Unsupported("not a LiveKit connection's handover".into())
         })?;
@@ -636,33 +842,51 @@ impl TransportConnection for LiveKitTransportConnection {
             config,
             token,
         } = *handover;
+        if self.shared.connector.trusted_focus.as_ref().is_some_and(|policy| {
+            !policy.allows_target(&config.target)
+                || token.as_ref().is_none_or(|token| !policy.allows_sfu_url(&token.url))
+        }) {
+            return Err(TransportError::Refused("unauthorized focus handover".into()));
+        }
         log::info!(
             "our own handle takes over the room of {}",
             config.target.describe()
         );
-        let previous = {
+        let (started, previous) = {
             let mut installs = self
                 .shared
                 .installs
                 .lock()
                 .expect("installs mutex poisoned");
-            *installs += 1;
+            let next = installs.and_then(|value| value.checked_add(1))
+                .ok_or_else(|| TransportError::Closed("connection closed or generation exhausted".into()))?;
+            *installs = Some(next);
             let connector = &self.shared.connector;
             *connector.config.lock().expect("config mutex poisoned") = config;
             *connector.token.lock().expect("token mutex poisoned") = token;
-            self.shared.session.send_replace(Some(session.clone()))
+            self.mute_replaced_publications(&session);
+            self.shared.installed_generation.store(next, Ordering::Relaxed);
+            (next, self.shared.session.send_replace(Some(session.clone())))
         };
         if let Some(previous) = previous {
-            close_room(previous);
+            if !Arc::ptr_eq(&previous, &session) {
+                close_room(previous);
+            }
         }
         // The room was the other connection's, subscribed to its members.
         self.subscribe_wanted(&session);
         let this = self.clone();
+        let restoration = RestorationGuard::new(self, started, &session);
+        let (mut completed, receiver) = oneshot::channel();
         tokio::spawn(async move {
-            this.republish_local_tracks(&session).await;
-            this.reassert_local_key_index();
+            let result = tokio::select! {
+                biased;
+                _ = completed.closed() => Err(TransportError::Closed("handover abandoned".into())),
+                result = this.republish_local_tracks(&session) => result,
+            };
+            let _ = completed.send(restoration.finish(result));
         });
-        Ok(())
+        Ok(Some(receiver))
     }
 
     /// Before the first connect the publication is held, and goes out with
@@ -730,22 +954,32 @@ impl TransportConnection for LiveKitTransportConnection {
             kind,
             source,
             published: Mutex::new(None),
+            publication_op: tokio::sync::Mutex::new(()),
+            connection: Arc::downgrade(&self.shared),
             muted: AtomicBool::new(options.muted),
             closed: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
             retraction_failed: AtomicBool::new(false),
         });
-        if let Some(session) = self.current_session() {
-            track.publish_on(&session).await?;
+        // Register under the installation fence before the first await. A
+        // concurrent room install either precedes this snapshot or includes
+        // this track in its subsequent republish pass.
+        let session = {
+            let installs = self.shared.installs.lock().expect("installs mutex poisoned");
+            if installs.is_none() {
+                return Err(TransportError::Closed("connection closed".into()));
+            }
+            self.shared.local_tracks.lock().expect("local tracks mutex poisoned")
+                .push(Arc::downgrade(&track));
+            self.current_session()
+        };
+        if let Some(session) = session {
+            track.publish_on(&session, true).await?;
             // A frame cryptor is created per published track, at index 0.
             // If we have already rotated, this one must be moved onto the
             // current index or its frames carry a key nobody holds.
             self.reassert_local_key_index();
         }
-        self.shared
-            .local_tracks
-            .lock()
-            .expect("local tracks mutex poisoned")
-            .push(Arc::downgrade(&track));
         Ok(track)
     }
 
@@ -835,16 +1069,36 @@ impl TransportConnection for LiveKitTransportConnection {
     /// the postcondition callers want ("this connection is not open") already
     /// holds, so reporting a failure only makes a clean hangup look broken.
     async fn close(&self) -> Result<(), TransportError> {
-        let Some(session) = self.current_session() else {
+        let session = {
+            let mut installs = self.shared.installs.lock().expect("installs mutex poisoned");
+            *installs = None;
+            // Fence mute changes and publication commits before starting the
+            // asynchronous room close. A failed close must not resume media.
+            let tracks: Vec<_> = self.shared.local_tracks.lock()
+                .expect("local tracks mutex poisoned")
+                .iter().filter_map(Weak::upgrade).collect();
+            for track in tracks {
+                let published = track.published.lock().expect("published mutex poisoned");
+                if let Some((local, _)) = published.as_ref() {
+                    LiveKitLocalTrack::apply_mute(local, true);
+                }
+            }
+            self.current_session()
+        };
+        let Some(session) = session else {
             return Ok(());
         };
         match session.room().close().await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.shared.session.send_replace(None);
+                Ok(())
+            },
             Err(livekit::RoomError::AlreadyClosed) => {
                 log::debug!(
                     "connection {} was already closed; treating as success",
                     self.connection_key,
                 );
+                self.shared.session.send_replace(None);
                 Ok(())
             }
             Err(error) => Err(TransportError::Closed(error.to_string())),
@@ -882,16 +1136,17 @@ struct LiveKitLocalTrack {
     /// muted and retracted; `None` before the first connect. The room never
     /// holds this wrapper, so no cycle.
     published: Mutex<Option<(LocalTrack, Arc<LiveKitSession>)>>,
+    /// Serialize asynchronous publish and unpublish on this handle.
+    publication_op: tokio::sync::Mutex<()>,
+    connection: Weak<ConnectionShared>,
     /// The mute the transport was last told: applied to every room.
     muted: AtomicBool,
-    /// Set once `unpublish` succeeds — not before: a failed retraction
-    /// leaves the publication live at the SFU, and the handle must stay
-    /// usable to feed, mute, and retry it. Captures landing in the source
-    /// while a retraction is in flight are harmless — the frames go
-    /// nowhere — but once the publication is gone a capture loop must see
-    /// an error rather than silent success, or it never learns to stop.
+    /// Set once unpublish is confirmed. A failed retraction retains the
+    /// handle for retry, but never resumes capture or publication.
     closed: AtomicBool,
-    /// Set when an `unpublish` attempt fails. LiveKit drops the publication
+    /// Irreversible stop intent, set before waiting for the publication gate.
+    stop_requested: AtomicBool,
+    /// Set when an `unpublish` attempt starts, including cancelled attempts. LiveKit drops the publication
     /// from its local map *before* the fallible transport work, with no
     /// rollback, so after a failure a retry sees "track not found" — which
     /// must not be mistaken for the benign already-retracted case, because
@@ -899,15 +1154,77 @@ struct LiveKitLocalTrack {
     retraction_failed: AtomicBool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PublicationFailure {
+    Closed,
+    Superseded,
+    Initial,
+    Republish,
+}
+
+fn publication_failure(open: bool, current: bool, initial: bool) -> PublicationFailure {
+    if !open {
+        PublicationFailure::Closed
+    } else if !current {
+        PublicationFailure::Superseded
+    } else if initial {
+        PublicationFailure::Initial
+    } else {
+        PublicationFailure::Republish
+    }
+}
+
+// Session identity is pointer identity, not focus URL or room name: reconnects
+// to the same focus still create a different native room.
+fn publication_on_current_room<T>(owner: &Arc<T>, current: Option<&Arc<T>>) -> bool {
+    current.is_some_and(|current| Arc::ptr_eq(current, owner))
+}
+
 impl LiveKitLocalTrack {
-    /// Publishes a new track over the source on `session`, muted as held.
+    fn connection_for_capture(&self) -> Result<Arc<ConnectionShared>, TransportError> {
+        let connection = self.connection.upgrade().ok_or_else(|| {
+            TransportError::Closed("connection dropped".into())
+        })?;
+        if connection.installs.lock().expect("installs mutex poisoned").is_none()
+            || self.closed.load(Ordering::Acquire)
+            || self.stop_requested.load(Ordering::Acquire)
+        {
+            return Err(TransportError::Closed("publication or connection closed".into()));
+        }
+        Ok(connection)
+    }
+
+    /// Publishes a new track over the source on `session`.
     ///
-    /// Muted before publishing, not after: livekit puts `track.is_muted()`
-    /// into the `AddTrackRequest`, so the track is announced muted in the
-    /// same request. Muting once the publish resolved would leave a window
-    /// with a live unmuted track at the SFU — a hot mic.
-    async fn publish_on(&self, session: &Arc<LiveKitSession>) -> Result<(), TransportError> {
-        let muted = self.muted.load(Ordering::Acquire);
+    /// Always announce it muted in AddTrackRequest. A mute change during
+    /// the asynchronous publish must not leave the new track transmitting.
+    /// Reconcile with the latest intent under the same lock as set_muted
+    /// only after publishing succeeds.
+    async fn publish_on(
+        &self,
+        session: &Arc<LiveKitSession>,
+        initial: bool,
+    ) -> Result<(), TransportError> {
+        let _operation = self.publication_op.lock().await;
+        if self.closed.load(Ordering::Acquire) || self.stop_requested.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let connection = self.connection.upgrade().ok_or_else(|| {
+            TransportError::Closed("connection dropped".into())
+        })?;
+        {
+            let installs = connection.installs.lock().expect("installs mutex poisoned");
+            if installs.is_none() {
+                return Err(TransportError::Closed("connection closed".into()));
+            }
+            if !connection.session.borrow().as_ref().is_some_and(|current| Arc::ptr_eq(current, session)) {
+                return Ok(()); // The current room's republish pass owns this track.
+            }
+            let published = self.published.lock().expect("published mutex poisoned");
+            if published.as_ref().is_some_and(|(_, previous)| Arc::ptr_eq(previous, session)) {
+                return Ok(());
+            }
+        }
         let source_kind = livekit_track_source(self.kind);
         let (track, options) = match &self.source {
             LocalSource::Audio(source) => {
@@ -915,9 +1232,7 @@ impl LiveKitLocalTrack {
                     "audio",
                     RtcAudioSource::Native(source.clone()),
                 );
-                if muted {
-                    track.mute();
-                }
+                track.mute();
                 (
                     LocalTrack::Audio(track),
                     TrackPublishOptions {
@@ -931,21 +1246,84 @@ impl LiveKitLocalTrack {
                     "video",
                     RtcVideoSource::Native(source.clone()),
                 );
-                if muted {
-                    track.mute();
-                }
+                track.mute();
                 (LocalTrack::Video(track), options.clone())
             }
         };
-        session
+        let result = session
             .room()
             .local_participant()
             .publish_track(track.clone(), options)
-            .await
-            .map_err(|error| TransportError::Connect(error.to_string()))?;
-        *self.published.lock().expect("published mutex poisoned") =
-            Some((track, Arc::clone(session)));
-        Ok(())
+            .await;
+        if let Err(error) = result {
+            // A replacement room owns the registered track once installed.
+            // An obsolete room's failure must not drop the initial handle.
+            // Keep the publication operation locked until the disposition is
+            // decided so a concurrent republish cannot revive a failed handle.
+            let installs = connection.installs.lock().expect("installs mutex poisoned");
+            let current = connection.session.borrow().as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, session));
+            match publication_failure(installs.is_some(), current, initial) {
+                PublicationFailure::Closed => {
+                    if initial {
+                        self.finish_retraction();
+                    }
+                    return Err(TransportError::Closed("connection closed".into()));
+                }
+                PublicationFailure::Superseded => {
+                    log::debug!("ignoring publication failure on replaced room: {error}");
+                    return Ok(());
+                }
+                PublicationFailure::Initial => self.finish_retraction(),
+                PublicationFailure::Republish => (),
+            }
+            return Err(TransportError::Connect(error.to_string()));
+        }
+        // Never unmute a publication completed on an abandoned room. The
+        // installation fence also excludes a concurrent terminal close at
+        // the moment we commit the publication.
+        let terminal = {
+            let installs = connection.installs.lock().expect("installs mutex poisoned");
+            if installs.is_some() && connection.session.borrow().as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, session))
+            {
+                let mut published = self.published.lock().expect("published mutex poisoned");
+                // Stop may have been requested while native publish was
+                // pending. Keep the new track muted but retain ownership so
+                // the waiting unpublish can retract its exact SID.
+                Self::apply_mute(&track, self.muted.load(Ordering::Acquire)
+                    || self.stop_requested.load(Ordering::Acquire));
+                *published = Some((track, Arc::clone(session)));
+                self.retraction_failed.store(false, Ordering::Release);
+                return Ok(());
+            }
+            installs.is_none()
+        };
+        // The abandoned publication is still muted; try to retract it even
+        // if the old room's asynchronous shutdown has not completed yet.
+        if let Err(error) = session.room().local_participant().unpublish_track(&track.sid()).await {
+            log::debug!("could not retract abandoned muted publication: {error}");
+        }
+        if terminal {
+            Err(TransportError::Closed("connection closed".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn apply_mute(track: &LocalTrack, muted: bool) {
+        match (track, muted) {
+            (LocalTrack::Audio(track), true) => track.mute(),
+            (LocalTrack::Audio(track), false) => track.unmute(),
+            (LocalTrack::Video(track), true) => track.mute(),
+            (LocalTrack::Video(track), false) => track.unmute(),
+        }
+    }
+
+    fn finish_retraction(&self) {
+        let mut published = self.published.lock().expect("published mutex poisoned");
+        self.closed.store(true, Ordering::Release);
+        *published = None;
     }
 
     fn current_track(&self) -> Option<LocalTrack> {
@@ -965,13 +1343,21 @@ impl LocalTrackHandle for LiveKitLocalTrack {
 
     /// Held for the rooms it is published on later, too.
     fn set_muted(&self, muted: bool) -> Result<(), TransportError> {
+        let connection = self.connection.upgrade().ok_or_else(|| {
+            TransportError::Closed("connection dropped".into())
+        })?;
+        let installs = connection.installs.lock().expect("installs mutex poisoned");
+        let published = self.published.lock().expect("published mutex poisoned");
+        if installs.is_none() || self.closed.load(Ordering::Acquire)
+            || self.stop_requested.load(Ordering::Acquire) {
+            return Err(TransportError::Closed("publication or connection closed".into()));
+        }
         self.muted.store(muted, Ordering::Release);
-        match (self.current_track(), muted) {
-            (Some(LocalTrack::Audio(track)), true) => track.mute(),
-            (Some(LocalTrack::Audio(track)), false) => track.unmute(),
-            (Some(LocalTrack::Video(track)), true) => track.mute(),
-            (Some(LocalTrack::Video(track)), false) => track.unmute(),
-            (None, _) => {}
+        if let Some((track, owner)) = published.as_ref() {
+            let current = publication_on_current_room(owner, connection.session.borrow().as_ref());
+            // Save the requested intent for republish, but never unmute an
+            // obsolete room while its asynchronous close is still pending.
+            Self::apply_mute(track, muted || !current);
         }
         Ok(())
     }
@@ -984,6 +1370,22 @@ impl LocalTrackHandle for LiveKitLocalTrack {
     /// work, without rollback), not the SFU, so it stays an error rather than
     /// reporting a retraction that may never have happened.
     async fn unpublish(&self) -> Result<(), TransportError> {
+        // Fence an in-flight publication commit and mute changes immediately,
+        // before waiting for the asynchronous per-track gate.
+        {
+            let connection = self.connection.upgrade();
+            let _installation = connection.as_ref().map(|connection|
+                connection.installs.lock().expect("installs mutex poisoned"));
+            let published = self.published.lock().expect("published mutex poisoned");
+            self.stop_requested.store(true, Ordering::Release);
+            if let Some((track, _)) = published.as_ref() {
+                Self::apply_mute(track, true);
+            }
+        }
+        let _operation = self.publication_op.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let published = self
             .published
             .lock()
@@ -991,10 +1393,12 @@ impl LocalTrackHandle for LiveKitLocalTrack {
             .clone();
         let Some((track, session)) = published else {
             // Never went out: nothing to retract, and no room gets it later.
-            self.closed.store(true, Ordering::Release);
+            self.finish_retraction();
             return Ok(());
         };
         let sid = track.sid();
+        // Cancellation after submission is as ambiguous as an error.
+        let previous_attempt = self.retraction_failed.swap(true, Ordering::AcqRel);
         match session
             .room()
             .local_participant()
@@ -1002,15 +1406,15 @@ impl LocalTrackHandle for LiveKitLocalTrack {
             .await
         {
             Ok(_) => {
-                self.closed.store(true, Ordering::Release);
+                self.finish_retraction();
                 Ok(())
             }
             Err(livekit::RoomError::Internal(message))
                 if message.contains("track not found")
-                    && !self.retraction_failed.load(Ordering::Acquire) =>
+                    && !previous_attempt =>
             {
                 log::debug!("{sid} was already unpublished; treating as success");
-                self.closed.store(true, Ordering::Release);
+                self.finish_retraction();
                 Ok(())
             }
             Err(error) => {
@@ -1021,11 +1425,7 @@ impl LocalTrackHandle for LiveKitLocalTrack {
     }
 
     async fn capture_audio(&self, frame: AudioFrame) -> Result<(), TransportError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(TransportError::Closed(
-                "this publication was unpublished".into(),
-            ));
-        }
+        let _connection = self.connection_for_capture()?;
         let LocalSource::Audio(source) = &self.source else {
             return Err(TransportError::Unsupported(
                 "this publication does not accept audio frames".into(),
@@ -1044,11 +1444,7 @@ impl LocalTrackHandle for LiveKitLocalTrack {
     }
 
     fn capture_video(&self, frame: VideoFrame) -> Result<(), TransportError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(TransportError::Closed(
-                "this publication was unpublished".into(),
-            ));
-        }
+        let _connection = self.connection_for_capture()?;
         let LocalSource::Video { source, .. } = &self.source else {
             return Err(TransportError::Unsupported(
                 "this publication does not accept video frames".into(),
@@ -1124,6 +1520,31 @@ impl LocalTrackHandle for LiveKitLocalTrack {
     }
 }
 
+/// One currently translated publication per participant and stream kind.
+/// Removing an older publication must not erase its replacement.
+#[derive(Default)]
+struct RemotePublications(HashMap<(String, MediaStreamKind), String>);
+
+impl RemotePublications {
+    fn added(&mut self, identity: &str, kind: MediaStreamKind, sid: String) {
+        self.0.insert((identity.to_owned(), kind), sid);
+    }
+
+    fn removed(&mut self, identity: &str, kind: MediaStreamKind, sid: &str) -> bool {
+        let key = (identity.to_owned(), kind);
+        if self.0.get(&key).is_some_and(|current| current == sid) {
+            self.0.remove(&key);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn participant_left(&mut self, identity: &str) {
+        self.0.retain(|(owner, _), _| owner != identity);
+    }
+}
+
 /// Translate the LiveKit room event stream into the transport-neutral
 /// [`ConnectionEvent`] vocabulary. Runs until the room closes its channel;
 /// the outbound channel closing (engine gone) stops it early.
@@ -1136,14 +1557,17 @@ async fn translate_room_events(
     session: std::sync::Weak<LiveKitSession>,
 ) {
     let e2ee = owner.shared.connector.e2ee;
+    let mut publications = RemotePublications::default();
     while let Some(event) = events.recv().await {
         let translated = match event {
             RoomEvent::ParticipantConnected(participant) => Some(ConnectionEvent::RemoteJoined {
                 identity: participant.identity().to_string(),
             }),
-            RoomEvent::ParticipantDisconnected(participant) => Some(ConnectionEvent::RemoteLeft {
-                identity: participant.identity().to_string(),
-            }),
+            RoomEvent::ParticipantDisconnected(participant) => {
+                let identity = participant.identity().to_string();
+                publications.participant_left(&identity);
+                Some(ConnectionEvent::RemoteLeft { identity })
+            }
             RoomEvent::TrackPublished {
                 publication,
                 participant,
@@ -1170,8 +1594,10 @@ async fn translate_room_events(
                         kind,
                     })
                 } else {
+                    let identity = participant.identity().to_string();
+                    publications.added(&identity, kind, String::from(publication.sid()));
                     Some(ConnectionEvent::TrackAdded {
-                        identity: participant.identity().to_string(),
+                        identity,
                         kind,
                         track: Arc::new(LiveKitRemoteTrack { kind, track }),
                     })
@@ -1187,10 +1613,13 @@ async fn translate_room_events(
                 publication,
                 participant,
                 ..
-            } => Some(ConnectionEvent::TrackRemoved {
-                identity: participant.identity().to_string(),
-                kind: stream_kind(publication.source(), publication.kind()),
-            }),
+            } => {
+                let identity = participant.identity().to_string();
+                let kind = stream_kind(publication.source(), publication.kind());
+                let sid = String::from(publication.sid());
+                publications.removed(&identity, kind, &sid)
+                    .then_some(ConnectionEvent::TrackRemoved { identity, kind })
+            }
             RoomEvent::TrackMuted {
                 participant,
                 publication,
@@ -1575,6 +2004,68 @@ fn copy_plane(
 mod tests {
     use super::*;
 
+    #[test]
+    fn publication_owner_is_native_room_identity_not_focus_equality() {
+        let old = Arc::new("same-focus");
+        let replacement = Arc::new("same-focus");
+        assert!(publication_on_current_room(&old, Some(&old.clone())));
+        assert!(!publication_on_current_room(&old, Some(&replacement)));
+        assert!(!publication_on_current_room(&old, None));
+        assert!(publication_on_current_room(&replacement, Some(&replacement)));
+    }
+
+    #[test]
+    fn reconnect_cannot_succeed_after_republish_failure_or_supersession() {
+        assert!(reconnect_publication_result(true, Ok(())).is_ok());
+        assert!(matches!(
+            reconnect_publication_result(true, Err(TransportError::Connect("publish failed".into()))),
+            Err(TransportError::Connect(_))
+        ));
+        assert!(matches!(reconnect_publication_result(false, Ok(())), Err(TransportError::Closed(_))));
+        assert!(matches!(
+            reconnect_publication_result(false, Err(TransportError::Connect("old room".into()))),
+            Err(TransportError::Closed(_))
+        ));
+    }
+
+    #[test]
+    fn publication_failure_is_scoped_to_the_installed_room() {
+        use PublicationFailure::*;
+        for initial in [false, true] {
+            for current in [false, true] {
+                assert_eq!(publication_failure(false, current, initial), Closed);
+            }
+            assert_eq!(publication_failure(true, false, initial), Superseded);
+        }
+        assert_eq!(publication_failure(true, true, true), Initial);
+        assert_eq!(publication_failure(true, true, false), Republish);
+    }
+
+    #[test]
+    fn old_publication_cannot_remove_replacement() {
+        let mut publications = RemotePublications::default();
+        let kind = MediaStreamKind::Camera;
+        publications.added("alice", kind, "old".into());
+        publications.added("alice", kind, "new".into());
+        assert!(!publications.removed("alice", kind, "old"));
+        assert!(publications.removed("alice", kind, "new"));
+        assert!(!publications.removed("alice", kind, "new"));
+    }
+
+    #[test]
+    fn publication_removal_is_scoped_to_participant_and_kind() {
+        let mut publications = RemotePublications::default();
+        publications.added("alice", MediaStreamKind::Camera, "camera".into());
+        publications.added("alice", MediaStreamKind::Microphone, "mic".into());
+        publications.added("bob", MediaStreamKind::Camera, "bob-camera".into());
+        assert!(!publications.removed("alice", MediaStreamKind::Microphone, "camera"));
+        assert!(!publications.removed("bob", MediaStreamKind::Camera, "camera"));
+        publications.participant_left("alice");
+        assert!(!publications.removed("alice", MediaStreamKind::Camera, "camera"));
+        assert!(!publications.removed("alice", MediaStreamKind::Microphone, "mic"));
+        assert!(publications.removed("bob", MediaStreamKind::Camera, "bob-camera"));
+    }
+
     fn codec_entry(id: &str, mime_type: &str) -> RtcStats {
         let mut codec = livekit::webrtc::stats::CodecStats::default();
         codec.rtc.id = id.to_owned();
@@ -1665,6 +2156,73 @@ mod tests {
             member_id: "member-1".into(),
             device_id: "DEVICE".into(),
         }
+    }
+
+    fn test_token(label: &str) -> SfuToken {
+        SfuToken { jwt: label.into(), url: format!("wss://{label}.example.org") }
+    }
+
+    #[test]
+    fn install_generations_supersede_previous_attempts_and_close_is_terminal() {
+        let installs = Mutex::new(Some(0));
+        assert_eq!(begin_install(&installs).unwrap(), 1);
+        assert_eq!(begin_install(&installs).unwrap(), 2);
+        *installs.lock().unwrap() = None;
+        assert!(matches!(begin_install(&installs), Err(TransportError::Closed(_))));
+        assert_eq!(*installs.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn close_during_token_exchange_rejects_the_result() {
+        let installs = Mutex::new(Some(0));
+        let config = Mutex::new(cs_api_config());
+        let cache = Mutex::new(Some(test_token("existing")));
+        let started = begin_install(&installs).unwrap();
+        let result = token_for_generation(&installs, started, &config, &cache, true, |_| async {
+            *installs.lock().unwrap() = None;
+            Ok(test_token("late"))
+        }).await;
+        assert!(matches!(result, Err(TransportError::Closed(_))));
+        assert_eq!(cache.lock().unwrap().as_ref().unwrap().jwt, "existing");
+    }
+
+    #[tokio::test]
+    async fn obsolete_token_result_cannot_replace_the_new_focus_cache() {
+        for fail in [false, true] {
+            let installs = Mutex::new(Some(0));
+            let config = Mutex::new(cs_api_config());
+            let cache = Mutex::new(None);
+            let result = token_for_generation(&installs, 0, &config, &cache, true, |_| async {
+                let mut generation = installs.lock().unwrap();
+                *generation = Some(1);
+                config.lock().unwrap().target = LiveKitTarget::CsApi {
+                    url: "wss://new.example.org".into(), server_name: "new.example.org".into(),
+                };
+                *cache.lock().unwrap() = Some(test_token("new"));
+                if fail { Err(TransportError::Refused("old focus refused".into())) }
+                else { Ok(test_token("old")) }
+            }).await;
+            assert!(matches!(result, Err(TransportError::Closed(_))));
+            assert_eq!(cache.lock().unwrap().as_ref().unwrap().jwt, "new");
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_attempt_cannot_use_new_cache_and_current_attempt_can_refresh_it() {
+        let installs = Mutex::new(Some(1));
+        let config = Mutex::new(cs_api_config());
+        let cache = Mutex::new(Some(test_token("cached")));
+        for (generation, expected) in [(0, false), (1, true)] {
+            let result = token_for_generation(&installs, generation, &config, &cache, false, |_| async {
+                panic!("cached or abandoned attempts must not request a token");
+            }).await;
+            assert_eq!(result.is_ok(), expected);
+        }
+        let result = token_for_generation(&installs, 1, &config, &cache, true, |_| async {
+            Ok(test_token("fresh"))
+        }).await.unwrap();
+        assert_eq!(result.jwt, "fresh");
+        assert_eq!(cache.lock().unwrap().as_ref().unwrap().jwt, "fresh");
     }
 
     /// A transport naming only an SFU `url` gets its token from the homeserver,

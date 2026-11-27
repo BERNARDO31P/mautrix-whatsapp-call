@@ -44,7 +44,7 @@ use matrix_rtc_core::{
 };
 use matrix_rtc_transport::keys::FrameKeyRing;
 use matrix_rtc_transport::livekit::token::{legacy_token_request, parse_sfu_token};
-use matrix_rtc_transport::livekit::{LiveKitTarget, SfuToken};
+use matrix_rtc_transport::livekit::{LiveKitTarget, SfuToken, valid_service_url, valid_sfu_url, valid_sfu_token};
 use matrix_rtc_transport::{
     ConnectionContext, ConnectionEvent, FrameEncryptionState, MediaStreamKind, MediaTransport,
     OwnFocusTransport, RemoteTrackHandle, SpeakingParticipant, TransportConnection, TransportError,
@@ -365,6 +365,9 @@ impl JsConnector {
         };
         let service_url = match target {
             LiveKitTarget::CsApi { url, server_name } => {
+                if !valid_sfu_url(&url) {
+                    return Err(TransportError::Refused("invalid LiveKit SFU endpoint".into()));
+                }
                 let jwt = self
                     .backend
                     .livekit_token(&LiveKitTokenRequest {
@@ -382,11 +385,18 @@ impl JsConnector {
                             backend_error("homeserver livekit token", error)
                         }
                     })?;
-                return Ok(SfuToken { jwt, url });
+                let token = SfuToken { jwt, url };
+                if !valid_sfu_token(&token) {
+                    return Err(TransportError::Refused("invalid LiveKit token response".into()));
+                }
+                return Ok(token);
             }
             LiveKitTarget::SfuGet { service_url } => service_url,
         };
 
+        if !valid_service_url(&service_url) {
+            return Err(TransportError::Refused("invalid LiveKit JWT service endpoint".into()));
+        }
         let openid = self
             .backend
             .openid_token()
@@ -424,13 +434,17 @@ impl JsConnector {
             })?;
 
         // A 4xx from the token service is a refusal (034 R24).
-        parse_sfu_token(response.status, &response.body).map_err(|error| {
+        let token = parse_sfu_token(response.status, &response.body).map_err(|error| {
             if (400..500).contains(&response.status) {
                 TransportError::Refused(error.to_string())
             } else {
                 TransportError::Connect(error.to_string())
             }
-        })
+        })?;
+        if !valid_sfu_token(&token) {
+            return Err(TransportError::Refused("invalid LiveKit token response".into()));
+        }
+        Ok(token)
     }
 
     /// Connects a livekit-js room through the delegate's `connect`, and

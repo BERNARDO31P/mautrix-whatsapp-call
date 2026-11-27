@@ -60,11 +60,43 @@ pub fn identity_for(subject: &IdentitySubject<'_>) -> Option<String> {
     }
 }
 
-/// The first LiveKit transport of a member's published ones.
+// Syntax only: no destination trust or authorization decision is made here.
+fn endpoint(value: &str, schemes: &[&str]) -> Option<url::Url> {
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+    let parsed = url::Url::parse(value).ok()?;
+    (schemes.contains(&parsed.scheme()) && parsed.host_str().is_some()
+        && parsed.username().is_empty() && parsed.password().is_none()
+        && parsed.fragment().is_none() && parsed.port() != Some(0)).then_some(parsed)
+}
+
+pub fn valid_service_url(value: &str) -> bool {
+    endpoint(value, &["https", "http"]).is_some_and(|url| url.query().is_none())
+}
+
+pub fn valid_sfu_url(value: &str) -> bool {
+    endpoint(value, &["wss", "ws"]).is_some()
+}
+
+pub fn valid_sfu_token(token: &SfuToken) -> bool {
+    valid_sfu_url(&token.url) && !token.jwt.is_empty()
+        && !token.jwt.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// Whether the endpoint selected by this transport's authentication flow is usable.
+pub fn usable_transport(transport: &LiveKitTransport) -> bool {
+    match transport.auth_flow() {
+        LiveKitAuthFlow::SfuGet { service_url } => valid_service_url(service_url),
+        LiveKitAuthFlow::CsApi { url } => valid_sfu_url(url),
+    }
+}
+
+/// The first usable LiveKit transport of a member's published ones.
 pub fn first_livekit(transports: &[RtcTransport]) -> Option<&LiveKitTransport> {
     transports.iter().find_map(|transport| match transport {
-        RtcTransport::LiveKit(livekit) => Some(livekit),
-        RtcTransport::Unsupported(_) => None,
+        RtcTransport::LiveKit(livekit) if usable_transport(livekit) => Some(livekit),
+        _ => None,
     })
 }
 
@@ -142,10 +174,10 @@ impl LiveKitTarget {
 /// when it is a LiveKit one: shared by the native and web transports.
 pub fn connection_key(transport: &RtcTransport, publisher_user_id: &str) -> Option<String> {
     match transport {
-        RtcTransport::LiveKit(livekit) => {
+        RtcTransport::LiveKit(livekit) if usable_transport(livekit) => {
             Some(LiveKitTarget::for_transport(livekit, publisher_user_id).connection_key())
         }
-        RtcTransport::Unsupported(_) => None,
+        _ => None,
     }
 }
 

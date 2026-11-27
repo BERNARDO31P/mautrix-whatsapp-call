@@ -4,7 +4,7 @@ Most operators should download a prebuilt runtime and follow the [installation g
 
 ## Prepare and build
 
-The Git repository is source-only. Keep your existing checkout and `.git` history; do not extract a source ZIP over it. Clone if you do not yet have it:
+Clone the repository:
 
 ```powershell
 git clone "https://github.com/BERNARDO31P/mautrix-whatsapp-call.git"
@@ -20,7 +20,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Build.ps1" -DistroNam
 
 For an unprepared machine run `Bootstrap.ps1` as described in the README. `-PrepareOnly` prepares without compiling. On Linux AMD64 use `bash build/build.sh`. The bootstrap downloads pinned toolchains and WebRTC inputs into `~/.cache/mautrix-whatsapp-call/` and checks their integrity. Allow adequate disk space and memory for the toolchains, dependency caches and build output. Do not commit the cache, binaries or `dist/`. `-Jobs` on Windows or `MAUTRIX_WHATSAPP_CALL_BUILD_JOBS` on Linux can reduce parallelism if memory is limited.
 
-Do not skip release tests. The Go release build disables Git/VCS stamping and performs Go operations in a temporary source copy so the checked-in source checksums remain unchanged (the fixes present in the initial public release). If an older checkout fails with `error obtaining VCS status: exit status 128` or changes tracked Go module files, update to the corrected release commit; do not disable source verification or blindly recalculate its hashes. Check `git status` before and after building. Review local changes before restoring any files.
+Release builds run the tests and use a verified source snapshot. Check `git status` before building.
 
 The build produces a timestamped Linux AMD64 ZIP and sibling checksum under `dist/`. The CI `source-check` workflow is a source/fixture check, not a full RTC release build or live-media test. Perform the full local build and runtime acceptance before publishing.
 
@@ -40,12 +40,12 @@ Write-Host $Release.FullName
 if ($Actual -ne $Expected) { throw "Runtime checksum mismatch" }
 ```
 
-In Linux/WSL, `bash build/verify-package.sh /path/to/runtime.zip` checks the exact allowed file inventory, complete internal manifest, matching binary copies, AMD64 ELF headers, executable modes and ZIP paths. The runtime packager never copies generated state or unknown local files into the archive. The source packager requires a clean committed tree. Checksums detect corruption; they do not authenticate an untrusted release publisher. Test that exact verified artifact on a compatible deployment and record the results using the [acceptance checklist](../deployment/mautrix-whatsapp-call/OPERATIONS.md#5-live-acceptance-checklist-for-every-deployment-or-dependency-update).
+In Linux/WSL, `bash build/verify-package.sh /path/to/runtime.zip` checks the exact allowed file inventory, complete internal manifest, matching binary copies, the mandatory format-2 build record, AMD64 ELF headers, executable modes and ZIP paths. The runtime packager never copies generated state or unknown local files into the archive. The source packager requires a clean committed tree. The build record binds the release binaries and source versions to the source snapshot and all required successful test/build log hashes. Before publication the builder rechecks the original checkout, snapshot, binaries and retained logs; the ZIP includes the record, not the potentially sensitive logs. Keep the private build directory for later comparison. Both checksums and the record are local integrity evidence, not independent attestation or authentication of an untrusted publisher. Older runtime packages without this record require the matching older verifier or a full rebuild. Test that exact verified artifact on a compatible deployment and record the results using the [acceptance checklist](../deployment/mautrix-whatsapp-call/OPERATIONS.md#5-live-acceptance-checklist-for-every-deployment-or-dependency-update).
 
 Publish the two runtime assets together using the GitHub release UI or GitHub CLI. For example, after committing the intended source revision and authenticating `gh`, use a **new** release tag (substitute the real version and tested source commit):
 
 ```powershell
-$Tag = "v0.1.1"
+$Tag = "vX.Y.Z"
 $Commit = (git rev-parse HEAD).Trim()
 gh release create $Tag $Release.FullName $Checksum `
     --repo "BERNARDO31P/mautrix-whatsapp-call" `
@@ -56,4 +56,4 @@ gh release create $Tag $Release.FullName $Checksum `
 
 Use the commit that actually produced the runtime, and ensure it exists on the remote. The sample tag is illustrative; do not recreate or overwrite an existing release. Attach the actual build output, not GitHub's automatic source archive. Release notes should mention the architecture, dependency versions, tested clients, changes, migration requirements and known limitations. Verify the public release page and downloadable assets. The stable entry point is <https://github.com/BERNARDO31P/mautrix-whatsapp-call/releases/latest>.
 
-Documentation-only changes do not require a new binary build or replacement of existing release assets. Commit/push the Markdown changes; the new guides in `deployment/mautrix-whatsapp-call/` will be packaged automatically by subsequent runtime builds. An existing published ZIP is immutable unless explicitly replaced; its manifest covers the files that were shipped with it.
+Changes to documentation outside the build input manifest do not require recompilation. Deployment documentation is packaged and included in the build input digest. Keep published archives and checksums unchanged.

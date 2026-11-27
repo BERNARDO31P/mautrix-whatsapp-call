@@ -201,6 +201,18 @@ fn a_key_of_an_extra_type_is_read_by_its_rooms_dialect() {
     assert!(parse_key_message(|_| None, message).is_none());
 }
 
+#[test]
+fn direct_key_parsing_rejects_oversized_envelopes_before_dialect_lookup() {
+    let message = ToDeviceMessageIn {
+        sender: BOB.to_owned(),
+        event_type: EXTRA_KEY.to_owned(),
+        content: json!({ "room_id": ROOM, "ignored": "x".repeat(MAX_QUEUED_TO_DEVICE_KEY_BYTES) }),
+        encryption: EventEncryption::Cleartext,
+    };
+    assert!(parse_key_message(|_| panic!("oversized envelope reached dialect lookup"), message.clone()).is_none());
+    assert!(parse_msc_key(&message).is_none());
+}
+
 #[tokio::test]
 async fn a_membership_set_waits_for_the_room_state_and_then_seeds() {
     let harness = Harness::attach().await;
@@ -422,6 +434,100 @@ async fn the_to_device_feeder_subscribes_to_the_spec_and_extra_key_types() {
     );
 }
 
+#[tokio::test]
+async fn to_device_queue_is_bounded_and_stop_bypasses_backlog() {
+    let mock = Arc::new(MockBackend::new());
+    let registry: RoomRegistry<BaseRtcRoom<MockBackend>> = RoomRegistry::default();
+    let manager = Arc::new(Mutex::new(BaseRtcRoom::with_backend(ROOM, mock.clone())));
+    registry.register(ROOM, Arc::new(MembershipFormat::Msc), &manager).unwrap();
+    let (feeder, run) = ToDeviceFeeder::start(mock.clone(), registry, Vec::new())
+        .await.expect("start");
+    let subscription = mock.to_device_subscription().unwrap();
+    let message = |event_type: &str| ToDeviceMessageIn {
+        sender: BOB.to_owned(),
+        event_type: event_type.to_owned(),
+        content: json!({ "room_id": ROOM }),
+        encryption: EventEncryption::Cleartext,
+    };
+    subscription.sink.on_to_device_message(message("unrelated"));
+    assert_eq!(run.rx.len(), 0);
+    let mut unknown = message(KEY_MESSAGE_TYPE);
+    unknown.content["room_id"] = json!("!unknown:example.org");
+    subscription.sink.on_to_device_message(unknown);
+    assert_eq!(run.rx.len(), 0);
+    let mut oversized = message(KEY_MESSAGE_TYPE);
+    oversized.content["ignored"] = json!("x".repeat(MAX_QUEUED_TO_DEVICE_KEY_BYTES));
+    subscription.sink.on_to_device_message(oversized);
+    assert_eq!(run.rx.len(), 0);
+    let mut oversized = message(KEY_MESSAGE_TYPE);
+    oversized.sender = "x".repeat(MAX_QUEUED_TO_DEVICE_KEY_BYTES);
+    subscription.sink.on_to_device_message(oversized);
+    assert_eq!(run.rx.len(), 0);
+    for _ in 0..MAX_QUEUED_TO_DEVICE_KEYS + 10 {
+        subscription.sink.on_to_device_message(message(KEY_MESSAGE_TYPE));
+    }
+    assert_eq!(run.rx.len(), MAX_QUEUED_TO_DEVICE_KEYS);
+    drop(feeder);
+    assert!(*run.stopped.borrow());
+    tokio::time::timeout(Duration::from_secs(1), run.run())
+        .await.expect("stop must bypass the backlog");
+}
+
+#[tokio::test]
+async fn queued_key_generation_is_not_reused_on_room_reopen() {
+    let mock = Arc::new(MockBackend::new());
+    let registry: RoomRegistry<BaseRtcRoom<MockBackend>> = RoomRegistry::default();
+    let manager = Arc::new(Mutex::new(BaseRtcRoom::with_backend(ROOM, mock.clone())));
+    registry.register(ROOM, Arc::new(MembershipFormat::Msc), &manager).unwrap();
+    let (_feeder, mut run) = ToDeviceFeeder::start(mock.clone(), registry.clone(), Vec::new())
+        .await.unwrap();
+    let subscription = mock.to_device_subscription().unwrap();
+    let message = || ToDeviceMessageIn {
+        sender: BOB.to_owned(),
+        event_type: KEY_MESSAGE_TYPE.to_owned(),
+        content: json!({ "room_id": ROOM }),
+        encryption: EventEncryption::Cleartext,
+    };
+    subscription.sink.on_to_device_message(message());
+    let old = run.rx.try_recv().unwrap();
+    assert!(registry.room_for_generation(ROOM, &old.generation).is_some());
+    registry.unregister(ROOM);
+    subscription.sink.on_to_device_message(message());
+    assert!(run.rx.try_recv().is_err());
+    // Even reusing the same application handle is a new registration.
+    registry.register(ROOM, Arc::new(MembershipFormat::Msc), &manager).unwrap();
+    assert!(registry.room_for_generation(ROOM, &old.generation).is_none());
+    subscription.sink.on_to_device_message(message());
+    let new = run.rx.try_recv().unwrap();
+    assert!(registry.room_for_generation(ROOM, &new.generation).is_some());
+    drop(manager);
+    assert!(registry.room_for_generation(ROOM, &new.generation).is_none());
+    subscription.sink.on_to_device_message(message());
+    assert!(run.rx.try_recv().is_err());
+}
+
+#[test]
+fn key_envelope_budget_counts_metadata_and_json_escaping() {
+    let mut message = ToDeviceMessageIn {
+        sender: BOB.to_owned(),
+        event_type: KEY_MESSAGE_TYPE.to_owned(),
+        content: json!({ "room_id": ROOM, "extra": "" }),
+        encryption: EventEncryption::encrypted(Some("DEVICE".to_owned()), Some(true)),
+    };
+    let overhead = serde_json::to_vec(&message).unwrap().len();
+    let remaining = MAX_QUEUED_TO_DEVICE_KEY_BYTES - overhead;
+    message.content["extra"] = json!("a".repeat(remaining));
+    assert!(key_message_fits_queue(&message));
+    message.content["extra"] = json!("a".repeat(remaining + 1));
+    assert!(!key_message_fits_queue(&message));
+    message.content["extra"] = json!("\n".repeat(remaining));
+    assert!(!key_message_fits_queue(&message));
+    message.content["extra"] = json!("");
+    message.encryption = EventEncryption::encrypted(
+        Some("D".repeat(MAX_QUEUED_TO_DEVICE_KEY_BYTES)), Some(true));
+    assert!(!key_message_fits_queue(&message));
+}
+
 #[test]
 fn key_origin_treats_an_unreported_confirmation_as_unconfirmed() {
     let origin = key_origin(&EventEncryption::encrypted(Some("D".to_owned()), None), BOB);
@@ -558,18 +664,274 @@ async fn an_application_gets_its_sticky_types_before_the_set_is_narrowed() {
 
 #[tokio::test]
 async fn room_snapshot_is_one_feeder_input() {
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let sink = ChannelRoomSink { tx };
+    let (tx, mut rx) = mpsc::channel(ROOM_INPUT_CAPACITY);
+    let (stop, _) = watch::channel(false);
+    let sink = ChannelRoomSink::new(tx, stop);
     sink.on_room_snapshot(true, vec![
         ("org.matrix.msc3401.call.member".to_owned(), vec![]),
         ("m.call.member".to_owned(), vec![]),
     ], vec![ME.to_owned(), BOB.to_owned()], vec![]);
-    let Some(RoomInput::Snapshot(encrypted, subjects, members, sticky)) = rx.recv().await else {
+    let Some(RoomInput::Snapshot(snapshot)) = rx.recv().await else {
         panic!("a full state response must be delivered as one feeder input");
     };
-    assert!(encrypted);
-    assert_eq!(subjects.len(), 2);
-    assert_eq!(members.len(), 2);
-    assert!(sticky.is_empty());
+    assert!(snapshot.encrypted);
+    assert_eq!(snapshot.state.len(), 2);
+    assert_eq!(snapshot.members.len(), 2);
+    assert!(snapshot.sticky.is_empty());
     assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+}
+
+#[tokio::test]
+async fn a_combined_snapshot_switches_slot_alias_without_auto_leave() {
+    use crate::{JoinSessionParams, LiveKitTransport, RtcTransport};
+    const MARKER: &str = "m.call#marker";
+    for (previous, next) in [
+        (SLOT_EVENT_TYPE, UNSTABLE_SLOT_EVENT_TYPE),
+        (UNSTABLE_SLOT_EVENT_TYPE, SLOT_EVENT_TYPE),
+    ] {
+        let harness = Harness::attach().await;
+        let sink = harness.sink();
+        let members = || vec![ME.to_owned(), BOB.to_owned()];
+        sink.on_room_snapshot(false, vec![
+            (previous.to_owned(), vec![slot(previous, "open")]),
+            (next.to_owned(), vec![]),
+        ], members(), vec![]);
+        tokio::time::timeout(Duration::from_secs(2), harness.attachment.seeded())
+            .await.expect("initial snapshot applied");
+        let (own, mut leaves) = {
+            let mut room = harness.manager.lock().await;
+            room.join(JoinSessionParams::application("m.call").transport(
+                RtcTransport::LiveKit(LiveKitTransport::sfu("wss://sfu.example.org")),
+            )).await.expect("join open slot");
+            (room.own_member_id(SLOT).expect("own membership"),
+             room.subscribe_auto_leaves(SLOT).expect("leave subscription"))
+        };
+        let marker = EventIn { state_key: Some(MARKER.to_owned()), ..slot(next, "open") };
+        // Removal is delivered first, which used to close the slot before the
+        // second alias arrived. The marker proves the new set was published.
+        sink.on_room_snapshot(false, vec![
+            (previous.to_owned(), vec![]),
+            (next.to_owned(), vec![slot(next, "open"), marker]),
+        ], members(), vec![]);
+        harness.wait_until(|| async {
+            harness.manager.lock().await.slot_state(MARKER).is_some_and(|s| s.is_open())
+        }).await;
+        assert_eq!(harness.manager.lock().await.own_member_id(SLOT), Some(own));
+        assert!(matches!(leaves.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
+
+        // A genuine removal of both aliases must still cause an automatic leave.
+        sink.on_room_snapshot(false, vec![
+            (previous.to_owned(), vec![]), (next.to_owned(), vec![]),
+        ], members(), vec![]);
+        tokio::time::timeout(Duration::from_secs(2), leaves.recv())
+            .await.expect("actual removal triggers leave").expect("leave event");
+        assert!(harness.manager.lock().await.own_member_id(SLOT).is_none());
+    }
+}
+
+#[tokio::test]
+async fn queued_equal_snapshots_do_not_accumulate_or_cross_events() {
+    let (tx, mut rx) = mpsc::channel(ROOM_INPUT_CAPACITY);
+    let (stop, _) = watch::channel(false);
+    let sink = ChannelRoomSink::new(tx, stop);
+    let emit = |joined: bool| {
+        let mut members = vec![ME.to_owned()];
+        if joined { members.push(BOB.to_owned()); }
+        sink.on_room_snapshot(false, vec![], members, vec![]);
+    };
+    for _ in 0..1000 { emit(true); }
+    emit(false); // Preserve an actual membership transition.
+    emit(true);
+    sink.on_redaction("$redaction".to_owned());
+    emit(true); // Do not deduplicate across an ordered event.
+    for expected in [2, 1, 2] {
+        let Some(RoomInput::Snapshot(snapshot)) = rx.recv().await else { panic!("snapshot expected"); };
+        assert_eq!(snapshot.members.len(), expected);
+    }
+    assert!(matches!(rx.recv().await, Some(RoomInput::Redaction(_))));
+    assert!(matches!(rx.recv().await, Some(RoomInput::Snapshot(_))));
+    assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    // Once consumed, a repeat can trigger a failed-application retry.
+    emit(true);
+    assert!(matches!(rx.try_recv(), Ok(RoomInput::Snapshot(_))));
+}
+
+#[tokio::test]
+async fn detach_discards_backlog_even_if_feeder_has_not_started() {
+    let mock = Arc::new(MockBackend::new());
+    let manager = Arc::new(Mutex::new(BaseRtcRoom::with_backend(ROOM, mock.clone())));
+    let (attachment, run) = RoomFeeder::attach(mock.clone(), manager.clone(), Arc::new(MembershipFormat::Msc))
+        .await.expect("attach");
+    let subscription = mock.room_subscription(ROOM).expect("subscription");
+    let sink = subscription.sink.clone();
+    for i in 0..128 {
+        sink.on_room_snapshot(false, vec![(SLOT_EVENT_TYPE.to_owned(), vec![open_slot()])],
+            vec![ME.to_owned(), BOB.to_owned()],
+            vec![member_event(BOB, "bob-1", &format!("$m{i}"))]);
+    }
+    drop(attachment);
+    assert!(subscription.cancelled.load(Ordering::SeqCst));
+    // Holding the room lock proves no queued mutation is attempted.
+    let guard = manager.lock().await;
+    tokio::time::timeout(Duration::from_secs(1), run.run()).await
+        .expect("detached feeder must exit without processing the backlog");
+    drop(guard);
+}
+
+#[tokio::test]
+async fn detach_wakes_an_idle_feeder() {
+    let mock = Arc::new(MockBackend::new());
+    let manager = Arc::new(Mutex::new(BaseRtcRoom::with_backend(ROOM, mock.clone())));
+    let (attachment, run) = RoomFeeder::attach(mock, manager, Arc::new(MembershipFormat::Msc))
+        .await.expect("attach");
+    let task = tokio::spawn(run.run());
+    tokio::task::yield_now().await;
+    drop(attachment);
+    tokio::time::timeout(Duration::from_secs(1), task).await
+        .expect("stop must wake an idle feeder").expect("feeder task");
+}
+
+#[tokio::test]
+async fn detach_wakes_seeded_feeder_waiting_for_room_lock() {
+    let mock = Arc::new(MockBackend::new());
+    let manager = Arc::new(Mutex::new(BaseRtcRoom::with_backend(ROOM, mock.clone())));
+    let (attachment, run) = RoomFeeder::attach(mock, manager.clone(), Arc::new(MembershipFormat::Msc))
+        .await.expect("attach");
+    run.seeded.send_replace(true);
+    let guard = manager.lock().await;
+    let task = tokio::spawn(run.run());
+    tokio::task::yield_now().await;
+    drop(attachment);
+    tokio::time::timeout(Duration::from_secs(1), task).await
+        .expect("stop must interrupt the initial room-lock wait").expect("feeder task");
+    drop(guard);
+}
+
+#[tokio::test]
+async fn room_queue_overflow_invalidates_and_stops_admission() {
+    let (tx, mut rx) = mpsc::channel(2);
+    let (stop, stopped) = watch::channel(false);
+    let sink = ChannelRoomSink::new(tx, stop);
+    sink.on_redaction("$one".to_owned());
+    sink.on_redaction("$two".to_owned());
+    assert!(!*stopped.borrow());
+    sink.on_redaction("$overflow".to_owned());
+    assert!(*stopped.borrow());
+    assert!(matches!(rx.try_recv(), Ok(RoomInput::Redaction(id)) if id == "$one"));
+    // Freed capacity must not resume admission after loss of an ordered event.
+    sink.on_redaction("$late".to_owned());
+    assert!(matches!(rx.try_recv(), Ok(RoomInput::Redaction(id)) if id == "$two"));
+    assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+}
+
+#[tokio::test]
+async fn overflow_invalidates_previously_seeded_room_without_waiting_for_consumer() {
+    let mock = Arc::new(MockBackend::new());
+    let manager = Arc::new(Mutex::new(BaseRtcRoom::with_backend(ROOM, mock.clone())));
+    let (attachment, run) = RoomFeeder::attach(mock.clone(), manager.clone(), Arc::new(MembershipFormat::Msc))
+        .await.expect("attach");
+    run.seeded.send_replace(true);
+    assert!(attachment.is_seeded());
+    let subscription = mock.room_subscription(ROOM).expect("subscription");
+    for i in 0..=ROOM_INPUT_CAPACITY {
+        subscription.sink.on_redaction(format!("$event{i}"));
+    }
+    assert!(!attachment.is_seeded());
+    tokio::time::timeout(Duration::from_secs(1), attachment.seeded()).await
+        .expect("failed feed must not block seeding waiters");
+    let guard = manager.lock().await;
+    tokio::time::timeout(Duration::from_secs(1), run.run()).await
+        .expect("overflow must stop before applying any queued mutation");
+    assert!(subscription.cancelled.load(Ordering::SeqCst));
+    drop(guard);
+}
+
+#[tokio::test]
+async fn failed_snapshot_invalidates_readiness_until_fresh_apply() {
+    let harness = Harness::attach().await;
+    let sink = harness.sink();
+    let emit = || sink.on_room_snapshot(false,
+        vec![(SLOT_EVENT_TYPE.to_owned(), vec![open_slot()])],
+        vec![ME.to_owned(), BOB.to_owned()], vec![]);
+    emit();
+    tokio::time::timeout(Duration::from_secs(2), harness.attachment.seeded()).await.unwrap();
+    assert!(harness.attachment.is_seeded());
+    sink.on_room_snapshot_failed();
+    assert!(!harness.attachment.is_seeded());
+    // The last known slot is retained, not interpreted as a withdrawal.
+    assert!(harness.manager.lock().await.slot_state(SLOT).is_some_and(|s| s.is_open()));
+    assert!(tokio::time::timeout(Duration::from_millis(10), harness.attachment.seeded()).await.is_err());
+    emit();
+    tokio::time::timeout(Duration::from_secs(2), harness.attachment.seeded()).await.unwrap();
+    assert!(harness.attachment.is_seeded());
+}
+
+#[tokio::test]
+async fn queued_snapshot_cannot_restore_readiness_after_a_newer_failure() {
+    let (tx, mut rx) = mpsc::channel(ROOM_INPUT_CAPACITY);
+    let (stop, _) = watch::channel(false);
+    let sink = ChannelRoomSink::new(tx, stop);
+    let emit = || sink.on_room_snapshot(false, vec![], vec![ME.to_owned()], vec![]);
+    emit();
+    sink.on_room_snapshot_failed();
+    emit(); // The same payload must not deduplicate across failure generations.
+    let Some(RoomInput::Snapshot(old)) = rx.recv().await else { panic!("old snapshot missing"); };
+    let Some(RoomInput::Snapshot(new)) = rx.recv().await else { panic!("fresh snapshot missing"); };
+    assert_ne!(old.generation, new.generation);
+    recover_snapshot(&sink.health, old.generation);
+    assert!(!sink.health.borrow().fresh);
+    recover_snapshot(&sink.health, new.generation);
+    assert!(sink.health.borrow().fresh);
+    sink.on_room_snapshot_failed();
+    recover_snapshot(&sink.health, new.generation);
+    assert!(!sink.health.borrow().fresh);
+}
+
+#[tokio::test]
+async fn oversized_room_input_permanently_invalidates_feed() {
+    let (tx, mut rx) = mpsc::channel(ROOM_INPUT_CAPACITY);
+    let (stop, stopped) = watch::channel(false);
+    let sink = ChannelRoomSink::new(tx, stop);
+    let mut event = open_slot();
+    event.content = json!({"ignored": "x".repeat(MAX_ROOM_INPUT_BYTES)});
+    sink.on_room_snapshot(false, vec![(SLOT_EVENT_TYPE.to_owned(), vec![event])],
+        vec![ME.to_owned()], vec![]);
+    assert!(*stopped.borrow());
+    sink.on_encryption(false);
+    assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+}
+
+#[test]
+fn room_input_budget_includes_all_snapshot_collections_and_metadata() {
+    let event = open_slot();
+    assert!(RoomInput::Sticky(vec![event.clone()]).fits_queue());
+    assert!(!RoomInput::Members(vec![String::new(); MAX_ROOM_INPUT_ENTRIES + 1]).fits_queue());
+    assert!(!RoomInput::State("x".repeat(MAX_ROOM_INPUT_BYTES), vec![]).fits_queue());
+    assert!(!RoomInput::Snapshot(Arc::new(RoomSnapshot {
+        generation: 0, encrypted: false,
+        state: vec![(SLOT_EVENT_TYPE.to_owned(), vec![event])],
+        members: vec![String::new(); MAX_ROOM_INPUT_ENTRIES - 1], sticky: vec![],
+    })).fits_queue());
+}
+
+#[tokio::test]
+async fn snapshot_invalidated_before_run_does_not_apply_old_slot() {
+    let mock = Arc::new(MockBackend::new());
+    let manager = Arc::new(Mutex::new(BaseRtcRoom::with_backend(ROOM, mock.clone())));
+    let (attachment, run) = RoomFeeder::attach(mock.clone(), manager.clone(), Arc::new(MembershipFormat::Msc))
+        .await.expect("attach");
+    let sink = mock.room_subscription(ROOM).expect("subscription").sink.clone();
+    sink.on_room_snapshot(false, vec![(SLOT_EVENT_TYPE.to_owned(), vec![open_slot()])],
+        vec![ME.to_owned(), BOB.to_owned()], vec![]);
+    sink.on_room_snapshot_failed();
+    let task = tokio::spawn(run.run());
+    assert!(tokio::time::timeout(Duration::from_millis(30), attachment.seeded()).await.is_err());
+    assert!(!manager.lock().await.slot_state(SLOT).is_some_and(|s| s.is_open()));
+    sink.on_room_snapshot(false, vec![(SLOT_EVENT_TYPE.to_owned(), vec![open_slot()])],
+        vec![ME.to_owned()], vec![]);
+    tokio::time::timeout(Duration::from_secs(2), attachment.seeded()).await.unwrap();
+    assert!(attachment.is_seeded());
+    assert!(manager.lock().await.slot_state(SLOT).is_some_and(|s| s.is_open()));
+    drop(attachment);
+    task.await.unwrap();
 }

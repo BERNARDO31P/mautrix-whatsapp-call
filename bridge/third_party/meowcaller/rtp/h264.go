@@ -159,11 +159,12 @@ func annexBStartCodeLen(data []byte, offset int) int {
 // H264Depacketizer reassembles H.264 NAL units from RFC 6184 RTP payloads (single NAL,
 // STAP-A, FU-A), carrying FU-A fragment state across packets.
 type H264Depacketizer struct {
-	fuBuf    []byte
-	fuType   byte
-	fuNriF   byte
-	fuActive bool
-	overflow bool
+	fuBuf     []byte
+	fuType    byte
+	fuNriF    byte
+	fuActive  bool
+	overflow  bool
+	malformed bool
 }
 
 // H264AccessUnitAssembler reconstructs complete Annex-B access units while
@@ -173,39 +174,64 @@ type H264AccessUnitAssembler struct {
 	accessUnit     []byte
 	expectedSeq    uint16
 	hasSequence    bool
+	timestamp      uint32
+	unitOpen       bool
 	keyframeNeeded bool
+	damagedUnit    bool
+}
+
+// NeedsKeyframe reports persistent recovery state, not just the transition
+// into recovery. The packet consumer can retry throttled or lost feedback
+// until a complete IDR restores decoder state.
+func (a *H264AccessUnitAssembler) NeedsKeyframe() bool {
+	return a.keyframeNeeded
+}
+
+// RequireKeyframe closes the decoder gate at an access-unit boundary. Callers
+// use it before the first packet or after an access unit was not delivered.
+func (a *H264AccessUnitAssembler) RequireKeyframe() {
+	a.keyframeNeeded = true
 }
 
 // Push consumes one ordered RTP payload and returns a complete, decodable access
 // unit when the marker closes the frame.
-func (a *H264AccessUnitAssembler) Push(sequence uint16, marker bool, payload []byte) ([]byte, bool, bool) {
+func (a *H264AccessUnitAssembler) Push(sequence uint16, timestamp uint32, marker bool, payload []byte) ([]byte, bool, bool) {
 	// Source of truth: https://github.com/JotaDev66/WaCalls/blob/2d6a1f666426049a89ef9541414e771acdcf8a16/internal/voip/transport/h264_packet.go#L138-L210
 	recoveryNeeded := false
-	if a.hasSequence && sequence != a.expectedSeq {
-		recoveryNeeded = !a.keyframeNeeded
-		a.depacketizer = H264Depacketizer{}
-		a.accessUnit = nil
-		a.keyframeNeeded = true
-	}
-	a.hasSequence = true
-	a.expectedSeq = sequence + 1
-
-	for _, nalu := range a.depacketizer.Depacketize(payload) {
-		if len(a.accessUnit)+4+len(nalu) > maxAccessUnitBytes {
-			recoveryNeeded = recoveryNeeded || !a.keyframeNeeded
-			a.depacketizer = H264Depacketizer{}
-			a.accessUnit = nil
-			a.keyframeNeeded = true
-			break
-		}
-		a.accessUnit = append(a.accessUnit, 0x00, 0x00, 0x00, 0x01)
-		a.accessUnit = append(a.accessUnit, nalu...)
-	}
-	if a.depacketizer.overflow {
+	invalidate := func() {
 		recoveryNeeded = recoveryNeeded || !a.keyframeNeeded
 		a.depacketizer = H264Depacketizer{}
 		a.accessUnit = nil
 		a.keyframeNeeded = true
+		a.damagedUnit = true
+	}
+	// A timestamp change closes the old access unit even if its marker was
+	// lost. Never combine NALs or FU fragments across that boundary. A gap
+	// still invalidates the new unit because its first packets may be missing.
+	if a.unitOpen && timestamp != a.timestamp {
+		invalidate()
+		a.damagedUnit = false
+	}
+	a.timestamp = timestamp
+	a.unitOpen = !marker
+	if a.hasSequence && sequence != a.expectedSeq {
+		invalidate()
+	}
+	a.hasSequence = true
+	a.expectedSeq = sequence + 1
+
+	if !a.damagedUnit {
+		for _, nalu := range a.depacketizer.Depacketize(payload) {
+			if len(a.accessUnit)+4+len(nalu) > maxAccessUnitBytes {
+				invalidate()
+				break
+			}
+			a.accessUnit = append(a.accessUnit, 0, 0, 0, 1)
+			a.accessUnit = append(a.accessUnit, nalu...)
+		}
+		if a.depacketizer.overflow || a.depacketizer.malformed || (marker && a.depacketizer.fuActive) {
+			invalidate()
+		}
 	}
 	if !marker {
 		return nil, false, recoveryNeeded
@@ -214,6 +240,10 @@ func (a *H264AccessUnitAssembler) Push(sequence uint16, marker bool, payload []b
 	accessUnit := a.accessUnit
 	a.accessUnit = nil
 	a.depacketizer = H264Depacketizer{}
+	if a.damagedUnit {
+		a.damagedUnit = false
+		return nil, false, recoveryNeeded
+	}
 	if len(accessUnit) == 0 {
 		return nil, false, recoveryNeeded
 	}
@@ -222,6 +252,7 @@ func (a *H264AccessUnitAssembler) Push(sequence uint16, marker bool, payload []b
 			return nil, false, recoveryNeeded
 		}
 		a.keyframeNeeded = false
+		recoveryNeeded = false // A complete IDR already restored decoder state.
 	}
 	return accessUnit, true, recoveryNeeded
 }
@@ -230,40 +261,54 @@ func (a *H264AccessUnitAssembler) Push(sequence uint16, marker bool, payload []b
 // mid-fragment, one for single/FU-A completion, many for STAP-A).
 func (d *H264Depacketizer) Depacketize(payload []byte) [][]byte {
 	// Source of truth: https://github.com/JotaDev66/WaCalls/blob/2d6a1f666426049a89ef9541414e771acdcf8a16/internal/voip/transport/h264_packet.go#L138-L210
-	if len(payload) < 1 {
+	d.malformed = false
+	d.overflow = false
+	invalid := func() [][]byte {
+		d.fuActive = false
+		d.fuBuf = nil
+		d.malformed = true
 		return nil
+	}
+	if len(payload) < 1 || len(payload) > maxAccessUnitBytes {
+		return invalid()
 	}
 	naluType := payload[0] & 0x1F
 	fbitAndNri := payload[0] & 0xE0
 
 	switch {
 	case naluType >= 1 && naluType <= 23:
-		d.fuActive = false
+		if d.fuActive {
+			return invalid()
+		}
 		out := make([]byte, len(payload))
 		copy(out, payload)
 		return [][]byte{out}
 
 	case naluType == h264StapAType:
-		d.fuActive = false
+		if d.fuActive {
+			return invalid()
+		}
 		body := payload[1:]
 		var out [][]byte
 		for len(body) >= 2 {
 			size := int(body[0])<<8 | int(body[1])
 			body = body[2:]
-			if size <= 0 || size > len(body) {
-				return out
+			if size <= 0 || size > len(body) || body[0]&0x1f == 0 || body[0]&0x1f > 23 {
+				return invalid()
 			}
 			nalu := make([]byte, size)
 			copy(nalu, body[:size])
 			out = append(out, nalu)
 			body = body[size:]
 		}
+		if len(body) != 0 || len(out) == 0 {
+			return invalid()
+		}
 		return out
 
 	case naluType == h264FuaType:
 		if len(payload) < 2 {
-			d.fuActive = false
-			return nil
+			return invalid()
 		}
 		fuHeader := payload[1]
 		startBit := fuHeader & 0x80
@@ -271,7 +316,13 @@ func (d *H264Depacketizer) Depacketize(payload []byte) [][]byte {
 		origType := fuHeader & 0x1F
 		body := payload[2:]
 
+		if origType == 0 || origType > 23 || (startBit != 0 && endBit != 0) {
+			return invalid()
+		}
 		if startBit != 0 {
+			if d.fuActive {
+				return invalid()
+			}
 			if 1+len(body) > maxFuReassemblyBytes {
 				d.fuActive = false
 				d.fuBuf = d.fuBuf[:0]
@@ -284,6 +335,9 @@ func (d *H264Depacketizer) Depacketize(payload []byte) [][]byte {
 			d.fuBuf = append(d.fuBuf[:0], fbitAndNri|origType)
 			d.fuBuf = append(d.fuBuf, body...)
 		} else if d.fuActive {
+			if origType != d.fuType || fbitAndNri != d.fuNriF {
+				return invalid()
+			}
 			if len(d.fuBuf)+len(body) > maxFuReassemblyBytes {
 				d.fuActive = false
 				d.fuBuf = d.fuBuf[:0]
@@ -292,7 +346,7 @@ func (d *H264Depacketizer) Depacketize(payload []byte) [][]byte {
 			}
 			d.fuBuf = append(d.fuBuf, body...)
 		} else {
-			return nil
+			return invalid()
 		}
 
 		if endBit != 0 && d.fuActive {
@@ -305,7 +359,6 @@ func (d *H264Depacketizer) Depacketize(payload []byte) [][]byte {
 		return nil
 
 	default:
-		d.fuActive = false
-		return nil
+		return invalid()
 	}
 }

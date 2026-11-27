@@ -48,6 +48,8 @@ type VideoState struct {
 	Active bool
 	// Upgrade reports a mid-call audio→video upgrade (state == 11).
 	Upgrade bool
+	// UpgradeGeneration identifies the pending peer request within this call.
+	UpgradeGeneration uint64
 	// Orientation is the peer's device orientation (0..3); rotate the rendered video by
 	// Orientation × 90° to display upright.
 	Orientation int
@@ -58,6 +60,7 @@ type VideoState struct {
 // ParticipantVideoFrame is one authenticated H.264 access unit attributed to a
 // participant device. AccessUnit is owned by the callback and may be retained.
 type ParticipantVideoFrame struct {
+	Epoch           ParticipantMediaEpoch
 	ParticipantID   string
 	Sender          types.JID
 	Device          types.JID
@@ -67,7 +70,10 @@ type ParticipantVideoFrame struct {
 	Timestamp       uint32
 	RequestKeyframe func()
 	Orientation     int
-	AccessUnit      []byte
+	// ScreenShare marks the signalled primary-video role, not a second RTP stream.
+	ScreenShare  bool
+	RoleRevision uint64
+	AccessUnit   []byte
 }
 
 func cloneParticipantVideoFrame(frame ParticipantVideoFrame) ParticipantVideoFrame {

@@ -18,7 +18,7 @@ description = "How MatrixRTC media flows: the transport contract, frames, constr
 matrix-rtc-core = { path = "../matrix-rtc-core" }
 # Sync primitives only (the connection event channel); timers go through
 # `matrix_rtc_core::executor`.
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }
 # `BoxStream`/`LocalBoxStream` for the frame streams handed out by
 # `RemoteTrackHandle`. Only the type is needed here; combinators stay in the
 # transport implementations.
@@ -31,6 +31,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
 base64 = "0.22"
+url = "2.5"
 
 [features]
 # `testing::ScriptedTransport`: a transport whose connections a test scripts,

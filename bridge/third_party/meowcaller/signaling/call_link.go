@@ -45,6 +45,7 @@ type CallLinkJoin struct {
 	InWaitingRoom      bool
 	IsAdmin            bool
 	Group              *GroupCallUpdate
+	Waiting            *WaitingRoom
 }
 
 // WaitingRoom is one authoritative call-link waiting-room snapshot.
@@ -226,8 +227,13 @@ func ParseCallLinkQueryAck(node *waBinary.Node) (*CallLinkPreview, error) {
 		return nil, fmt.Errorf("signaling: parse link_query ACK: missing waiting_room")
 	}
 	wrAttrs := waitingRoom.AttrGetter()
-	preview.WaitingRoomEnabled = wrAttrs.OptionalString("enabled") == "1"
-	preview.IsAdmin = wrAttrs.OptionalString("is_admin") == "1"
+	enabled := wrAttrs.String("enabled")
+	admin := wrAttrs.String("is_admin")
+	if wrAttrs.Error() != nil || (enabled != "0" && enabled != "1") || (admin != "0" && admin != "1") {
+		return nil, fmt.Errorf("signaling: invalid link_query waiting-room state")
+	}
+	preview.WaitingRoomEnabled = enabled == "1"
+	preview.IsAdmin = admin == "1"
 	return preview, nil
 }
 
@@ -247,6 +253,7 @@ func ParseCallLinkJoinAck(node *waBinary.Node) (*CallLinkJoin, error) {
 		result.Token, result.Media = waiting.LinkToken, waiting.Media
 		result.CallID, result.CallCreator = waiting.CallID, waiting.CallCreator
 		result.WaitingRoomEnabled, result.IsAdmin = waiting.Enabled, waiting.IsAdmin
+		result.Waiting = waiting
 	}
 	group, hasGroup, err := ParseInitialGroupCallAck(node)
 	if err != nil {

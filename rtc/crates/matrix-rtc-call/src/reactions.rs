@@ -376,6 +376,9 @@ pub struct RaisedHand {
     pub member_id: String,
     /// The member's user id.
     pub sender: String,
+    /// Internal participation generation, not a host-facing DTO field.
+    #[serde(skip)]
+    pub membership_ts: Option<u64>,
     /// The `m.reaction` event that raised it — the one to redact to lower it,
     /// if it is ours.
     pub reaction_event_id: String,
@@ -401,6 +404,9 @@ pub struct ReceivedReaction {
     pub member_id: String,
     /// The reacting user.
     pub sender: String,
+    /// Internal participation generation, not a host-facing DTO field.
+    #[serde(skip)]
+    pub membership_ts: Option<u64>,
     /// The emoji to show: the catalogue's for a catalogue `name`, as Element
     /// Call shows, otherwise the first grapheme of what was sent.
     pub emoji: String,
@@ -561,6 +567,7 @@ pub(crate) struct ReactionsState {
     /// Every membership event id seen for each member of the roster, latest
     /// last. A reaction is validated against any of them.
     known_membership_events: HashMap<String, Vec<String>>,
+    membership_generations: HashMap<String, Option<u64>>,
     /// Membership event ids whose relations have been looked up (or asked
     /// for; a failed lookup is the host's to retry by asking again).
     relations_fetched: HashSet<String>,
@@ -590,6 +597,7 @@ impl ReactionsState {
             reactions_tx,
             last_reaction_at: HashMap::new(),
             known_membership_events: HashMap::new(),
+            membership_generations: HashMap::new(),
             relations_fetched: HashSet::new(),
             last_sent_ms: None,
             own_raised_hand: None,
@@ -643,8 +651,13 @@ impl ReactionsState {
     /// whose membership event moved on get the new id remembered, so a hand
     /// raised on the old one stays valid and a hand raised on the new one is
     /// accepted too. Publishes the hands if any were dropped.
-    pub(crate) fn sync_roster(&mut self, members: &[JoinedMembership]) {
-        let present: HashSet<&str> = members.iter().map(|m| m.member_id.as_str()).collect();
+    pub(crate) fn sync_roster(&mut self, previous: &[JoinedMembership], members: &[JoinedMembership]) {
+        let replaced: HashSet<&str> = members.iter().filter(|member| previous.iter().any(|old|
+            old.member_id == member.member_id && !old.same_participation(member)))
+            .map(|member| member.member_id.as_str()).collect();
+        let present: HashSet<&str> = members.iter().map(|m| m.member_id.as_str())
+            .filter(|id| !replaced.contains(id)).collect();
+        self.membership_generations = members.iter().map(|m| (m.member_id.clone(), m.membership_ts)).collect();
 
         let before = self.raised_hands.len();
         self.raised_hands
@@ -785,6 +798,7 @@ impl ReactionsState {
                 let _ = self.reactions_tx.send(ReceivedReaction {
                     member_id: member.member_id.clone(),
                     sender: member.sender.clone(),
+                    membership_ts: member.membership_ts,
                     emoji: reaction_kind(&name).map_or(emoji, |kind| kind.emoji.to_owned()),
                     sound: sound_for(&name),
                     name,
@@ -797,6 +811,7 @@ impl ReactionsState {
                 let hand = RaisedHand {
                     member_id: member.member_id.clone(),
                     sender: member.sender.clone(),
+                    membership_ts: member.membership_ts,
                     reaction_event_id: event.event_id.clone(),
                     raised_at_ms: event.origin_server_ts,
                     from_backfill: backfill,
@@ -1029,6 +1044,7 @@ impl ReactionsState {
         let wanted = self.hand_wanted.then(|| RaisedHand {
             member_id: own_member_id.to_owned(),
             sender: own_user_id.to_owned(),
+            membership_ts: self.membership_generations.get(own_member_id).copied().flatten(),
             reaction_event_id: self
                 .own_raised_hand
                 .as_ref()
@@ -1079,6 +1095,51 @@ mod tests {
             origin_server_ts: 1_000,
             content,
         }
+    }
+
+    #[test]
+    fn legacy_replacement_retires_hand_history_and_reaction_cooldown() {
+        let mut state = ReactionsState::new();
+        state.set_clock(Arc::new(|| 1_000));
+        let mut bob = JoinedMembership {
+            room_id: "!room:example.org".into(),
+            slot_id: "m.call#room".into(),
+            sender: "@bob:example.org".into(),
+            origin: EventOrigin::encrypted(Some("BOBDEV".into())),
+            sticky_key: "bob".into(),
+            member_id: "bob".into(),
+            membership_event_id: Some("$first".into()),
+            membership_ts: Some(100),
+            origin_server_ts: Some(100),
+            application: "m.call".into(),
+            transports: Vec::new(),
+            can_subscribe: Vec::new(),
+        };
+        let mut received = state.subscribe_reactions();
+        state.sync_roster(&[], std::slice::from_ref(&bob));
+        let hand = event(ANNOTATION_EVENT_TYPE, &bob.sender, build_raised_hand_content("$first"));
+        let reaction = event(REACTION_EVENT_TYPE, &bob.sender, build_reaction_content("$first", "👏", "clapping"));
+        state.ingest(&hand, std::slice::from_ref(&bob), false);
+        state.ingest(&reaction, std::slice::from_ref(&bob), false);
+        assert_eq!(state.raised_hands()[0].membership_ts, Some(100));
+        assert_eq!(received.try_recv().unwrap().membership_ts, Some(100));
+        let first = bob.clone();
+        bob.membership_event_id = Some("$refresh".into());
+        state.sync_roster(&[first], std::slice::from_ref(&bob));
+        assert_eq!(state.raised_hands().len(), 1);
+        assert!(state.resolve_target("$first", &hand, std::slice::from_ref(&bob)).is_some());
+        let refreshed = bob.clone();
+        bob.membership_ts = Some(500);
+        bob.membership_event_id = Some("$replacement".into());
+        state.sync_roster(&[refreshed], std::slice::from_ref(&bob));
+        assert!(state.raised_hands().is_empty());
+        state.ingest(&hand, std::slice::from_ref(&bob), true);
+        state.ingest(&reaction, std::slice::from_ref(&bob), false);
+        assert!(state.raised_hands().is_empty());
+        assert!(received.try_recv().is_err());
+        let fresh = event(REACTION_EVENT_TYPE, &bob.sender, build_reaction_content("$replacement", "👏", "clapping"));
+        state.ingest(&fresh, std::slice::from_ref(&bob), false);
+        assert_eq!(received.try_recv().unwrap().membership_ts, Some(500));
     }
 
     #[test]

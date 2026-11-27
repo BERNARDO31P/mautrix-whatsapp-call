@@ -3,6 +3,10 @@ set -euo pipefail
 
 curl() { command curl --connect-timeout 5 --max-time 30 "$@"; }
 
+portal_kind() {
+    python3 -B "$(dirname "${BASH_SOURCE[0]}")/worker/portal_kind.py" "$2" "$3" <<<"$1"
+}
+
 candidate_from_room_json() {
     local members_json="$1"
     local hints_json="$2"
@@ -173,10 +177,8 @@ while IFS= read -r ROOM; do
     jq -e --arg bot "$BOT_MXID" '.joined | has($bot)' <<<"$MEMBERS" >/dev/null || continue
     jq -e --arg bot "$BOT_MXID" '(.service_members // []) | index($bot) != null' <<<"$HINT_BODY" >/dev/null || continue
     STATE="$(curl -fsS "${AUTH[@]}" "$HS/_matrix/client/v3/rooms/$ROOM_ESC/state" 2>/dev/null)" || continue
-    jq -e --arg bot "$BOT_MXID" '
-      any(.[]; .type=="m.room.encryption" and .content.algorithm=="m.megolm.v1.aes-sha2")
-      and ([.[] | select((.type=="m.bridge" or .type=="uk.half-shot.bridge") and .sender==$bot and .content.bridgebot==$bot and .content.protocol.id=="whatsapp") | .content | if ((.["com.beeper.room_type.v2"] // .["com.beeper.room_type"])=="dm" and (.channel.id|test("@(s\\.whatsapp\\.net|lid|hosted|hosted\\.lid|bot)$"))) then "dm" else "other" end] | unique)==["dm"]
-    ' <<<"$STATE" >/dev/null || continue
+    jq -e 'any(.[]; .type=="m.room.encryption" and .content.algorithm=="m.megolm.v1.aes-sha2")' <<<"$STATE" >/dev/null || continue
+    [[ "$(portal_kind "$STATE" "$BOT_MXID" "$GHOST_REGEXES_JSON")" == dm ]] || continue
     CANDIDATE="$(candidate_from_room_json "$MEMBERS" "$HINT_BODY" "$USER_MXID" "$GHOST_REGEXES_JSON" 2>/dev/null || true)"
     [[ -n "$CANDIDATE" ]] || continue
 

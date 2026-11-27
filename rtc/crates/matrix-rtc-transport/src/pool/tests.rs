@@ -34,6 +34,7 @@ struct TransportState {
     reconnects: StdMutex<Vec<(tokio::time::Instant, bool)>>,
     /// Every connection key the own handle took over.
     takeovers: StdMutex<Vec<String>>,
+    handover_completions: StdMutex<std::collections::VecDeque<tokio::sync::oneshot::Receiver<Result<(), TransportError>>>>,
     /// The last wanted set each connection key was handed.
     wanted: StdMutex<HashMap<String, Vec<String>>>,
 }
@@ -158,10 +159,10 @@ impl TransportConnection for FakeConnection {
         Some(Box::new(self.key.clone()))
     }
 
-    fn take_over(&self, handover: Box<dyn std::any::Any>) -> Result<(), TransportError> {
+    fn take_over(&self, handover: Box<dyn std::any::Any>) -> Result<Option<tokio::sync::oneshot::Receiver<Result<(), TransportError>>>, TransportError> {
         let key = handover.downcast::<String>().expect("a fake's handover");
         self.state.takeovers.lock().unwrap().push(*key);
-        Ok(())
+        Ok(self.state.handover_completions.lock().unwrap().pop_front())
     }
 
     async fn close(&self) -> Result<(), TransportError> {
@@ -972,6 +973,60 @@ mod fallback {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn handover_does_not_announce_recovery_before_publications_and_signalling() {
+        let (mut fx, own) = call(true).await;
+        let (complete, completion) = tokio::sync::oneshot::channel();
+        fx.state.handover_completions.lock().unwrap().push_back(completion);
+        let start = tokio::time::Instant::now();
+        lose_own(&fx, &own);
+        let mut events = run(&mut fx, start, 12).await;
+        assert_eq!(moved(&events), None);
+        assert_eq!(*fx.state.takeovers.lock().unwrap(), [PEER_FOCUS]);
+        assert_eq!(fx.pool.own_connection_state(), ConnectionState::Reconnecting);
+        assert!(fx.pool.own_connection().is_none());
+        fx.pool.set_signalling_reachable(false);
+        complete.send(Ok(())).unwrap();
+        events.extend(run(&mut fx, start, 2).await);
+        assert_eq!(moved(&events), None);
+        let events = fx.pool.set_signalling_reachable(true);
+        assert!(events.iter().any(|event| matches!(event, PoolEvent::OwnFocusMoved { connection_key, .. } if connection_key == PEER_FOCUS)));
+        assert_eq!(fx.pool.own_connection_state(), ConnectionState::Connected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_handover_reconnects_without_reporting_success_early() {
+        let (mut fx, own) = call(true).await;
+        let (complete, completion) = tokio::sync::oneshot::channel();
+        fx.state.handover_completions.lock().unwrap().push_back(completion);
+        let start = tokio::time::Instant::now();
+        lose_own(&fx, &own);
+        let mut events = run(&mut fx, start, 12).await;
+        assert_eq!(moved(&events), None);
+        complete.send(Err(TransportError::Connect("republish failed".into()))).unwrap();
+        events.extend(run(&mut fx, start, 3).await);
+        assert_eq!(moved(&events), None);
+        assert_eq!(fx.pool.own_connection_state(), ConnectionState::Reconnecting);
+        fx.state.reconnect_outcomes.lock().unwrap().clear();
+        events.extend(run(&mut fx, start, 12).await);
+        assert!(moved(&events).is_some_and(|(_, key)| key == PEER_FOCUS));
+        assert_eq!(fx.pool.own_connection_state(), ConnectionState::Connected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closing_pool_abandons_pending_handover() {
+        let (mut fx, own) = call(true).await;
+        let (complete, completion) = tokio::sync::oneshot::channel();
+        fx.state.handover_completions.lock().unwrap().push_back(completion);
+        let start = tokio::time::Instant::now();
+        lose_own(&fx, &own);
+        let events = run(&mut fx, start, 12).await;
+        assert_eq!(moved(&events), None);
+        fx.pool.close();
+        fx.drain().await;
+        assert!(complete.send(Ok(())).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn without_the_host_flag_the_budget_runs_out() {
         let (mut fx, own) = call(false).await;
         let start = tokio::time::Instant::now();
@@ -1228,6 +1283,64 @@ async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
     );
 }
 
+/// An explicit lapse is recoverable only when the returning generation is
+/// the same. A different legacy created_ts must not inherit parked handles.
+#[tokio::test(start_paused = true)]
+async fn legacy_replacement_after_lapse_drops_parked_media_and_keys() {
+    let mut fx = Fixture::new();
+    let mut bob = member_on("bob", PEER_FOCUS);
+    bob.membership_ts = Some(100);
+    fx.pool.apply_snapshot(&[bob.clone()]);
+    fx.drain().await;
+    fx.sender(PEER_FOCUS).send(track_added("id-bob", MediaStreamKind::Microphone)).unwrap();
+    fx.drain().await;
+    assert!(fx.pool.remote_tracks().get("bob", MediaStreamKind::Microphone).is_some());
+    fx.pool.apply_snapshot(&[]);
+    assert!(fx.pool.key_imported("id-bob".into(), 1).is_empty());
+    // Same participation: recover media rather than waiting for a new SFU announcement.
+    let events = fx.pool.apply_snapshot(&[bob.clone()]);
+    assert!(events.contains(&PoolEvent::StreamAdded { member_id: "bob".into(), kind: MediaStreamKind::Microphone }));
+    fx.pool.apply_snapshot(&[]);
+    fx.pool.key_imported("id-bob".into(), 2);
+    bob.membership_ts = Some(300);
+    let events = fx.pool.apply_snapshot(&[bob]);
+    assert!(fx.pool.remote_tracks().get("bob", MediaStreamKind::Microphone).is_none());
+    assert!(!events.iter().any(|event| matches!(event, PoolEvent::StreamAdded { .. } | PoolEvent::KeyImported { .. })));
+    fx.sender(PEER_FOCUS).send(track_added("id-bob", MediaStreamKind::Microphone)).unwrap();
+    fx.drain().await;
+    assert!(fx.pool.remote_tracks().get("bob", MediaStreamKind::Microphone).is_some());
+}
+
+/// A snapshot can coalesce a legacy departure and a new join into one
+/// update with the same member id. Old tracks must not follow the new join.
+#[tokio::test(start_paused = true)]
+async fn legacy_rejoin_drops_predecessor_media_but_refresh_retains_it() {
+    let mut fx = Fixture::new();
+    let mut bob = member_on("bob", PEER_FOCUS);
+    bob.membership_ts = Some(100);
+    fx.pool.apply_snapshot(&[bob.clone()]);
+    fx.drain().await;
+    fx.sender(PEER_FOCUS)
+        .send(track_added("id-bob", MediaStreamKind::Microphone))
+        .unwrap();
+    fx.drain().await;
+    bob.origin_server_ts = Some(200);
+    bob.membership_event_id = Some("$refresh".into());
+    assert!(!fx.pool.membership_replaced(&bob));
+    fx.pool.apply_snapshot(&[bob.clone()]);
+    assert!(fx.pool.remote_tracks().get("bob", MediaStreamKind::Microphone).is_some());
+
+    bob.membership_ts = Some(300);
+    assert!(fx.pool.membership_replaced(&bob));
+    let events = fx.pool.apply_snapshot(&[bob.clone()]);
+    assert!(events.contains(&PoolEvent::StreamRemoved {
+        member_id: "bob".into(), kind: MediaStreamKind::Microphone,
+    }));
+    assert!(fx.pool.remote_tracks().get("bob", MediaStreamKind::Microphone).is_none());
+    assert!(!fx.pool.membership_replaced(&bob));
+    assert!(!events.iter().any(|event| matches!(event, PoolEvent::StreamAdded { .. })));
+}
+
 /// 034 R25: a member moving focus is added on the new connection before the
 /// old one removes them: the replaced track is reported removed and added,
 /// so readers reopen, and the late removal leaves the new track alone.
@@ -1241,9 +1354,10 @@ async fn a_late_removal_from_the_old_connection_keeps_the_moved_track() {
         .unwrap();
     fx.drain().await;
 
-    fx.pool
+    let mut events = fx.pool
         .apply_snapshot(&[member_on("own", OWN_FOCUS), member_on("bob", PEER_FOCUS)]);
-    fx.drain().await;
+    assert!(fx.pool.remote_tracks().get("bob", MediaStreamKind::Camera).is_none());
+    events.extend(fx.drain().await);
     fx.sender(PEER_FOCUS)
         .send(track_added("id-bob", MediaStreamKind::Camera))
         .unwrap();
@@ -1252,7 +1366,7 @@ async fn a_late_removal_from_the_old_connection_keeps_the_moved_track() {
         kind: MediaStreamKind::Camera,
     })
     .unwrap();
-    let events = fx.drain().await;
+    events.extend(fx.drain().await);
     let streams: Vec<_> = events
         .iter()
         .filter(|event| {
@@ -1293,8 +1407,8 @@ mod identity {
     //! 1. a stream is reported added only when absent and removed only when
     //!    present, and the reported streams are exactly the subscribed tracks;
     //! 2. every subscribed track is a current member's, and every track a
-    //!    current member has live on a connection is subscribed (media that
-    //!    beat its membership included);
+    //!    current member has live on their selected connection is subscribed
+    //!    (media that beat its membership included);
     //! 3. a key is reported only for a current member, under their identity,
     //!    and one imported before the membership is reported when it lands;
     //! 4. `unmappable()` is exactly the identities that joined a live
@@ -1449,15 +1563,13 @@ mod identity {
             "after {step:?}: the subscribed tracks are not the reported streams"
         );
         // 2.
-        for (member_id, _) in &tracks {
-            assert!(
-                model.snapshot.contains_key(member_id),
-                "after {step:?}: a track of {member_id}, not a member"
-            );
+        for ((member_id, _), pooled) in fx.pool.tracks.lock().unwrap().iter() {
+            assert_eq!(model.snapshot.get(member_id), Some(&pooled.connection_key),
+                "after {step:?}: a track of {member_id} from a non-selected focus");
         }
-        for (identity, kind) in model.published.keys() {
+        for ((identity, kind), focus) in &model.published {
             if let Some(member) = member_of(identity)
-                && model.snapshot.contains_key(member)
+                && model.snapshot.get(member) == Some(focus)
             {
                 assert!(
                     tracks.contains(&(member.to_owned(), *kind)),
@@ -1516,6 +1628,10 @@ mod identity {
                     model.unmapped.retain(|identity, _| {
                         member_of(identity).is_none_or(|m| !model.snapshot.contains_key(m))
                     });
+                    model.published.retain(|(identity, _), focus| {
+                        member_of(identity).and_then(|m| model.snapshot.get(m))
+                            .is_none_or(|selected| selected.as_str() == focus.as_str())
+                    });
                     events.extend(fx.pool.apply_snapshot(&snapshot));
                 }
                 Step::TrackAdded(focus, who, kind) => {
@@ -1523,9 +1639,10 @@ mod identity {
                         sender
                             .send(track_added(&who.identity(), KINDS[*kind]))
                             .unwrap();
-                        model
-                            .published
-                            .insert((who.identity(), KINDS[*kind]), FOCI[*focus].to_owned());
+                        if member_of(&who.identity()).and_then(|m| model.snapshot.get(m))
+                            .is_none_or(|selected| selected == FOCI[*focus]) {
+                            model.published.insert((who.identity(), KINDS[*kind]), FOCI[*focus].to_owned());
+                        }
                     }
                 }
                 Step::TrackRemoved(focus, who, kind) => {
@@ -1565,7 +1682,13 @@ mod identity {
                                 identity: who.identity(),
                             })
                             .unwrap();
-                        model.unmapped.remove(&who.identity());
+                        let identity = who.identity();
+                        if model.unmapped.get(&identity).is_some_and(|key| key == FOCI[*focus]) {
+                            model.unmapped.remove(&identity);
+                        }
+                        if member_of(&identity).is_none_or(|m| !model.snapshot.contains_key(m)) {
+                            model.published.retain(|(id, _), on| id != &identity || on != FOCI[*focus]);
+                        }
                     }
                 }
                 Step::KeyImported(who, index) => {
@@ -1730,4 +1853,233 @@ async fn a_peer_connection_is_told_whom_to_receive_once_up() {
     tokio::time::sleep(Duration::from_secs(30)).await;
     fx.drain().await;
     assert_eq!(fx.wanted(PEER_FOCUS), Some(vec!["id-carol".to_owned()]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn previous_loss_completion_cannot_satisfy_reused_attempt() {
+    let mut fx = Fixture::new();
+    let _sender = fx.adopt();
+    fx.pool.start_own_loss();
+    let old_epoch = fx.pool.own.as_ref().unwrap().epoch;
+    fx.pool.end_own_loss();
+    fx.pool.start_own_loss();
+    let epoch = fx.pool.own.as_ref().unwrap().epoch;
+    fx.pool.pool.get_mut(OWN_FOCUS).unwrap().state = ConnState::Connecting { attempt: 0 };
+    let (_tx, rx) = mpsc::unbounded_channel();
+    fx.pool.handle(PoolMessage(Message::OwnConnectFinished {
+        epoch: old_epoch, attempt: 0, result: Ok(rx),
+    }));
+    assert!(matches!(fx.pool.pool[OWN_FOCUS].state, ConnState::Connecting { attempt: 0 }));
+    assert_eq!(fx.pool.own.as_ref().unwrap().epoch, epoch);
+    assert!(fx.pool.own.as_ref().unwrap().lost_since.is_some());
+    let (_tx, rx) = mpsc::unbounded_channel();
+    fx.pool.handle(PoolMessage(Message::OwnConnectFinished {
+        epoch, attempt: 0, result: Ok(rx),
+    }));
+    assert!(matches!(fx.pool.pool[OWN_FOCUS].state, ConnState::Up { .. }));
+    assert!(fx.pool.own.as_ref().unwrap().lost_since.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn previous_loss_retry_cannot_start_reused_attempt() {
+    let mut fx = Fixture::new();
+    let _sender = fx.adopt();
+    fx.pool.start_own_loss();
+    let old_epoch = fx.pool.own.as_ref().unwrap().epoch;
+    fx.pool.end_own_loss();
+    fx.pool.start_own_loss();
+    let epoch = fx.pool.own.as_ref().unwrap().epoch;
+    fx.pool.pool.get_mut(OWN_FOCUS).unwrap().state = ConnState::Backoff { attempt: 1 };
+    fx.pool.handle(PoolMessage(Message::OwnRetry { epoch: old_epoch, attempt: 1 }));
+    assert!(matches!(fx.pool.pool[OWN_FOCUS].state, ConnState::Backoff { attempt: 1 }));
+    fx.pool.handle(PoolMessage(Message::OwnRetry { epoch, attempt: 1 }));
+    assert!(matches!(fx.pool.pool[OWN_FOCUS].state, ConnState::Connecting { attempt: 1 }));
+}
+
+
+#[tokio::test(start_paused = true)]
+async fn old_peer_entry_messages_cannot_match_recreated_entry() {
+    let mut fx = Fixture::new();
+    fx.pool.apply_snapshot(&[member_on("carol", PEER_FOCUS)]);
+    let old = fx.pool.pool[PEER_FOCUS].incarnation;
+    fx.pool.apply_snapshot(&[]);
+    let idle = fx.pool.pool[PEER_FOCUS].idle_generation;
+    fx.pool.close_if_idle(PEER_FOCUS, old, idle);
+    fx.pool.apply_snapshot(&[member_on("carol", PEER_FOCUS)]);
+    let new = fx.pool.pool[PEER_FOCUS].incarnation;
+    assert_ne!(old, new);
+    let (_tx, rx) = mpsc::unbounded_channel();
+    let connection: Box<dyn TransportConnection> = Box::new(FakeConnection {
+        key: PEER_FOCUS.to_owned(), state: fx.state.clone(),
+    });
+    fx.pool.connect_finished(PEER_FOCUS, old, 0, Ok((connection, rx)));
+    assert!(matches!(fx.pool.pool[PEER_FOCUS].state, ConnState::Connecting { attempt: 0 }));
+    fx.pool.pool.get_mut(PEER_FOCUS).unwrap().state = ConnState::Backoff { attempt: 0 };
+    fx.pool.retry_connect(PEER_FOCUS, old, 0);
+    assert!(matches!(fx.pool.pool[PEER_FOCUS].state, ConnState::Backoff { attempt: 0 }));
+    fx.pool.retry_connect(PEER_FOCUS, new, 0);
+    assert!(matches!(fx.pool.pool[PEER_FOCUS].state, ConnState::Connecting { attempt: 0 }));
+    fx.pool.apply_snapshot(&[]);
+    assert_eq!(fx.pool.pool[PEER_FOCUS].idle_generation, idle);
+    fx.pool.close_if_idle(PEER_FOCUS, old, idle);
+    assert!(fx.pool.pool.contains_key(PEER_FOCUS));
+    fx.pool.close_if_idle(PEER_FOCUS, new, idle);
+    assert!(!fx.pool.pool.contains_key(PEER_FOCUS));
+}
+
+#[tokio::test(start_paused = true)]
+async fn unchanged_empty_peer_membership_does_not_rearm_idle_timer() {
+    let mut fx = Fixture::new();
+    fx.pool.apply_snapshot(&[member_on("carol", PEER_FOCUS)]);
+    fx.drain().await;
+    fx.pool.apply_snapshot(&[]);
+    fx.drain().await;
+    let idle = fx.pool.pool[PEER_FOCUS].idle_generation;
+    tokio::time::sleep(IDLE_GRACE / 2).await;
+    fx.pool.apply_snapshot(&[]);
+    assert_eq!(fx.pool.pool[PEER_FOCUS].idle_generation, idle);
+    tokio::time::sleep(IDLE_GRACE / 2 + Duration::from_millis(1)).await;
+    fx.drain().await;
+    assert!(!fx.pool.pool.contains_key(PEER_FOCUS));
+    assert_eq!(*fx.state.closes.lock().unwrap(), vec![PEER_FOCUS]);
+}
+
+#[tokio::test]
+async fn unmatched_track_buffer_is_bounded_and_replaces_at_capacity() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    for i in 0..MAX_PENDING_TRACKS {
+        own.send(track_added(&format!("unknown-{i}"), MediaStreamKind::Camera)).unwrap();
+    }
+    fx.drain().await;
+    let replacement: Arc<dyn RemoteTrackHandle> = Arc::new(FakeTrack(MediaStreamKind::Camera));
+    own.send(ConnectionEvent::TrackAdded {
+        identity: "unknown-0".into(), kind: MediaStreamKind::Camera, track: replacement.clone(),
+    }).unwrap();
+    own.send(track_added("overflow", MediaStreamKind::Camera)).unwrap();
+    fx.drain().await;
+    assert_eq!(fx.pool.pending_tracks.values().map(Vec::len).sum::<usize>(), MAX_PENDING_TRACKS);
+    assert!(!fx.pool.pending_tracks.contains_key("overflow"));
+    let retained = &fx.pool.pending_tracks["unknown-0"];
+    assert_eq!(retained.len(), 1);
+    assert!(Arc::ptr_eq(&retained[0].1.track, &replacement));
+    own.send(ConnectionEvent::TrackRemoved {
+        identity: "unknown-0".into(), kind: MediaStreamKind::Camera,
+    }).unwrap();
+    fx.drain().await;
+    assert!(!fx.pool.pending_tracks.contains_key("unknown-0"));
+    own.send(track_added("overflow", MediaStreamKind::Camera)).unwrap();
+    fx.drain().await;
+    assert!(fx.pool.pending_tracks.contains_key("overflow"));
+}
+
+#[tokio::test]
+async fn unknown_remote_leave_discards_only_its_focus_buffer() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.pool.apply_snapshot(&[member_on("carol", PEER_FOCUS)]);
+    fx.drain().await;
+    let peer = fx.sender(PEER_FOCUS);
+    own.send(track_added("id-bob", MediaStreamKind::Camera)).unwrap();
+    peer.send(track_added("id-bob", MediaStreamKind::Camera)).unwrap();
+    fx.drain().await;
+    own.send(ConnectionEvent::RemoteLeft { identity: "id-bob".into() }).unwrap();
+    fx.drain().await;
+    let retained = &fx.pool.pending_tracks["id-bob"];
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].1.connection_key, PEER_FOCUS);
+}
+
+#[tokio::test]
+async fn unmatched_key_notifications_bound_identities_without_blocking_known_members() {
+    let mut fx = Fixture::new();
+    for i in 0..MAX_PENDING_KEY_IDENTITIES {
+        assert!(fx.pool.key_imported(format!("id-pending-{i}"), 0).is_empty());
+    }
+    assert!(fx.pool.key_imported("id-overflow".into(), 0).is_empty());
+    assert_eq!(fx.pool.pending_keys.len(), MAX_PENDING_KEY_IDENTITIES);
+    assert!(!fx.pool.pending_keys.contains_key("id-overflow"));
+    fx.pool.key_imported("id-pending-0".into(), 1);
+    fx.pool.key_imported("id-pending-0".into(), 1);
+    assert_eq!(fx.pool.pending_keys["id-pending-0"], vec![0, 1]);
+    fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
+    assert_eq!(fx.pool.key_imported("id-bob".into(), 7), vec![PoolEvent::KeyImported {
+        member_id: "bob".into(), identity: "id-bob".into(), key_index: 7,
+    }]);
+    let released = fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS), member_on("pending-0", OWN_FOCUS)]);
+    let indexes: Vec<u8> = released.iter().filter_map(|event| match event {
+        PoolEvent::KeyImported { key_index, .. } => Some(*key_index),
+        _ => None,
+    }).collect();
+    assert_eq!(indexes, vec![0, 1]);
+    fx.pool.key_imported("id-overflow".into(), 0);
+    assert!(fx.pool.pending_keys.contains_key("id-overflow"));
+}
+
+#[tokio::test]
+async fn unmatched_key_notification_identity_bytes_are_bounded() {
+    let mut fx = Fixture::new();
+    let boundary = "x".repeat(MAX_PENDING_KEY_IDENTITY_BYTES);
+    fx.pool.key_imported(boundary.clone(), 0);
+    assert_eq!(fx.pool.pending_keys.get(&boundary), Some(&vec![0]));
+    fx.pool.key_imported(boundary + "x", 0);
+    assert_eq!(fx.pool.pending_keys.len(), 1);
+}
+
+#[tokio::test]
+async fn unmatched_key_notifications_bound_total_and_stop_after_close() {
+    let mut fx = Fixture::new();
+    for i in 0..(MAX_PENDING_KEY_NOTIFICATIONS / 256) {
+        for index in 0..=u8::MAX {
+            fx.pool.key_imported(format!("id-pending-{i}"), index);
+        }
+    }
+    fx.pool.key_imported("id-overflow".into(), 0);
+    assert_eq!(fx.pool.pending_keys.values().map(Vec::len).sum::<usize>(), MAX_PENDING_KEY_NOTIFICATIONS);
+    assert!(!fx.pool.pending_keys.contains_key("id-overflow"));
+    fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
+    fx.pool.close();
+    assert!(fx.pool.pending_keys.is_empty());
+    assert!(fx.pool.key_imported("id-bob".into(), 1).is_empty());
+    assert!(fx.pool.key_imported("id-late".into(), 2).is_empty());
+    assert!(fx.pool.pending_keys.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn wrong_focus_cannot_replace_track_or_attribute_peer_state() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+    fx.drain().await;
+    let peer = fx.sender(PEER_FOCUS);
+    peer.send(track_added("id-bob", MediaStreamKind::Camera)).unwrap();
+    fx.drain().await;
+    let legitimate = fx.pool.remote_tracks().get("bob", MediaStreamKind::Camera).unwrap();
+    own.send(track_added("id-bob", MediaStreamKind::Camera)).unwrap();
+    own.send(ConnectionEvent::TrackMuted { identity: "id-bob".into(), kind: MediaStreamKind::Camera }).unwrap();
+    own.send(ConnectionEvent::TrackNotEncrypted { identity: "id-bob".into(), kind: MediaStreamKind::Camera }).unwrap();
+    own.send(ConnectionEvent::EncryptionStateChanged { identity: "id-bob".into(), state: FrameEncryptionState::MissingKey }).unwrap();
+    own.send(ConnectionEvent::TrackRemoved { identity: "id-bob".into(), kind: MediaStreamKind::Camera }).unwrap();
+    let events = fx.drain().await;
+    assert!(events.is_empty(), "wrong-focus events must not change the member: {events:?}");
+    own.send(ConnectionEvent::ActiveSpeakers { speakers: vec![crate::SpeakingParticipant { identity: "id-bob".into(), level: 0.8 }] }).unwrap();
+    assert!(!fx.drain().await.iter().any(|event| matches!(event,
+        PoolEvent::ActiveSpeakers { speakers } if speakers.iter().any(|speaker| speaker.member_id == "bob")
+    )));
+    assert!(Arc::ptr_eq(&legitimate, &fx.pool.remote_tracks().get("bob", MediaStreamKind::Camera).unwrap()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn buffered_wrong_focus_media_is_not_attributed_on_membership_arrival() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    own.send(track_added("id-bob", MediaStreamKind::Camera)).unwrap();
+    own.send(ConnectionEvent::TrackNotEncrypted { identity: "id-bob".into(), kind: MediaStreamKind::Camera }).unwrap();
+    fx.drain().await;
+    let events = fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+    assert!(fx.pool.remote_tracks().get("bob", MediaStreamKind::Camera).is_none());
+    assert!(!events.iter().any(|event| matches!(event, PoolEvent::StreamAdded { .. } | PoolEvent::SentInClear { .. })));
+    fx.drain().await;
+    fx.sender(PEER_FOCUS).send(track_added("id-bob", MediaStreamKind::Camera)).unwrap();
+    assert!(fx.drain().await.contains(&PoolEvent::StreamAdded { member_id: "bob".into(), kind: MediaStreamKind::Camera }));
 }
