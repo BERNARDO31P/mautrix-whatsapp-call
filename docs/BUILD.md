@@ -45,6 +45,17 @@ export MAUTRIX_WHATSAPP_CALL_CACHE="$HOME/.cache/mautrix-whatsapp-call"
 ./build/build.sh
 ```
 
-Release builds reject `MAUTRIX_WHATSAPP_CALL_SKIP_TESTS=1`. Each attempt retains its own source snapshot, binaries, logs and (only after successful tests and compilation) build record under `~/.cache/mautrix-whatsapp-call/work/runs/`. Keep the completed run with its runtime ZIP; failed attempts do not overwrite earlier runs. A cache lock excludes concurrent release builds; do not run standalone preparation against an active builder.
+Release builds reject `MAUTRIX_WHATSAPP_CALL_SKIP_TESTS=1`. Each attempt retains logs and (only after successful tests and compilation) its build record under `~/.cache/mautrix-whatsapp-call/work/runs/`. The private stable scratch directory is removed on exit; a stale marked scratch directory is reclaimed under the build lock on the next build. Published ZIPs and checksums remain in `dist/`. Rust debug symbols and incremental compilation are disabled for verification builds. The focused Go test evidence is extracted from the single full connector suite. A cache lock excludes concurrent release builds; do not run standalone preparation against an active builder.
 
 For direct builds, output defaults to `dist/mautrix-whatsapp-call-<timestamp>.zip` and `dist/mautrix-whatsapp-call-<timestamp>.zip.sha256`.
+
+## Reclaiming build space on Windows
+
+Run from the repository root. Preview first; the default compiler cache policy removes the Rust debug target on apply. This costs a one-time test rebuild, but preserves release compilation caches, pinned toolchains and dependency downloads.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Cleanup.ps1" -DistroName "Ubuntu-22.04"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Cleanup.ps1" -DistroName "Ubuntu-22.04" -Apply
+```
+
+Use your actual build distribution. `-CompilerCache keep` keeps all compiled caches; `-CompilerCache all` additionally removes Rust release and Go compiled caches. Cleanup preserves logs and build records but deletes old unpublished packages, source snapshots and intermediate binaries. Copy any unpublished artefacts needed for recovery before applying. Published ZIPs are not touched. Only the default project cache is cleaned by the Windows wrapper. No Docker or production state is changed. The reported bytes are inside Linux; WSL's dynamically allocated VHDX may not shrink immediately on Windows.

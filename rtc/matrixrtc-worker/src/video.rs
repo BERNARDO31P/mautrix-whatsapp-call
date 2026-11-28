@@ -87,6 +87,54 @@ mod rtc {
     pub const MATRIX_VIDEO_HEIGHT: u32 = 480;
     const DEFAULT_FRAME_DURATION_US: u64 = 33_333;
     const MAX_FRAME_DURATION_US: u64 = 1_000_000;
+    const ENCODER_SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
+    const ENCODER_FRAME_BUDGET: Duration = Duration::from_millis(250);
+    const DECODER_FRAME_BUDGET: Duration = Duration::from_millis(250);
+    // Keep queued video bounded independently of the per-write timeout. A
+    // stale H.264 access unit cannot safely be skipped within a prediction
+    // chain, so restart the decoder and request an IDR instead of replaying it.
+    const VIDEO_QUEUE_FRAMES: usize = 8;
+    const DECODER_QUEUE_AGE: Duration = Duration::from_millis(250);
+    const ENCODER_QUEUE_AGE: Duration = Duration::from_millis(250);
+    const ENCODER_RECOVERY_FRAMES: u32 = 450;
+
+    // This is local pipeline backpressure, not a bandwidth estimator. Reduce
+    // the encoded workload on a submission timeout and restore one level only
+    // after a sustained run of fast submissions. Each change starts a new GOP.
+    #[derive(Default)]
+    struct EncoderBudget {
+        level: usize,
+        fast_frames: u32,
+    }
+
+    impl EncoderBudget {
+        fn rates(&self) -> [&'static str; 3] {
+            [["400k", "500k", "250k"], ["250k", "320k", "160k"], ["150k", "200k", "100k"]][self.level]
+        }
+
+        fn stalled(&mut self) {
+            self.fast_frames = 0;
+            self.level = (self.level + 1).min(2);
+        }
+
+        fn submitted(&mut self, elapsed: Duration) -> bool {
+            if elapsed > Duration::from_millis(33) || self.level == 0 {
+                self.fast_frames = 0;
+                return false;
+            }
+            self.fast_frames += 1;
+            if self.fast_frames >= ENCODER_RECOVERY_FRAMES {
+                self.fast_frames = 0;
+                self.level -= 1;
+                return true;
+            }
+            false
+        }
+    }
+
+    fn decoder_frame_expired(queued_at: tokio::time::Instant, now: tokio::time::Instant) -> bool {
+        now.saturating_duration_since(queued_at) >= DECODER_QUEUE_AGE
+    }
 
     fn video_rotation(orientation: u8) -> io::Result<VideoRotation> {
         match orientation {
@@ -111,7 +159,17 @@ mod rtc {
         env::var("RTC_WORKER_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_owned())
     }
 
+    // The worker image and its FFmpeg executable are fixed for the process
+    // lifetime. Do not launch another encoder probe in the media event loop
+    // on each camera start, decoder resync or track replacement. Failed or
+    // cancelled initialization is not cached by OnceCell.
+    static FFMPEG_VERIFIED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
     pub async fn verify_ffmpeg() -> io::Result<()> {
+        FFMPEG_VERIFIED.get_or_try_init(probe_ffmpeg).await.map(|_| ())
+    }
+
+    async fn probe_ffmpeg() -> io::Result<()> {
         // A version check alone is insufficient: some minimal FFmpeg builds do
         // not contain libx264, which would make Matrix -> WhatsApp video fail
         // only after the remote party answered. Encode one tiny synthetic frame
@@ -166,7 +224,7 @@ mod rtc {
 
     pub struct WhatsAppVideoDecoder {
         pub generation:u64,
-        input: mpsc::Sender<(Vec<u8>, u64)>,
+        input: mpsc::Sender<(Vec<u8>, u64, tokio::time::Instant)>,
         child: Child,
         tasks: Vec<JoinHandle<()>>,
     }
@@ -194,8 +252,8 @@ mod rtc {
             let mut stdin = child.stdin.take().ok_or_else(|| io::Error::other("ffmpeg decoder stdin unavailable"))?;
             let mut stdout = child.stdout.take().ok_or_else(|| io::Error::other("ffmpeg decoder stdout unavailable"))?;
             let stderr=child.stderr.take().ok_or_else(||io::Error::other("decoder diagnostics unavailable"))?;
-            let (input,mut rx)=mpsc::channel::<(Vec<u8>,u64)>(24);
-            let (timestamps,mut decoded_pts)=mpsc::channel::<u64>(32);
+            let (input,mut rx)=mpsc::channel::<(Vec<u8>, u64, tokio::time::Instant)>(VIDEO_QUEUE_FRAMES);
+            let (timestamps,mut decoded_pts)=mpsc::channel::<u64>(VIDEO_QUEUE_FRAMES);
             let timing_task=tokio::spawn(async move{
                 let mut lines=BufReader::new(stderr).lines();
                 while let Ok(Some(line))=lines.next_line().await {
@@ -206,7 +264,16 @@ mod rtc {
                 }
             });
             let writer_task=tokio::spawn(async move{
-                while let Some((au,pts))=rx.recv().await {if stdin.write_all(&pes(&au,pts)).await.is_err(){break}}
+                while let Some((au, pts, queued_at)) = rx.recv().await {
+                    if decoder_frame_expired(queued_at, tokio::time::Instant::now()) {
+                        break;
+                    }
+                    // A partial PES write cannot be retried safely. Stop this
+                    // decoder and let the caller recover at a fresh keyframe.
+                    if !matches!(tokio::time::timeout(DECODER_FRAME_BUDGET, stdin.write_all(&pes(&au,pts))).await, Ok(Ok(()))) {
+                        break;
+                    }
+                }
             });
             let reader_task = tokio::spawn(async move {
                 let y = (MATRIX_VIDEO_WIDTH * MATRIX_VIDEO_HEIGHT) as usize;
@@ -245,10 +312,10 @@ mod rtc {
 
         pub fn push(&self,access_unit:Vec<u8>,orientation:u8,timestamp:u64)->io::Result<bool>{
             video_rotation(orientation)?;
-            match self.input.try_send((access_unit,(timestamp & !3)|u64::from(orientation))){
+            match self.input.try_send((access_unit, (timestamp & !3) | u64::from(orientation), tokio::time::Instant::now())){
                 Ok(())=>Ok(true),
                 Err(mpsc::error::TrySendError::Full(_))=>Ok(false),
-                Err(mpsc::error::TrySendError::Closed(_))=>Err(io::Error::new(io::ErrorKind::BrokenPipe,"H.264 decoder stopped"))
+                Err(mpsc::error::TrySendError::Closed(_))=>Ok(false)
             }
         }
 
@@ -276,6 +343,11 @@ mod rtc {
     struct FrameMetadata {
         duration_us: u64,
         orientation: u8,
+        submitted_at: tokio::time::Instant,
+    }
+
+    fn encoder_frame_expired(meta: &FrameMetadata, now: tokio::time::Instant) -> bool {
+        now.saturating_duration_since(meta.submitted_at) >= ENCODER_QUEUE_AGE
     }
 
     // Dropping a JoinHandle detaches its task. Encoder cancellation must
@@ -285,6 +357,24 @@ mod rtc {
         fn drop(&mut self) { self.0.abort(); }
     }
 
+    async fn finish_encoder_output(output: &mut EncoderOutput, deadline: tokio::time::Instant) -> io::Result<()> {
+        match tokio::time::timeout_at(deadline, &mut output.0).await {
+            Ok(result) => result.map_err(io::Error::other)?,
+            Err(_) => {
+                output.0.abort();
+                Err(io::Error::new(io::ErrorKind::TimedOut, "H.264 encoder output shutdown timed out"))
+            }
+        }
+    }
+
+    // A stalled raw-frame write can partially fill FFmpeg's stdin. The caller
+    // must discard that encoder on timeout, not append another raw frame.
+    async fn submit_encoder_frame(write: impl std::future::Future<Output = io::Result<()>>, budget: Duration) -> io::Result<()> {
+        tokio::time::timeout(budget, write).await.map_err(|_| {
+            io::Error::new(io::ErrorKind::TimedOut, "H.264 encoder frame submission timed out")
+        })?
+    }
+
     struct EncoderProcess {
         width: u32,
         height: u32,
@@ -292,6 +382,7 @@ mod rtc {
         child: Child,
         metadata: mpsc::Sender<FrameMetadata>,
         output_task: EncoderOutput,
+        stale_output: Arc<AtomicBool>,
     }
 
     impl EncoderProcess {
@@ -302,6 +393,7 @@ mod rtc {
             call_id: String,
             active: Arc<AtomicBool>,
             source_generation: u64,
+            rates: [&str; 3],
         ) -> io::Result<Self> {
             if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "Matrix video dimensions must be non-zero and even"));
@@ -320,6 +412,20 @@ mod rtc {
                     "zerolatency",
                     "-profile:v",
                     "baseline",
+                    // Bound transcoding CPU and video bursts on the shared audio/video
+                    // transport. Keep the camera aspect ratio and never upscale.
+                    "-vf",
+                    "scale=w=min(640\\,iw):h=min(640\\,ih):force_original_aspect_ratio=decrease:force_divisible_by=2",
+                    "-filter_threads",
+                    "1",
+                    "-threads",
+                    "2",
+                    "-b:v",
+                    rates[0],
+                    "-maxrate",
+                    rates[1],
+                    "-bufsize",
+                    rates[2],
                     "-pix_fmt",
                     "yuv420p",
                     "-x264-params",
@@ -335,7 +441,9 @@ mod rtc {
                 .spawn()?;
             let stdin = child.stdin.take().ok_or_else(|| io::Error::other("ffmpeg encoder stdin unavailable"))?;
             let mut stdout = child.stdout.take().ok_or_else(|| io::Error::other("ffmpeg encoder stdout unavailable"))?;
-            let (metadata, mut metadata_rx) = mpsc::channel::<FrameMetadata>(120);
+            let (metadata, mut metadata_rx) = mpsc::channel::<FrameMetadata>(VIDEO_QUEUE_FRAMES);
+            let stale_output = Arc::new(AtomicBool::new(false));
+            let expired = stale_output.clone();
             let output_task = tokio::spawn(async move {
                 let mut parser = AnnexBAccessUnitParser::default();
                 let mut buf = vec![0u8; 64 * 1024];
@@ -345,10 +453,11 @@ mod rtc {
                         break;
                     }
                     for access_unit in parser.push(&buf[..read])? {
-                        let frame_meta = metadata_rx.recv().await.unwrap_or(FrameMetadata {
-                            duration_us: DEFAULT_FRAME_DURATION_US,
-                            orientation: 0,
-                        });
+                        let frame_meta = metadata_rx.recv().await.ok_or_else(|| io::Error::other("H.264 encoder output missing frame metadata"))?;
+                        if encoder_frame_expired(&frame_meta, tokio::time::Instant::now()) {
+                            expired.store(true, Ordering::Release);
+                            return Ok(());
+                        }
                         if active.load(Ordering::Acquire) {
                             let mut message = Message::new("matrix_video", &call_id);
                         message.generation = source_generation;
@@ -360,10 +469,11 @@ mod rtc {
                     }
                 }
                 if let Some(access_unit) = parser.finish() {
-                    let frame_meta = metadata_rx.recv().await.unwrap_or(FrameMetadata {
-                        duration_us: DEFAULT_FRAME_DURATION_US,
-                        orientation: 0,
-                    });
+                    let frame_meta = metadata_rx.recv().await.ok_or_else(|| io::Error::other("H.264 encoder output missing frame metadata"))?;
+                    if encoder_frame_expired(&frame_meta, tokio::time::Instant::now()) {
+                        expired.store(true, Ordering::Release);
+                        return Ok(());
+                    }
                     if active.load(Ordering::Acquire) {
                         let mut message = Message::new("matrix_video", &call_id);
                         message.generation = source_generation;
@@ -375,19 +485,21 @@ mod rtc {
                 }
                 Ok(())
             });
-            Ok(Self { width, height, stdin, child, metadata, output_task: EncoderOutput(output_task) })
+            Ok(Self { width, height, stdin, child, metadata, output_task: EncoderOutput(output_task), stale_output })
         }
 
         async fn write_frame(&mut self, frame: &VideoFrame, duration_us: u64) -> io::Result<()> {
             if frame.buffer.width != self.width || frame.buffer.height != self.height {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "video dimensions changed"));
             }
+            let submitted_at = tokio::time::Instant::now();
             let raw = pack_i420(&frame.buffer)?;
             self.stdin.write_all(&raw).await?;
             self.metadata
                 .send(FrameMetadata {
                     duration_us: duration_us.clamp(1, MAX_FRAME_DURATION_US),
                     orientation: quarter_turns(frame.rotation),
+                    submitted_at,
                 })
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "H.264 encoder output stopped"))
@@ -396,16 +508,18 @@ mod rtc {
         async fn shutdown(mut self) -> io::Result<()> {
             drop(self.stdin);
             drop(self.metadata);
-            let (status, forced_shutdown) = match tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await {
-                Ok(result) => (result?, false),
+            // One budget covers the child and its output task. The output task
+            // can still be draining multiple bounded IPC writes after FFmpeg exits.
+            let deadline = tokio::time::Instant::now() + ENCODER_SHUTDOWN_BUDGET;
+            let status = match tokio::time::timeout_at(deadline, self.child.wait()).await {
+                Ok(result) => result?,
                 Err(_) => {
                     let _ = self.child.start_kill();
-                    (self.child.wait().await?, true)
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "H.264 encoder shutdown timed out"));
                 }
             };
-            let output_result = (&mut self.output_task.0).await.map_err(io::Error::other)?;
-            output_result?;
-            if !status.success() && !forced_shutdown {
+            finish_encoder_output(&mut self.output_task, deadline).await?;
+            if !status.success() {
                 return Err(io::Error::other(format!("H.264 encoder exited with {status}")));
             }
             Ok(())
@@ -421,12 +535,23 @@ mod rtc {
         source_generation: u64,
     ) -> io::Result<()> {
         let mut encoder: Option<EncoderProcess> = None;
+        let mut budget = EncoderBudget::default();
         let mut seen_keyframe_generation = keyframe_generation.load(Ordering::Acquire);
         let mut last_timestamp_us: Option<i64> = None;
         while let Some(frame) = frames.next().await {
             if !active.load(Ordering::Acquire) {
+                // The remote decoder cannot reconstruct a prediction chain
+                // whose pictures were suppressed during media suspension.
+                // Do not retain that encoder or its queued output on resume.
+                drop(encoder.take());
+                budget.fast_frames = 0;
                 last_timestamp_us = None;
                 continue;
+            }
+            if encoder.as_ref().is_some_and(|current| current.stale_output.load(Ordering::Acquire)) {
+                budget.stalled();
+                drop(encoder.take());
+                last_timestamp_us = None;
             }
             let requested_generation = keyframe_generation.load(Ordering::Acquire);
             let restart = encoder.as_ref().is_some_and(|current| {
@@ -435,9 +560,11 @@ mod rtc {
                     || requested_generation != seen_keyframe_generation
             });
             if restart {
-                if let Some(current) = encoder.take() {
-                    current.shutdown().await?;
-                }
+                // A resync or resolution change invalidates the old GOP. Do not
+                // drain stale encoded pictures before producing the requested IDR.
+                // Child kill-on-drop and EncoderOutput abort stop the old producer;
+                // any already admitted IPC frame retains its own writer deadline.
+                drop(encoder.take());
                 seen_keyframe_generation = requested_generation;
                 last_timestamp_us = None;
             }
@@ -449,8 +576,15 @@ mod rtc {
                     call_id.clone(),
                     active.clone(),
                     source_generation,
+                    budget.rates(),
                 ) {
-                    Ok(created) => encoder = Some(created),
+                    Ok(created) => {
+                        encoder = Some(created);
+                        // A fresh encoder already starts with an IDR. Consume
+                        // the request observed before spawning, including when
+                        // recovering from an earlier timeout or suspension.
+                        seen_keyframe_generation = requested_generation;
+                    },
                     Err(error) => return Err(error),
                 }
             }
@@ -461,7 +595,26 @@ mod rtc {
                 .unwrap_or(DEFAULT_FRAME_DURATION_US);
             last_timestamp_us = Some(frame.timestamp_us);
             if let Some(current) = encoder.as_mut() {
-                current.write_frame(&frame, duration_us).await?;
+                let started = std::time::Instant::now();
+                match submit_encoder_frame(current.write_frame(&frame, duration_us), ENCODER_FRAME_BUDGET).await {
+                    Ok(()) => {
+                        if budget.submitted(started.elapsed()) {
+                            eprintln!("RTC video encoder local workload recovery: target {}", budget.rates()[0]);
+                            drop(encoder.take());
+                            last_timestamp_us = None;
+                        }
+                    },
+                    Err(err) if err.kind() == io::ErrorKind::TimedOut || current.stale_output.load(Ordering::Acquire) => {
+                        eprintln!("RTC video encoder stalled; discarding partial frame and restarting: {err}");
+                        // A cancelled write_all is not frame-atomic. Dropping
+                        // the child and output task prevents reuse of its pipe.
+                        budget.stalled();
+                        eprintln!("RTC video encoder local workload fallback: target {}", budget.rates()[0]);
+                        drop(encoder.take());
+                        last_timestamp_us = None;
+                    },
+                    Err(err) => return Err(err),
+                }
             }
         }
         if let Some(current) = encoder {
@@ -539,12 +692,89 @@ mod rtc {
             let (_,writer)=tokio::io::split(worker);
             let writer=Writer::new(writer);
             for size in [16u32,32,32] {
-                let mut process=EncoderProcess::spawn(size,size,writer.clone(),"test".into(),Arc::new(AtomicBool::new(true)),1).unwrap();
+                let mut process=EncoderProcess::spawn(size,size,writer.clone(),"test".into(),Arc::new(AtomicBool::new(true)),1,EncoderBudget::default().rates()).unwrap();
                 let n=(size*size) as usize;
                 let frame=VideoFrame{buffer:I420Buffer{width:size,height:size,data_y:vec![16;n],data_u:vec![128;n/4],data_v:vec![128;n/4],stride_y:size,stride_u:size/2,stride_v:size/2},rotation:VideoRotation::Deg0,timestamp_us:100000};
                 process.write_frame(&frame,33_333).await.unwrap();
                 process.shutdown().await.unwrap();
             }
+        }
+
+        #[tokio::test]
+        async fn ffmpeg_probe_failure_can_retry_and_success_is_reused() {
+            let verified = tokio::sync::OnceCell::<()>::new();
+            let failed = verified.get_or_try_init(|| async {
+                Err::<(), _>(io::Error::other("probe failed"))
+            }).await;
+            assert!(failed.is_err());
+            assert!(verified.get().is_none());
+            verified.get_or_try_init(|| async { Ok::<(), io::Error>(()) }).await.unwrap();
+            verified.get_or_try_init(|| async {
+                panic!("a successful probe must not be repeated");
+                #[allow(unreachable_code)]
+                Ok::<(), io::Error>(())
+            }).await.unwrap();
+        }
+
+        #[test]
+        fn encoder_budget_is_bounded_and_recovers_gradually() {
+            let mut budget = EncoderBudget::default();
+            assert_eq!(budget.rates()[0], "400k");
+            budget.stalled();
+            assert_eq!(budget.rates()[0], "250k");
+            budget.stalled();
+            budget.stalled();
+            assert_eq!(budget.rates()[0], "150k");
+            for _ in 0..ENCODER_RECOVERY_FRAMES - 1 {
+                assert!(!budget.submitted(Duration::from_millis(10)));
+            }
+            assert!(!budget.submitted(Duration::from_millis(50)));
+            for expected in ["250k", "400k"] {
+                for _ in 0..ENCODER_RECOVERY_FRAMES - 1 {
+                    assert!(!budget.submitted(Duration::from_millis(10)));
+                }
+                assert!(budget.submitted(Duration::from_millis(10)));
+                assert_eq!(budget.rates()[0], expected);
+            }
+            assert!(!budget.submitted(Duration::from_millis(10)));
+        }
+
+        #[test]
+        fn queued_decoder_frames_expire_at_latency_budget() {
+            let start = tokio::time::Instant::now();
+            assert!(!decoder_frame_expired(start, start));
+            assert!(!decoder_frame_expired(start, start + DECODER_QUEUE_AGE - Duration::from_millis(1)));
+            assert!(decoder_frame_expired(start, start + DECODER_QUEUE_AGE));
+            assert!(decoder_frame_expired(start, start + Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn queued_encoder_output_expires_at_latency_budget() {
+            let start = tokio::time::Instant::now();
+            let meta = FrameMetadata { duration_us: 33_333, orientation: 0, submitted_at: start };
+            assert!(!encoder_frame_expired(&meta, start));
+            assert!(!encoder_frame_expired(&meta, start + ENCODER_QUEUE_AGE - Duration::from_millis(1)));
+            assert!(encoder_frame_expired(&meta, start + ENCODER_QUEUE_AGE));
+        }
+
+        #[tokio::test]
+        async fn encoder_frame_submission_has_a_deadline() {
+            let stalled = submit_encoder_frame(std::future::pending(), Duration::from_millis(10)).await;
+            assert_eq!(stalled.unwrap_err().kind(), io::ErrorKind::TimedOut);
+            submit_encoder_frame(async { Ok(()) }, Duration::from_secs(1)).await.unwrap();
+            let broken = submit_encoder_frame(async { Err(io::Error::from(io::ErrorKind::BrokenPipe)) }, Duration::from_secs(1)).await;
+            assert_eq!(broken.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        }
+
+        #[tokio::test]
+        async fn encoder_output_shutdown_has_a_shared_deadline() {
+            let mut output = EncoderOutput(tokio::spawn(std::future::pending::<io::Result<()>>()));
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+            let err = finish_encoder_output(&mut output, deadline).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+            assert!((&mut output.0).await.unwrap_err().is_cancelled());
+            let mut output = EncoderOutput(tokio::spawn(async { Ok(()) }));
+            finish_encoder_output(&mut output, tokio::time::Instant::now() + Duration::from_secs(1)).await.unwrap();
         }
 
         #[test]

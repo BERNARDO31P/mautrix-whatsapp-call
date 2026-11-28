@@ -309,6 +309,29 @@ impl Outbox {
             .clone()
     }
 
+    /// Reconcile a durable legacy membership before admitting a new call.
+    /// The caller must exclusively reserve the room/slot for the whole call.
+    /// The fence also serializes this with a previous detached leave.
+    pub async fn reconcile_legacy<F>(
+        &self, room: &str, key: &str, recover: impl FnOnce() -> F,
+    ) -> Result<(), CommandError>
+    where F: Future<Output = Result<(), CommandError>>,
+    {
+        let mut fence = self.legacy_leave_fence(room, key).lock_owned().await;
+        if !self.legacy_pending(room, key)? {
+            return if *fence {
+                Err(CommandError::ClientRejected("legacy leave fence remains unsettled".to_owned()))
+            } else { Ok(()) };
+        }
+        *fence = true;
+        recover().await?;
+        if self.legacy_pending(room, key)? {
+            return Err(CommandError::ClientRejected("legacy recovery left pending ownership".to_owned()));
+        }
+        *fence = false;
+        Ok(())
+    }
+
     pub(crate) fn legacy_pending(&self, room: &str, key: &str) -> Result<bool, CommandError> {
         self.inner.legacy_journal.as_ref().map_or(Ok(false), |j| j.pending(room, key))
     }

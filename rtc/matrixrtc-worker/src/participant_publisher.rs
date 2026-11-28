@@ -304,8 +304,7 @@ impl ParticipantPublisher {
         }
         self.check(fence)?;
         let decoder = self.camera.as_mut().ok_or_else(|| error("participant decoder missing"))?;
-        decoder.ensure_running()?;
-        if !decoder.push(msg.data, msg.orientation, timestamp)? {
+        if decoder.ensure_running().is_err() || !decoder.push(msg.data, msg.orientation, timestamp)? {
             self.stop_camera().await?;
             return Ok(PublicationResult::RequestKeyframe);
         }

@@ -241,7 +241,11 @@ func (wa *WhatsAppClient) registerVoIPCall(call *meowcaller.Call, direction voip
 			_, _ = wa.callManager.Transition(id, voipbridge.Connecting)
 			_, _ = wa.callManager.Transition(id, voipbridge.Active)
 		case meowcaller.CallPhaseEnded:
-			_, _ = wa.callManager.End(id, "whatsapp-ended")
+			reason := call.TerminalReason()
+			if reason == "" {
+				reason = "whatsapp-ended"
+			}
+			_, _ = wa.callManager.End(id, reason)
 		}
 	})
 	call.OnReady(func() {

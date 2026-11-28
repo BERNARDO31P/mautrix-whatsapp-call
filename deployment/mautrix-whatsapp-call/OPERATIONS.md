@@ -243,6 +243,28 @@ The dedicated calling worker restricts legacy JWT exchanges and SFU connections 
 
 The installer checks the rendered Compose JWT image and existing (including stopped) JWT containers before changing deployment files or stopping calls. It accepts only the pinned `ghcr.io/element-hq/lk-jwt-service:0.9.0` image reference, without a custom build. Version 0.9.0 hashes the legacy `m.call#ROOM` slot, whereas 0.10.0 normalizes it to `m.call#room` in its token paths; the aliases are different. Do not change the image pin independently of the calling protocol review. If a different version is already deployed, the installer refuses replacement: review client dialects and room compatibility in staging rather than automatically downgrading. The guard also records the local immutable Docker image ID, refuses a tag that points at different bytes than any existing container, rechecks the ID across installation, and recreates the JWT service without pulling. It checks the running container ID before enabling calls. Only a fresh install with no local image may pull the pinned tag. This is local image continuity, not registry signature verification or mixed-dialect interoperability; never retag the JWT image concurrently with deployment.
 
+### JWT delayed-leave request errors
+
+A JWT service `delegate_delayed_leave: error reading body` message with JSON
+EOF indicates that request-body decoding failed, before delegation validation
+or processing. It does not establish that an accepted call, a LiveKit session,
+or a worker-owned MatrixRTC membership failed to terminate. The legacy worker
+uses homeserver delayed-state-event creation, restart and cancellation instead
+of this JWT delegation endpoint. Do not replace an empty request with synthetic
+JSON or retry it on behalf of a different Matrix identity.
+
+If the error coincides with a stale call indicator, correlate the timestamp
+with the client, JWT service, reverse proxy and homeserver access logs. Check
+which endpoint received the request, its HTTP method and response status, and
+whether the client or proxy supplied a request body. If access logs do not
+contain enough metadata, collect client diagnostics and reproduce in staging;
+never log authorization headers, request bodies, access tokens or OpenID
+credentials. Inspect the worker's separate membership recovery outcome and
+confirm the current room membership on the homeserver. Keep the pinned JWT
+image and room alias contract unchanged unless the actual sender and failing
+request path have been identified. The error alone is not evidence of a proxy
+body-stripping bug or a reason to change the JWT image.
+
 ### Inconsistent local ghost identity metadata
 
 Provisioning will not automatically replace an existing malformed or incomplete
@@ -279,3 +301,16 @@ operation against the authoritative homeserver before explicitly reconciling the
 corresponding operation records and legacy ownership marker. Do not remove
 these records as an automatic repair, even when rolling back the worker image.
 The pinned API does not provide automatic reconciliation of an unknown ID.
+
+An empty inspection report is different from an inaccessible or absent journal
+folder. The inspector returns a nonzero status in the latter case; verify the
+identity directory and worker-state mount instead of creating or removing
+files. During recovery the worker logs whether cancellation was confirmed or
+whether it observed the matching delayed leave publication. A missing pending
+event without matching authoritative publication remains unresolved. A healthy
+worker socket does not establish that every room has settled its ownership.
+
+For scripted preflight checks, pass `--require-empty` to the read-only inspector.
+It returns status 3 for unresolved records, 2 for inspection errors, and 0 only
+for a successfully inspected empty journal. The default reporting behavior is
+unchanged. This does not settle or delete any operation.

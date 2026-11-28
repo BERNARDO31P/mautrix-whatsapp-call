@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync/atomic"
 
 	"github.com/pion/datachannel"
 	"github.com/pion/dtls/v3"
@@ -96,6 +97,12 @@ func (c *RelayMediaChannel) BindLifetime(ctx context.Context) {
 	c.stopLifetime = c.WatchCancellation(ctx)
 }
 
+// Abort interrupts the underlying transport before closing a failed setup.
+func (c *RelayMediaChannel) Abort() error {
+	_ = c.udp.Close()
+	return c.Close()
+}
+
 // Close tears down the media stack in reverse order of construction.
 func (c *RelayMediaChannel) Close() error {
 	if c.stopLifetime != nil {
@@ -141,6 +148,75 @@ func (c *RelayMediaChannel) Recv(buf []byte) (int, error) {
 	return n, nil
 }
 
+// Count socket activity during setup without logging packet contents.
+// This distinguishes a silent relay from a received but rejected handshake.
+type countedPacketConn struct {
+	net.PacketConn
+	peer                                *net.UDPAddr
+	sent, received                      atomic.Uint64
+	peerReceived, foreignReceived       atomic.Uint64
+	peerHandshake, peerAlert, peerOther atomic.Uint64
+	firstOutboundRecord                 atomic.Uint32
+}
+
+func (c *countedPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	n, err := c.PacketConn.WriteTo(p, addr)
+	if err == nil {
+		c.sent.Add(1)
+		if n == len(p) {
+			c.firstOutboundRecord.CompareAndSwap(0, dtlsRecordMetadata(p))
+		}
+	}
+	return n, err
+}
+
+func (c *countedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, addr, err := c.PacketConn.ReadFrom(p)
+	if err == nil {
+		c.received.Add(1)
+		if c.peer != nil {
+			if source, ok := addr.(*net.UDPAddr); ok && source.Port == c.peer.Port && source.IP.Equal(c.peer.IP) && source.Zone == c.peer.Zone {
+				c.peerReceived.Add(1)
+				switch classifyHandshakeDatagram(p[:n]) {
+				case 22:
+					c.peerHandshake.Add(1)
+				case 21:
+					c.peerAlert.Add(1)
+				default:
+					c.peerOther.Add(1)
+				}
+			} else {
+				c.foreignReceived.Add(1)
+			}
+		}
+	}
+	return n, addr, err
+}
+
+// Classify the first DTLS 1.0/1.2 record header, not its payload. This is
+// diagnostic only; Pion remains responsible for protocol validation.
+// Other formats (including encrypted records) are not evidence of a rejection.
+func classifyHandshakeDatagram(p []byte) byte {
+	if len(p) < 13 || p[1] != 0xfe || (p[2] != 0xff && p[2] != 0xfd) {
+		return 0
+	}
+	if int(p[11])<<8|int(p[12]) > len(p)-13 {
+		return 0
+	}
+	return p[0]
+}
+
+// dtlsRecordMetadata records only public record-header metadata. It deliberately
+// excludes handshake bodies, random values, cookies and all key material.
+// A zero value means the datagram did not contain a complete recognised record.
+func dtlsRecordMetadata(p []byte) uint32 {
+	kind := classifyHandshakeDatagram(p)
+	if kind == 0 {
+		return 0
+	}
+	return uint32(kind)<<16 | uint32(p[1])<<8 | uint32(p[2])
+}
+
 // ConnectRelayMedia connects the full media stack (UDP→DTLS→SCTP→DataChannel) to one
 // relay endpoint. Self-signed cert; server-cert verification skipped (media auth is
 // HBH SRTP, not DTLS). No vector — validated only against a live relay.
@@ -160,21 +236,24 @@ func ConnectRelayMediaContext(ctx context.Context, relayAddr *net.UDPAddr, opts 
 	lg.Debug().Str("relay_addr", relayAddr.String()).Msg("connecting relay media stack")
 	// Roll back already-allocated resources if a later step fails.
 	var cleanup []func() error
+	var abortSocket func() error
 	fail := func(err error) (*RelayMediaChannel, error) {
-		for i := len(cleanup) - 1; i >= 0; i-- {
-			_ = cleanup[i]()
-		}
+		abortFailedSetup(abortSocket, cleanup)
 		lg.Debug().Err(err).Msg("relay media connect failed")
 		return nil, &CallTransportError{Op: "connect", Err: err}
 	}
 
 	// 1. UDP socket.
-	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	network, bindIP := "udp6", net.IPv6unspecified
+	if relayAddr.IP.To4() != nil {
+		network, bindIP = "udp4", net.IPv4zero
+	}
+	udp, err := net.ListenUDP(network, &net.UDPAddr{IP: bindIP, Port: 0})
 	if err != nil {
 		lg.Debug().Err(err).Msg("relay media connect failed")
 		return nil, &CallTransportError{Op: "connect", Err: fmt.Errorf("bind udp: %w", err)}
 	}
-	cleanup = append(cleanup, udp.Close)
+	abortSocket = udp.Close
 	stopSetup := watchSetupCancellation(ctx, udp)
 	defer stopSetup()
 	lg.Debug().Str("local_addr", udp.LocalAddr().String()).Msg("relay udp socket bound")
@@ -184,7 +263,8 @@ func ConnectRelayMediaContext(ctx context.Context, relayAddr *net.UDPAddr, opts 
 	if err != nil {
 		return fail(fmt.Errorf("dtls self-signed cert: %w", err))
 	}
-	dtlsConn, err := dtls.ClientWithOptions(udp, relayAddr,
+	counted := &countedPacketConn{PacketConn: udp, peer: relayAddr}
+	dtlsConn, err := dtls.ClientWithOptions(counted, relayAddr,
 		dtls.WithCertificates(cert),
 		dtls.WithInsecureSkipVerify(true),
 	)
@@ -193,9 +273,18 @@ func ConnectRelayMediaContext(ctx context.Context, relayAddr *net.UDPAddr, opts 
 	}
 	cleanup = append(cleanup, dtlsConn.Close)
 	if err := dtlsConn.HandshakeContext(ctx); err != nil {
+		lg.Warn().Uint64("udp_sent", counted.sent.Load()).Uint64("udp_received", counted.received.Load()).
+			Uint64("peer_received", counted.peerReceived.Load()).
+			Uint64("foreign_received", counted.foreignReceived.Load()).
+			Uint64("peer_dtls_handshake", counted.peerHandshake.Load()).
+			Uint64("peer_dtls_alert", counted.peerAlert.Load()).
+			Uint64("peer_other", counted.peerOther.Load()).
+			Uint32("first_outbound_dtls_record", counted.firstOutboundRecord.Load()).
+			Str("network", network).Msg("relay DTLS handshake failed")
 		return fail(fmt.Errorf("dtls handshake: %w", err))
 	}
-	lg.Debug().Msg("relay dtls handshake complete")
+	lg.Debug().Uint64("udp_sent", counted.sent.Load()).Uint64("peer_received", counted.peerReceived.Load()).
+		Uint32("first_outbound_dtls_record", counted.firstOutboundRecord.Load()).Msg("relay dtls handshake complete")
 
 	// 3. SCTP association over the DTLS conn.
 	assoc, err := sctp.ClientWithOptions(sctp.WithNetConn(dtlsConn), sctp.WithName("wa-voip"))
@@ -207,11 +296,17 @@ func ConnectRelayMediaContext(ctx context.Context, relayAddr *net.UDPAddr, opts 
 
 	// 4. Pre-negotiated DataChannel id=0. LoggerFactory is required: datachannel
 	// does not default it and dereferences it on construction.
-	dc, err := datachannel.Dial(assoc, 0, &datachannel.Config{
-		Negotiated:    true,
-		Label:         DataChannelLabel,
-		LoggerFactory: logging.NewDefaultLoggerFactory(),
-	})
+	// The relay media channel is negotiated out of band, so there is no DCEP
+	// ACK to commit reliability parameters. Apply them directly to the SCTP
+	// stream before the first media write, matching the native reference's
+	// unordered, zero-retransmission real-time transport.
+	// Reference: whatsapp-rust/src/voip/transport/native.rs, open_media_stream.
+	stream, err := assoc.OpenStream(0, sctp.PayloadTypeWebRTCBinary)
+	if err != nil {
+		return fail(fmt.Errorf("media stream open: %w", err))
+	}
+	stream.SetReliabilityParams(true, sctp.ReliabilityTypeRexmit, 0)
+	dc, err := datachannel.Client(stream, mediaDataChannelConfig())
 	if err != nil {
 		return fail(fmt.Errorf("datachannel dial: %w", err))
 	}
@@ -220,7 +315,17 @@ func ConnectRelayMediaContext(ctx context.Context, relayAddr *net.UDPAddr, opts 
 	if !stopSetup() || ctx.Err() != nil {
 		return fail(ctx.Err())
 	}
-	lg.Debug().Str("label", DataChannelLabel).Msg("relay datachannel open")
+	lg.Debug().Str("label", DataChannelLabel).Bool("ordered", false).Int("max_retransmits", 0).Msg("relay datachannel open")
 
 	return &RelayMediaChannel{udp: udp, dtlsConn: dtlsConn, assoc: assoc, dc: dc, log: lg}, nil
+}
+
+func mediaDataChannelConfig() *datachannel.Config {
+	return &datachannel.Config{
+		Negotiated:           true,
+		Label:                DataChannelLabel,
+		ChannelType:          datachannel.ChannelTypePartialReliableRexmitUnordered,
+		ReliabilityParameter: 0,
+		LoggerFactory:        logging.NewDefaultLoggerFactory(),
+	}
 }

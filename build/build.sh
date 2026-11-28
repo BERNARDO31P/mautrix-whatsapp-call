@@ -18,15 +18,43 @@ DIST="$(cd "$DIST" && pwd)"
 # Do not race a second builder sharing toolchain caches or cargo outputs.
 exec 9>"$CACHE/build.lock"
 flock -n 9 || { echo "Another release build is using this cache" >&2; exit 2; }
-WORK="$(mktemp -d "$WORK_ROOT/runs/build.XXXXXXXX")"
-WORK="$(cd "$WORK" && pwd)"
-chmod 0700 "$WORK"
-BIN="$WORK/bin"
-LOG="$WORK/logs"
-mkdir -p "$BIN" "$LOG"
-echo "Build evidence and outputs: $WORK"
+RUN="$(mktemp -d "$WORK_ROOT/runs/build.XXXXXXXX")"
+RUN="$(cd "$RUN" && pwd)"
+chmod 0700 "$RUN"
+LOG="$RUN/logs"
+mkdir -p "$LOG"
+echo "Build evidence: $RUN"
 
 bash "$SCRIPT_DIR/verify-source.sh"
+# Stable path keeps compiler fingerprints and CGO library paths consistent.
+# The cache lock above protects this private scratch directory, even when
+# the evidence location (WORK_ROOT) is overridden.
+WORK="$CACHE/build-scratch-v1"
+MARKER="$WORK/.mautrix-whatsapp-call-scratch"
+if [[ -e "$WORK" || -L "$WORK" ]]; then
+    [[ -d "$WORK" && ! -L "$WORK" && -f "$MARKER" && ! -L "$MARKER" ]] &&
+        [[ "$(cat "$MARKER")" == "mautrix-whatsapp-call scratch v1" ]] || {
+        echo "Refusing to remove unrecognised scratch directory: $WORK" >&2; exit 2;
+    }
+    rm -rf --one-file-system -- "$WORK"
+fi
+mkdir -m 0700 "$WORK"
+printf '%s\n' "mautrix-whatsapp-call scratch v1" > "$MARKER"
+cleanup_scratch() {
+    local status=$?
+    trap - EXIT
+    if ! rm -rf --one-file-system -- "$WORK"; then
+        echo "Scratch cleanup failed: $WORK" >&2
+        if (( status == 0 )); then status=2; fi
+    fi
+    exit "$status"
+}
+trap cleanup_scratch EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+BIN="$WORK/bin"
+mkdir -p "$BIN"
 REPO_ROOT="$WORK/source"
 SOURCE_DIGEST="$(python3 -B "$SCRIPT_DIR/build-record.py" snapshot "$ORIGINAL_ROOT" "$REPO_ROOT")"
 SCRIPT_DIR="$REPO_ROOT/build"
@@ -79,6 +107,9 @@ export CARGO_HOME="$CACHE/cargo"
 export RUSTUP_HOME="$RUST_ROOT/rustup"
 export PATH="$RUST_ROOT/rustup/toolchains/$RUST_VERSION-x86_64-unknown-linux-gnu/bin:$PATH"
 export CARGO_TARGET_DIR="$CACHE/rust-target"
+# Release verification does not require DWARF or incremental compiler state.
+# Keep dependency artefacts reusable, without multiplying multi-GB debug data.
+export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0
 mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
 (
     cd "$RTC_SRC"
@@ -139,21 +170,29 @@ if [[ "$SKIP_TESTS" == "0" ]]; then
     bash "$REPO_ROOT/build/test-wire-interop.sh" "$BRIDGE_SRC" 2>&1 | tee "$LOG/wire-interop.log"
     (
         cd "$BRIDGE_SRC"
-        go test -p "$JOBS" -mod=readonly -tags "goolm,liveopus" -count=1 \
-            -run 'Test(RTC(EventProcessorDispatchClasses|RingLifetimeAfterAcceptAndCancellation|UnansweredRingExpires)|MatrixRTCDMPowerLevels|MatrixRTCCall(DeviceClassification|StaticJIDAvailability)|WhatsApp(BusinessCallOptionClassification|BusinessCallProfileResponseClassification|VoIPFeatureResponseClassification|EndReasonFormatting)|CombineWhatsAppMatrixRTCCallAvailabilityPrecedence|VoIPManagerRefinesEndReason)$' \
-            -v ./pkg/connector 2>&1 | tee "$LOG/go-focused.log"
-        go test -p "$JOBS" -mod=readonly -tags "goolm,liveopus" -count=1 ./pkg/connector/voipbridge/... ./pkg/connector 2>&1 | tee "$LOG/go-connector.log"
+        go test -p "$JOBS" -mod=readonly -tags "goolm,liveopus" -count=1 -v ./pkg/connector/voipbridge/... ./pkg/connector 2>&1 | tee "$LOG/go-connector.log"
+        # The full connector run already executes these tests. Retain explicit
+        # evidence for each required regression without running it twice.
+        focused=(TestRTCEventProcessorDispatchClasses TestRTCRingLifetimeAfterAcceptAndCancellation
+            TestRTCUnansweredRingExpires TestMatrixRTCDMPowerLevels TestMatrixRTCCallDeviceClassification
+            TestMatrixRTCCallStaticJIDAvailability TestWhatsAppBusinessCallOptionClassification
+            TestWhatsAppBusinessCallProfileResponseClassification TestWhatsAppVoIPFeatureResponseClassification
+            TestWhatsAppEndReasonFormatting TestCombineWhatsAppMatrixRTCCallAvailabilityPrecedence)
+        for name in "${focused[@]}"; do
+            grep -E "^--- PASS: ${name} \(" "$LOG/go-connector.log" || {
+                echo "Required connector regression did not pass: $name" >&2; exit 26;
+            }
+        done | tee "$LOG/go-focused.log"
     )
     (
         cd "$MEOW_SRC"
         MAUTRIX_WHATSAPP_CALL_EXPECT_OPUS_VERSION="$OPUS_VERSION" go test -p "$JOBS" -mod=readonly -tags liveopus -count=1 -v ./liveopus 2>&1 | tee "$LOG/meowcaller.log"
         grep -q "^--- PASS: TestRoundTripNegotiatedFrameLengths " "$LOG/meowcaller.log" || { echo "Native Opus regression did not execute" >&2; exit 26; }
-        go test -p "$JOBS" -mod=readonly -tags liveopus -count=1 ./rtp ./mlow ./signaling . 2>&1 | tee -a "$LOG/meowcaller.log"
+        go test -p "$JOBS" -mod=readonly -tags liveopus -count=1 ./rtp ./mlow ./signaling ./relay ./stun . 2>&1 | tee -a "$LOG/meowcaller.log"
     )
     (
         cd "$RTC_SRC"
-        cargo test --locked -p matrix-rtc-core --features testing --lib -j "$JOBS" 2>&1 | tee "$LOG/matrix-rtc-core.log"
-        cargo test --locked -p matrix-rtc-core --features testing --test key_rotation -j "$JOBS" 2>&1 | tee -a "$LOG/matrix-rtc-core.log"
+        cargo test --locked -p matrix-rtc-core --features testing --lib --test key_rotation -j "$JOBS" 2>&1 | tee "$LOG/matrix-rtc-core.log"
         cargo test --locked -p matrix-rtc-call -p matrix-rtc-transport --lib --features matrix-rtc-transport/testing -j "$JOBS" 2>&1 | tee "$LOG/matrix-rtc-call-transport.log"
         cargo test --locked -p matrix-rtc-call-sdk --features matrix-sdk --lib -j "$JOBS" 2>&1 | tee "$LOG/matrix-rtc-call-sdk.log"
         cargo test --locked -p matrix-rtc-call-sdk --features matrix-sdk,testing --test resilience -j "$JOBS" 2>&1 | tee -a "$LOG/matrix-rtc-call-sdk.log"
@@ -193,7 +232,7 @@ grep -q '^--- PASS: TestRTCWorkerRelease ' "$LOG/worker-process.log" || { echo "
 # Only commands that returned success can reach this point (set -e / pipefail).
 # Bind the record to actual artifacts and nonempty logs from this fresh run.
 [[ "$(python3 -B "$SCRIPT_DIR/build-record.py" digest "$ORIGINAL_ROOT")" == "$SOURCE_DIGEST" ]] || { echo "Checkout changed during build" >&2; exit 20; }
-RECORD="$WORK/BUILD-RECORD.json"
+RECORD="$RUN/BUILD-RECORD.json"
 python3 -B "$SCRIPT_DIR/build-record.py" create "$RECORD" "$REPO_ROOT" "$BIN" "$LOG" "$SOURCE_DIGEST"
 
 # Serialize publication even if builders use different caches and the same dist.
@@ -268,7 +307,7 @@ publish_release() (
     (cd "$dist" && sha256sum -c "$name.zip.sha256") || return 21
 )
 if ! publish_release "$DIST" "$PACKAGE_NAME" "$ZIP_WORK" "$SHA_WORK"; then
-    echo "Incomplete release export; private build evidence retained at $WORK" >&2
+    echo "Incomplete release export; build logs and record retained at $RUN" >&2
     exit 21
 fi
 echo "Built release: $DIST/$PACKAGE_NAME.zip"

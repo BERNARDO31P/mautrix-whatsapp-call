@@ -241,3 +241,18 @@ func TestVideoSenderReportsDiscardedFrameAndRetiredProtection(t *testing.T) {
 		t.Fatal("failed protection must not clear recovery gate")
 	}
 }
+
+func TestRelayControlReadinessRequiresAllocationAndConsent(t *testing.T) {
+	for _, tc := range []struct {
+		allocation, consent, want bool
+	}{
+		{false, false, false},
+		{true, false, false},
+		{false, true, false},
+		{true, true, true},
+	} {
+		if got := relayControlReady(tc.allocation, tc.consent); got != tc.want {
+			t.Errorf("allocation=%v consent=%v: got %v want %v", tc.allocation, tc.consent, got, tc.want)
+		}
+	}
+}

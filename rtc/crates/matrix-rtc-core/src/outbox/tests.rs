@@ -730,3 +730,59 @@ mod properties {
         assert!(!unreachable(&outbox));
     }
 }
+
+// Reconciliation shares the existing leave fence and requires the durable
+// record to be gone before admitting another use of the legacy state key.
+#[derive(Default)]
+struct ReconcileJournal(std::sync::atomic::AtomicBool);
+impl LegacyLeaveJournal for ReconcileJournal {
+    fn pending(&self, _: &str, _: &str) -> Result<bool, CommandError> {
+        Ok(self.0.load(Ordering::SeqCst))
+    }
+    fn mark(&self, _: &str, _: &str) -> Result<(), CommandError> {
+        self.0.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    fn clear(&self, _: &str, _: &str) -> Result<(), CommandError> {
+        self.0.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn legacy_recovery_waits_for_previous_leave_and_clears_exact_fence() {
+    let journal = Arc::new(ReconcileJournal::default());
+    let outbox = Outbox::with_legacy_journal(journal.clone());
+    journal.mark("room", "key").unwrap();
+    let mut old_leave = outbox.legacy_leave_fence("room", "key").lock_owned().await;
+    *old_leave = true;
+    let calls = AtomicUsize::new(0);
+    let recover = || async {
+        calls.fetch_add(1, Ordering::SeqCst);
+        journal.clear("room", "key")
+    };
+    assert!(tokio::time::timeout(Duration::from_millis(20),
+        outbox.reconcile_legacy("room", "key", recover)).await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    drop(old_leave);
+    outbox.reconcile_legacy("room", "key", recover).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!*outbox.legacy_leave_fence("room", "key").lock_owned().await);
+    outbox.reconcile_legacy("room", "key", recover).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn legacy_recovery_keeps_fence_until_journal_settlement() {
+    let journal = Arc::new(ReconcileJournal::default());
+    let outbox = Outbox::with_legacy_journal(journal.clone());
+    journal.mark("room", "key").unwrap();
+    assert!(outbox.reconcile_legacy("room", "key", || async {
+        Err(CommandError::ClientRejected("unconfirmed cancellation".to_owned()))
+    }).await.is_err());
+    assert!(*outbox.legacy_leave_fence("room", "key").lock_owned().await);
+    assert!(outbox.reconcile_legacy("room", "key", || async { Ok(()) }).await.is_err());
+    assert!(journal.pending("room", "key").unwrap());
+    outbox.reconcile_legacy("room", "key", || async { journal.clear("room", "key") }).await.unwrap();
+    assert!(!*outbox.legacy_leave_fence("room", "key").lock_owned().await);
+}

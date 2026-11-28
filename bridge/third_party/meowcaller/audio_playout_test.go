@@ -1,6 +1,9 @@
 package meowcaller
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 type playoutTestSink struct {
 	frames [][]float32
@@ -183,5 +186,134 @@ func TestAudioPlayoutDuplicateDoesNotResetPrefillOrReplacePCM(t *testing.T) {
 		if frame[0] != 0.25 {
 			t.Fatal("duplicate replaced original PCM")
 		}
+	}
+}
+
+// MLow timestamp deltas need not match the 60 ms AudioSink frame size.
+func TestMLowPlayoutFramesVariableTimestampIntervals(t *testing.T) {
+	p := newAudioPlayoutBuffer()
+	p.clockScale = 1
+	s := &playoutTestSink{}
+	timestamp := uint32(0)
+	offset := 0
+	for _, samples := range []int{320, 640, 1920, 480, 480, 960, 960} {
+		pcm := make([]float32, samples)
+		for i := range pcm {
+			pcm[i] = float32(offset + i)
+		}
+		if _, err := p.Push(timestamp, pcm, s); err != nil {
+			t.Fatal(err)
+		}
+		timestamp += uint32(samples)
+		offset += samples
+	}
+	if err := p.Flush(s); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.frames) != offset/FrameSamples {
+		t.Fatalf("frames = %d, want %d", len(s.frames), offset/FrameSamples)
+	}
+	n := 0
+	for _, frame := range s.frames {
+		if len(frame) != FrameSamples {
+			t.Fatalf("invalid sink frame length %d", len(frame))
+		}
+		for _, sample := range frame {
+			if sample != float32(n) {
+				t.Fatalf("sample %d = %f", n, sample)
+			}
+			n++
+		}
+	}
+	if len(p.partialPCM) != offset%FrameSamples {
+		t.Fatal("incorrect PCM remainder")
+	}
+}
+
+type failingPlayoutSink struct {
+	playoutTestSink
+	fail bool
+}
+
+func (s *failingPlayoutSink) WriteFrame(frame []float32) error {
+	if s.fail {
+		s.fail = false
+		return errors.New("sink rejected frame")
+	}
+	return s.playoutTestSink.WriteFrame(frame)
+}
+
+func TestAudioPlayoutDoesNotReplayFailedPrefill(t *testing.T) {
+	p := newAudioPlayoutBuffer()
+	s := &failingPlayoutSink{fail: true}
+	for i := 0; i < 3; i++ {
+		_, err := p.Push(uint32(i*FrameSamples), constantPCM(FrameSamples, float32(i)), s)
+		if (err != nil) != (i == 2) {
+			t.Fatalf("push %d: %v", i, err)
+		}
+	}
+	for i := 3; i < 5; i++ {
+		if _, err := p.Push(uint32(i*FrameSamples), constantPCM(FrameSamples, float32(i)), s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(s.frames) != 2 || s.frames[0][0] != 2 || s.frames[1][0] != 3 {
+		t.Fatal("failed prefill was replayed")
+	}
+}
+
+func TestAudioPlayoutLatePacketsPreservePrefillAndSteadyState(t *testing.T) {
+	for _, scale := range []uint32{1, 3} {
+		for _, origin := range []uint32{0, ^uint32(0) - uint32(FrameSamples)*scale + 1} {
+			p := newAudioPlayoutBuffer()
+			p.clockScale = scale
+			s := &playoutTestSink{}
+			step := uint32(FrameSamples) * scale
+			push := func(ts uint32, value float32) bool {
+				t.Helper()
+				started, err := p.Push(ts, constantPCM(FrameSamples, value), s)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return started
+			}
+			push(origin, 0.25)
+			push(origin+step, 0.25)
+			if push(origin, 0.9) || p.pending.timestamp != origin+step {
+				t.Fatal("late packet replaced pending PCM")
+			}
+			if !push(origin+2*step, 0.25) {
+				t.Fatal("late packet reset prefill")
+			}
+			if push(origin+step, 0.9) || !p.started {
+				t.Fatal("late packet reset steady playout")
+			}
+			push(origin+3*step, 0.25)
+			if len(s.frames) != 3 {
+				t.Fatalf("writes = %d", len(s.frames))
+			}
+			for _, frame := range s.frames {
+				if frame[0] != 0.25 {
+					t.Fatal("late PCM was replayed")
+				}
+			}
+		}
+	}
+}
+
+func TestAudioPlayoutLargeBackwardDiscontinuityStillResets(t *testing.T) {
+	p := newAudioPlayoutBuffer()
+	s := &playoutTestSink{}
+	start := uint32(4 * audioPlayoutMaxGapSamples)
+	for i := uint32(0); i < 3; i++ {
+		if _, err := p.Push(start+i*FrameSamples, constantPCM(FrameSamples, 0.25), s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !p.started {
+		t.Fatal("prefill did not start")
+	}
+	if started, err := p.Push(0, constantPCM(FrameSamples, 0.5), s); err != nil || started || p.started || p.pending.timestamp != 0 {
+		t.Fatal("large backward discontinuity did not reset", err)
 	}
 }

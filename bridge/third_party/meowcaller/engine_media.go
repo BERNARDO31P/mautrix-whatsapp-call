@@ -1,6 +1,7 @@
 package meowcaller
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -37,6 +38,7 @@ type videoReceiveState struct {
 	role             GroupVideoRole
 	requestKeyframe  atomic.Bool
 	assembler        rtp.H264AccessUnitAssembler
+	reorder          rtp.VideoReorder
 	orientation      int
 }
 
@@ -94,7 +96,8 @@ func (e *engine) maybeStartMediaMatching(callID string, expected *engineCall) {
 		e.mu.Unlock()
 		return
 	}
-	if !m.group && m.relay == nil {
+	if !m.group && len(mediaRelayCandidates(m.relay, m.direction == CallDirectionIncoming, false)) == 0 {
+		e.c.log.Debug().Str("call_id", callID).Msg("waiting for usable direct relay allocation")
 		e.mu.Unlock()
 		return
 	}
@@ -139,7 +142,9 @@ func (e *engine) maybeStartMediaMatching(callID string, expected *engineCall) {
 		if err := e.runMedia(mctx, callID, call, callKey, selfLID, peerLID, rd, inbound); err != nil {
 			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("media ended")
 			if mctx.Err() == nil {
-				e.finishCallIfCurrent(call, "media_failed")
+				if endErr := e.endLocallyWithReason(call, false, "media_failed"); endErr != nil {
+					e.c.log.Warn().Err(endErr).Str("call_id", callID).Msg("media failure terminal settlement unconfirmed")
+				}
 			}
 		}
 	}()
@@ -149,53 +154,92 @@ func (e *engine) maybeStartMediaMatching(callID string, expected *engineCall) {
 // the channel and the allocate bytes (re-sent by the keepalive).
 //
 // NOT VALIDATED: live-relay only.
+// Check allocation prerequisites before spending a transport attempt.
+func usableRelayEndpoint(rd *relayData, ep *relayEndpoint) bool {
+	if rd == nil || ep == nil || len(rd.relayKeyASCII) == 0 ||
+		uint64(ep.tokenID) >= uint64(len(rd.relayTokens)) || len(rd.relayTokens[ep.tokenID]) == 0 || len(ep.addresses) == 0 {
+		return false
+	}
+	addr := ep.addresses[0]
+	ip := net.ParseIP(addr.ipv4)
+	return addr.port != 0 && ip != nil && ip.To4() != nil && !ip.IsUnspecified() && !ip.IsMulticast()
+}
+
 func mediaRelayCandidates(rd *relayData, inbound, group bool) []*relayEndpoint {
+	if rd == nil {
+		return nil
+	}
 	preferred := getMediaRelayEndpoint(rd, inbound)
 	if preferred == nil {
 		return nil
 	}
-	candidates := []*relayEndpoint{preferred}
-	if !group {
-		// Only retry advertised endpoints with their own allocation token.
-		// An explicit inbound FNA selection must not be replaced by non-FNA.
-		for i := range rd.endpoints {
-			ep := &rd.endpoints[i]
-			if ep == preferred || (inbound && preferred.isFNA && !ep.isFNA) || (!inbound && !preferred.isFNA && ep.isFNA) {
-				continue
-			}
+	if group {
+		// Group subscription updates are bound to the elected relay.
+		return []*relayEndpoint{preferred}
+	}
+	candidates := make([]*relayEndpoint, 0, 3)
+	// The parser can receive repeated te2 entries. Identical transport and
+	// allocation inputs must not consume multiple slots in the retry budget.
+	// Distinct tokens at the same address remain independent allocations.
+	type candidateKey struct {
+		ip      string
+		port    uint16
+		tokenID uint32
+	}
+	seen := make(map[candidateKey]bool, 3)
+	add := func(ep *relayEndpoint) {
+		if !usableRelayEndpoint(rd, ep) {
+			return
+		}
+		addr := ep.addresses[0]
+		key := candidateKey{net.ParseIP(addr.ipv4).To4().String(), addr.port, ep.tokenID}
+		if !seen[key] {
+			seen[key] = true
 			candidates = append(candidates, ep)
-			if len(candidates) == 3 {
-				break
-			}
+		}
+	}
+	add(preferred)
+	// Keep the elected relay class. An inbound FNA relay cannot be replaced
+	// by a non-FNA endpoint that does not carry the caller's media.
+	for i := range rd.endpoints {
+		ep := &rd.endpoints[i]
+		if ep == preferred || (inbound && preferred.isFNA && !ep.isFNA) || (!inbound && !preferred.isFNA && ep.isFNA) {
+			continue
+		}
+		add(ep)
+		if len(candidates) == 3 {
+			break
 		}
 	}
 	return candidates
 }
 
-func (e *engine) connectAndAllocate(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, inbound, group bool) (*relay.RelayMediaChannel, []byte, error) {
-	candidates := mediaRelayCandidates(rd, inbound, group)
-	if len(candidates) == 0 {
-		return nil, nil, fmt.Errorf("relay has no usable endpoint")
-	}
-	var lastErr error
-	for i, ep := range candidates {
-		if err := ctx.Err(); err != nil {
-			return nil, nil, err
-		}
-		ch, allocation, err := e.connectAndAllocateEndpoint(ctx, rd, streamSsrcs, ep)
-		if err == nil {
-			return ch, allocation, nil
-		}
-		lastErr = err
-		e.c.log.Warn().Err(err).Int("attempt", i+1).Int("candidates", len(candidates)).Str("relay_name", ep.relayName).Msg("relay setup attempt failed")
-	}
-	return nil, nil, fmt.Errorf("relay setup exhausted: %w", lastErr)
+// relayInitialSetup retains the early direct relay packets for the ordinary
+// media reader. A received packet is not itself proof of allocation or media.
+type relayInitialSetup struct {
+	channel      *relay.RelayMediaChannel
+	allocation   []byte
+	firstPackets [][]byte
+	pingTx       *[12]byte
 }
 
-func (e *engine) connectAndAllocateEndpoint(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, ep *relayEndpoint) (*relay.RelayMediaChannel, []byte, error) {
+func (e *engine) connectAndAllocate(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, inbound, group bool) (relayInitialSetup, error) {
+	candidates := mediaRelayCandidates(rd, inbound, group)
+	return tryRelayCandidates(ctx, candidates, func(ep *relayEndpoint, timeout time.Duration) (relayInitialSetup, error) {
+		return e.connectAndAllocateEndpoint(ctx, rd, streamSsrcs, ep, group, timeout)
+	}, func(attempt int, ep *relayEndpoint, err error) {
+		e.c.log.Warn().Err(err).Int("attempt", attempt).Int("candidates", len(candidates)).Str("relay_name", ep.relayName).Msg("relay setup attempt failed")
+	}, func(setup relayInitialSetup) {
+		if setup.channel != nil {
+			_ = setup.channel.Abort()
+		}
+	})
+}
+
+func (e *engine) connectAndAllocateEndpoint(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, ep *relayEndpoint, group bool, timeout time.Duration) (relayInitialSetup, error) {
 	log := e.c.log
-	if ep == nil || len(ep.addresses) == 0 {
-		return nil, nil, fmt.Errorf("relay has no usable endpoint")
+	if !usableRelayEndpoint(rd, ep) {
+		return relayInitialSetup{}, fmt.Errorf("relay endpoint or allocation credentials are incomplete")
 	}
 	addr := &net.UDPAddr{IP: net.ParseIP(ep.addresses[0].ipv4), Port: int(ep.addresses[0].port)}
 	log.Info().Str("relay_name", ep.relayName).Str("addr", addr.String()).Msg("connecting media transport to relay")
@@ -203,69 +247,112 @@ func (e *engine) connectAndAllocateEndpoint(ctx context.Context, rd *relayData, 
 		"event": "endpoint", "relay_name": ep.relayName,
 		"ipv4": ep.addresses[0].ipv4, "port": ep.addresses[0].port, "token_id": ep.tokenID,
 	})
-
-	connectCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
-	defer cancel()
-	ch, err := awaitRelayConnection(connectCtx, func() (*relay.RelayMediaChannel, error) {
-		return relay.ConnectRelayMediaContext(connectCtx, addr, relay.WithLogger(log))
-	}, func(ch *relay.RelayMediaChannel) {
-		if ch != nil {
-			_ = ch.Close()
-		}
-	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("relay connect: %w", err)
-	}
-	ch.BindLifetime(ctx)
-	stopAllocate := ch.WatchCancellation(connectCtx)
-	defer stopAllocate()
-	if err := connectCtx.Err(); err != nil {
-		_ = ch.Close()
-		return nil, nil, err
-	}
-	log.Info().Str("relay_name", ep.relayName).Msg("relay DataChannel open")
-
-	if int(ep.tokenID) >= len(rd.relayTokens) || rd.relayTokens[ep.tokenID] == nil {
-		ch.Close()
-		return nil, nil, fmt.Errorf("no relay token #%d", ep.tokenID)
-	}
-	if len(rd.relayKeyASCII) == 0 {
-		ch.Close()
-		return nil, nil, fmt.Errorf("relay has no <key>")
+	// The allocation always uses the signalled address, not the alternate transport port.
+	endpointXor, ok := stun.EncodeXorRelayEndpoint(ep.addresses[0].ipv4, ep.addresses[0].port, log)
+	if !ok {
+		return relayInitialSetup{}, fmt.Errorf("bad endpoint XOR")
 	}
 	e.c.diag.Emit("relay", map[string]any{
 		"event": "keying", "token_id": ep.tokenID, "token_count": len(rd.relayTokens),
-		"relay_key_bytes": len(rd.relayKeyASCII),
-		"token_bytes":     len(rd.relayTokens[ep.tokenID]),
+		"relay_key_bytes": len(rd.relayKeyASCII), "token_bytes": len(rd.relayTokens[ep.tokenID]),
 	})
-	endpointXor, ok := stun.EncodeXorRelayEndpoint(ep.addresses[0].ipv4, ep.addresses[0].port, log)
-	if !ok {
-		ch.Close()
-		return nil, nil, fmt.Errorf("bad endpoint XOR")
-	}
-	var tx [12]byte
-	if _, err := rand.Read(tx[:]); err != nil {
-		ch.Close()
-		return nil, nil, fmt.Errorf("generate relay allocation transaction ID: %w", err)
-	}
-	allocate := stun.BuildWasmStunAllocateRequestWithStreamSsrcs(tx, rd.relayTokens[ep.tokenID], endpointXor, streamSsrcs, rd.relayKeyASCII, log)
-	if _, err := ch.Send(allocate); err != nil {
-		ch.Close()
-		return nil, nil, fmt.Errorf("allocate send: %w", err)
-	}
-	// The allocation write also belongs to the setup deadline. Disarm the
-	// temporary watcher before cancelling connectCtx on a successful return.
-	if !stopAllocate() || connectCtx.Err() != nil {
-		_ = ch.Close()
-		return nil, nil, connectCtx.Err()
-	}
-	log.Info().Int("bytes", len(allocate)).Msg("sent STUN allocate")
-	e.c.diag.Emit("stun", map[string]any{
-		"event": "allocate_sent", "bytes": len(allocate),
-		"tx_id_hex":    hex.EncodeToString(tx[:]),
-		"stream_ssrcs": streamSsrcs,
+	connectCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	setup, _, err := dialDirectRelayPorts(connectCtx, ep.addresses[0].port, group, func(dialCtx context.Context, port uint16) (relayInitialSetup, error) {
+		target := &net.UDPAddr{IP: addr.IP, Port: int(port)}
+		log.Debug().Str("addr", target.String()).Uint16("advertised_port", ep.addresses[0].port).Msg("dialing relay transport port")
+		ch, err := awaitRelayConnection(dialCtx, func() (*relay.RelayMediaChannel, error) {
+			return relay.ConnectRelayMediaContext(dialCtx, target, relay.WithLogger(log))
+		}, func(ch *relay.RelayMediaChannel) {
+			if ch != nil {
+				_ = ch.Abort()
+			}
+		})
+		if err != nil {
+			return relayInitialSetup{}, err
+		}
+		keep := false
+		defer func() {
+			if !keep {
+				_ = ch.Abort()
+			}
+		}()
+		stopAllocate := ch.WatchCancellation(dialCtx)
+		defer stopAllocate()
+		if err := relayContextError(dialCtx); err != nil {
+			return relayInitialSetup{}, err
+		}
+		log.Info().Str("relay_name", ep.relayName).Uint16("transport_port", port).Uint16("advertised_port", ep.addresses[0].port).Msg("relay DataChannel open")
+		var tx [12]byte
+		if _, err := rand.Read(tx[:]); err != nil {
+			return relayInitialSetup{}, fmt.Errorf("generate relay allocation transaction ID: %w", err)
+		}
+		allocation := stun.BuildWasmStunAllocateRequestWithStreamSsrcs(tx, rd.relayTokens[ep.tokenID], endpointXor, streamSsrcs, rd.relayKeyASCII, log)
+		if _, err := ch.Send(allocation); err != nil {
+			return relayInitialSetup{}, fmt.Errorf("allocate send: %w", err)
+		}
+		log.Info().Int("bytes", len(allocation)).Msg("sent STUN allocate")
+		e.c.diag.Emit("stun", map[string]any{"event": "allocate_sent", "bytes": len(allocation), "tx_id_hex": hex.EncodeToString(tx[:]), "stream_ssrcs": streamSsrcs})
+		result := relayInitialSetup{channel: ch, allocation: allocation}
+		if !group {
+			var ptx [12]byte
+			if _, err := rand.Read(ptx[:]); err != nil {
+				return relayInitialSetup{}, fmt.Errorf("generate relay consent transaction ID: %w", err)
+			}
+			ping := stun.BuildWhatsappPing(ptx, log)
+			if _, err := ch.Send(ping[:]); err != nil {
+				return relayInitialSetup{}, fmt.Errorf("initial relay consent ping: %w", err)
+			}
+			e.c.diag.Emit("stun", map[string]any{"event": "consent_ping_sent", "tx_id_hex": hex.EncodeToString(ptx[:]), "ping_hex": hex.EncodeToString(ping[:])})
+			result.pingTx = &ptx
+			packets, err := awaitRelayPackets(dialCtx, ch.Recv, ch.WatchCancellation, func(packet []byte) (bool, error) {
+				// A matching allocation result is decisive. A binding request or
+				// early media must reach the normal reader without waiting for an
+				// acknowledgement that the relay might not send first.
+				if mt, ok := stun.StunMessageType(packet); ok {
+					switch mt {
+					case stun.MsgAllocateSuccess, stun.MsgAllocateError:
+						if got, ok := stun.StunTransactionID(packet); ok && bytes.Equal(got, tx[:]) {
+							if mt == stun.MsgAllocateSuccess {
+								return true, nil
+							}
+							e.c.diag.Emit("stun", map[string]any{"event": "allocation_response", "success": false, "transport_port": port})
+							if code, ok := stun.ParseStunErrorCode(packet, log); ok {
+								return false, fmt.Errorf("direct relay allocation rejected: STUN error %d", code)
+							}
+							return false, fmt.Errorf("direct relay allocation rejected")
+						}
+					case stun.MsgBindingRequest:
+						return true, nil
+					}
+					return false, nil
+				}
+				kind := relay.ClassifyRelayPacket(packet)
+				return kind == relay.RelayPacketRtp || kind == relay.RelayPacketRtcp, nil
+			})
+			if err != nil {
+				e.c.diag.Emit("stun", map[string]any{"event": "allocation_preflight_failed", "transport_port": port, "error": err.Error()})
+				return relayInitialSetup{}, fmt.Errorf("direct relay allocation receive: %w", err)
+			}
+			result.firstPackets = packets
+		}
+		if !stopAllocate() || dialCtx.Err() != nil {
+			return relayInitialSetup{}, relayContextError(dialCtx)
+		}
+		ch.BindLifetime(ctx)
+		keep = true
+		return result, nil
 	})
-	return ch, allocate, nil
+	if err != nil {
+		return relayInitialSetup{}, fmt.Errorf("relay setup: %w", err)
+	}
+	return setup, nil
+}
+
+// Both matched control acknowledgements are needed to establish relay readiness
+// without authenticated peer media. Either acknowledgement may arrive first.
+func relayControlReady(allocationConfirmed, consentConfirmed bool) bool {
+	return allocationConfirmed && consentConfirmed
 }
 
 // runMedia runs the per-frame media loop over the relay DataChannel: the Player's frames
@@ -305,12 +392,19 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		}
 		e.mu.Unlock()
 	}()
-	log := e.c.log
+	log := e.c.log.With().Str("call_id", callID).Logger()
 	enc, closeEncoder, err := newLiveAudioEncoder(audioConfig, log)
 	if err != nil {
 		return err
 	}
-	defer closeEncoder()
+	// Until the sender starts, startup owns the encoder. Once started, the
+	// sender closes it itself; a caller-provided AudioSource may block.
+	encoderOwnedBySender := false
+	defer func() {
+		if !encoderOwnedBySender {
+			closeEncoder()
+		}
+	}()
 	if ctx.Err() != nil {
 		return context.Cause(ctx)
 	}
@@ -343,25 +437,32 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	if err != nil {
 		return err
 	}
-	ch, allocate, err := e.connectAndAllocate(ctx, rd, streamSsrcs, inbound, group)
+	setup, err := e.connectAndAllocate(ctx, rd, streamSsrcs, inbound, group)
 	if err != nil {
 		return err
 	}
-	defer func() {
+	ch, allocate := setup.channel, setup.allocation
+	// Stop protocol I/O before joining senders. Closing only the UDP socket
+	// does not guarantee an SCTP/DataChannel writer has been released.
+	stopRelay := sync.OnceFunc(func() {
 		cancelMedia(nil)
-		_ = ch.Close()
-	}()
+		_ = ch.Abort()
+	})
+	defer stopRelay()
 	allocateState := newGroupRelayAllocateStateWithHBHFEC(
 		allocate,
 		rd.relayKeyASCII,
 		[2]uint32{hbhFECTXSSRC, hbhFECRXSSRC},
 	)
 
+	allocationStarted := time.Now()
 	var consent relayConsentTransactions
 	// Send a consent ping (0x0801) immediately, together with the allocate and BEFORE any
 	// RTP. The relay won't forward the peer's media until consent (ping → pong) is
 	// established; RTP sent before the first ping is dropped and the relay never bridges.
-	{
+	if setup.pingTx != nil {
+		consent.remember(*setup.pingTx, time.Now())
+	} else {
 		var ptx [12]byte
 		if _, err := rand.Read(ptx[:]); err != nil {
 			return fmt.Errorf("generate relay consent transaction ID: %w", err)
@@ -513,6 +614,8 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	var audioPlayoutMu sync.Mutex
 	var groupMixing atomic.Bool
 	defer func() {
+		// Stop background media I/O before flushing the playout buffer.
+		cancelMedia(nil)
 		if groupMixing.Load() {
 			return
 		}
@@ -523,7 +626,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	}()
 	audioMixer := newParticipantAudioMixer()
 	var audioSinkFramer participantAudioSinkFramer
-	go func() {
+	runMixedPlayout := func() {
 		ticker := time.NewTicker(time.Duration(participantAudioMixChunkSamples) * time.Second / SampleRate)
 		defer ticker.Stop()
 		playoutStarted := false
@@ -533,6 +636,9 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+			}
+			if ctx.Err() != nil {
+				return
 			}
 			if !groupMixing.Load() {
 				continue
@@ -563,7 +669,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 					Msg("started participant-mixed inbound audio playout")
 			}
 		}
-	}()
+	}
 	txPipe, err := NewMediaPipeline(callKey, selfLID, peerLID, ssrc, audioConfig.ticksPerPacket(), WithLogger(log))
 	if err != nil {
 		return err
@@ -591,31 +697,26 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		"peer_lid": peerLID, "ssrc": ssrc,
 	})
 
-	// relayRx counts packets received from the relay, so the silence watchdog can warn if
-	// the relay never answers our allocate.
-	var relayRx atomic.Uint64
-
-	// Inbound calls are torn down by the caller within ~400ms if the relay bind never
-	// comes alive; check at 400ms and 900ms and say so explicitly.
-	go func() {
-		for _, d := range []time.Duration{400 * time.Millisecond, 900 * time.Millisecond} {
-			select {
-			case <-ctx.Done():
+	// Observe actual responses independently of packet arrival. The direct-call
+	// allocation is fixed; group subscriptions may replace their transaction.
+	var allocationWatch relayAllocationWatch
+	runAllocationWatch := func() {
+		runRelayAllocationWatch(ctx, allocationStarted, func(after time.Duration) {
+			status := allocationWatch.status()
+			if status == relayAllocationAcknowledged || status == relayAllocationRejected || (group && status != relayAllocationSilent) {
 				return
-			case <-time.After(d):
 			}
-			if relayRx.Load() == 0 {
-				log.Warn().Dur("after", d).Msg("relay silent after allocate, no bytes back yet (allocate undelivered or rejected)")
-			}
-		}
-	}()
+			log.Warn().Dur("after", after).Str("allocation_status", status).Msg("relay allocation not acknowledged")
+			e.c.diag.Emit("stun", map[string]any{"event": "allocation_watchdog", "status": status, "elapsed_ms": after.Milliseconds()})
+		})
+	}
 
 	// Keepalive: re-send the Allocate AND a WhatsApp ping (0x0801) ~1 Hz. This matches the
 	// working capture exactly — allocate+ping every second, NO STUN binding-requests at
 	// all; the relay answers allocate-success + pong and bridges the peer's media.
 	// Binding-requests instead flip the relay into ICE-consent mode and the bridge never
 	// forms.
-	go func() {
+	runRelayKeepalive := func() {
 		t := time.NewTicker(time.Second)
 		defer t.Stop()
 		var tickCount uint64
@@ -624,6 +725,9 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			case <-ctx.Done():
 				return
 			case <-t.C:
+			}
+			if ctx.Err() != nil {
+				return
 			}
 			var tx [12]byte
 			if _, err := rand.Read(tx[:]); err != nil {
@@ -702,14 +806,15 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				"tx_id_hex": hex.EncodeToString(tx[:]), "ping_hex": hex.EncodeToString(ping[:]),
 			})
 		}
-	}()
+	}
 
 	// Send loop: frame-paced from connect, NOT gated on the Player. WhatsApp starts media
 	// on relay connection and the relay learns our SSRC from our FIRST RTP — it won't
 	// bridge the peer's media until it sees our stream. So we send silence frames until the
 	// Player has real audio (nextFrame() == nil means send silence).
 	frameInterval := time.Duration(audioConfig.frameSamples) * time.Second / SampleRate
-	go func() {
+	runAudioSender := func() {
+		defer closeEncoder()
 		silence := make([]float32, FrameSamples)
 		var packetizer opusPCMPacketizer
 		var packetGeneration opusPlayerGeneration
@@ -783,7 +888,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				e.c.diag.Emit("meta", map[string]any{"event": "first_rtp_sent", "call_id": callID, "bytes": len(packet)})
 			}
 		}
-	}()
+	}
 
 	// Receive: DataChannel → classify. RTP → unprotect → decode → sink. A non-RTP STUN
 	// binding request gets a binding-success reply (ICE consent freshness, RFC 7675);
@@ -890,6 +995,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		e.mu.Unlock()
 	}()
 
+	var allocationConfirmed, allocationRejected, consentConfirmed bool
 	var audioReception rtp.RtcpReceptionStatsSet
 	var videoReception rtp.RtcpReceptionStatsSet
 	if groupMode.Load() {
@@ -931,10 +1037,37 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		groupMixing.Store(shouldStartParticipantMixing(activeParticipantIDs))
 	}
 
+	// Do not start background media I/O until all fallible startup steps,
+	// including the authoritative group allocation and sender registration,
+	// have completed. A failed startup must not leak partially started tasks.
+	if err := relayContextError(ctx); err != nil {
+		return err
+	}
+	// Join the internal watchdog and report sender before releasing media
+	// resources. Do not join arbitrary AudioSource/AudioSink callbacks: the
+	// public interfaces allow blocking implementations.
+	var internalTasks sync.WaitGroup
+	defer func() {
+		stopRelay() // release protocol writers before waiting for their exit
+		internalTasks.Wait()
+	}()
+	startInternalTask := func(run func()) {
+		internalTasks.Add(1)
+		go func() {
+			defer internalTasks.Done()
+			run()
+		}()
+	}
+	go runMixedPlayout()
+	startInternalTask(runAllocationWatch)
+	go runRelayKeepalive()
+	encoderOwnedBySender = true
+	go runAudioSender()
+
 	// WhatsApp associates the RTP streams with an SRTCP session. Periodic compound
 	// SR+SDES packets are required for the caller's video to start flowing to the
 	// answerer, and give the peer a target for PLI/FIR recovery feedback.
-	go func() {
+	startInternalTask(func() {
 		ticker := time.NewTicker(1500 * time.Millisecond)
 		defer ticker.Stop()
 		var sent uint64
@@ -943,6 +1076,9 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			case <-ctx.Done():
 				return
 			case now := <-ticker.C:
+				if ctx.Err() != nil {
+					return
+				}
 				nowMs := uint64(now.UnixMilli())
 				e.mu.Lock()
 				current := e.mediaCallLocked(callID, call)
@@ -1000,7 +1136,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				})
 			}
 		}
-	}()
+	})
 
 	buf := make([]byte, 1500)
 	var rtpIn, rtpSeen, unprotectFail, rtpInspect, vidIn, appDataIn, appDataUnprotectFail, videoUnprotectFail, videoFrameIn, videoSinkMissing, rtcpIn, rtcpAuthFail, groupForwardingInvalid uint64
@@ -1008,7 +1144,15 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		if ctx.Err() != nil {
 			return context.Cause(ctx)
 		}
-		n, err := ch.Recv(buf)
+		var n int
+		var err error
+		if len(setup.firstPackets) != 0 {
+			n = copy(buf, setup.firstPackets[0])
+			setup.firstPackets[0] = nil
+			setup.firstPackets = setup.firstPackets[1:]
+		} else {
+			n, err = ch.Recv(buf)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return context.Cause(ctx)
@@ -1036,7 +1180,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			rosterGeneration = currentRosterGeneration
 			hasRosterGeneration = true
 		}
-		relayRx.Add(1)
+		allocationWatch.received.Store(true)
 		rawPkt := buf[:n]
 		pkt, groupWrapped, groupValid := relay.UnwrapGroupForwardingPacket(rawPkt)
 		if !groupValid {
@@ -1066,6 +1210,9 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 					"event": "auth_failed", "ssrc": senderSsrc, "bytes": n,
 				})
 				continue
+			}
+			if call != nil {
+				call.markRelayReady()
 			}
 			if rtcpIn++; rtcpIn == 1 {
 				log.Info().Uint32("ssrc", senderSsrc).Uint32("index", index).Msg("first authenticated peer SRTCP received")
@@ -1098,11 +1245,46 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				if allocateState.matchesResponse(pkt) {
 					// An acknowledgement is not evidence of peer media readiness.
 					e.c.diag.Emit("stun", map[string]any{"event": "allocation_response", "success": mt == stun.MsgAllocateSuccess})
+					if mt == stun.MsgAllocateSuccess {
+						allocationWatch.acknowledged.Store(true)
+					} else {
+						allocationWatch.rejected.Store(true)
+					}
+					if mt == stun.MsgAllocateSuccess && !allocationConfirmed {
+						log.Info().Msg("relay allocation acknowledged")
+						allocationConfirmed = true
+						if call != nil && relayControlReady(allocationConfirmed, consentConfirmed) {
+							call.markRelayReady()
+						}
+					} else if mt == stun.MsgAllocateError {
+						code, hasCode := stun.ParseStunErrorCode(pkt, log)
+						if !allocationRejected {
+							event := log.Warn()
+							if hasCode {
+								event = event.Uint16("stun_error_code", code)
+							}
+							event.Msg("relay rejected allocation")
+							allocationRejected = true
+						}
+						// Preflight can hand off on an early binding request or media.
+						// Do not leave a direct call connecting if the matching
+						// allocation is explicitly rejected afterwards.
+						if err := initialRelayRejection(groupMode.Load(), allocationConfirmed, code, hasCode); err != nil {
+							return err
+						}
+					}
 				}
 			case stun.MsgWhatsappPong:
 				tx, ok := stun.StunTransactionID(pkt)
 				if ok && consent.consume([12]byte(tx), time.Now()) {
 					e.c.diag.Emit("stun", map[string]any{"event": "consent_pong_matched"})
+					if !consentConfirmed {
+						log.Info().Msg("relay consent acknowledged")
+						consentConfirmed = true
+						if call != nil && relayControlReady(allocationConfirmed, consentConfirmed) {
+							call.markRelayReady()
+						}
+					}
 				}
 			case stun.MsgBindingRequest:
 				resp, answered, err := allocateState.SendBindingSuccess(pkt, func(packet []byte) error {
@@ -1210,22 +1392,9 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				}
 			}
 			videoReception.Observe(vh.Ssrc, vh.SequenceNumber, vh.Timestamp, uint64(time.Now().UnixMilli()), 90000)
+			orientation := -1
 			if vh.VideoExtension != nil {
-				orientation := vh.VideoExtension.DisplayOrientation()
-				if orientation != videoState.orientation {
-					videoState.orientation = orientation
-					if sink, ok := callVideoSink(call).(VideoOrientationSink); ok {
-						sink.SetOrientation(orientation)
-					}
-					log.Debug().
-						Int("orientation", orientation).
-						Uint8("media_frame_info", vh.VideoExtension.MediaFrameInfo).
-						Msg("updated peer video orientation from RTP")
-					e.c.diag.Emit("video", map[string]any{
-						"event": "orientation", "orientation": orientation,
-						"media_frame_info": vh.VideoExtension.MediaFrameInfo,
-					})
-				}
+				orientation = vh.VideoExtension.DisplayOrientation()
 			}
 			if videoWirePacket < videoWirePacketLimit {
 				headerLen, _ := rtp.RtpHeaderByteLength(pkt)
@@ -1241,12 +1410,63 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				})
 			}
 			videoWirePacket++
-			frame, complete, _ := videoState.assembler.Push(
-				vh.SequenceNumber,
-				vh.Timestamp,
-				vh.Marker,
-				media.Payload,
-			)
+			for _, ordered := range videoState.reorder.Push(rtp.VideoPacket{
+				Sequence: vh.SequenceNumber, Timestamp: vh.Timestamp, Marker: vh.Marker,
+				Orientation: orientation, Payload: media.Payload,
+			}, time.Now()) {
+				if ordered.Orientation >= 0 && ordered.Orientation != videoState.orientation {
+					videoState.orientation = ordered.Orientation
+					if sink, ok := callVideoSink(call).(VideoOrientationSink); ok {
+						sink.SetOrientation(ordered.Orientation)
+					}
+				}
+				frame, complete, _ := videoState.assembler.Push(ordered.Sequence, ordered.Timestamp, ordered.Marker, ordered.Payload)
+				if complete {
+					if videoWireFrame < videoWireFrameLimit {
+						e.c.diag.Emit("video_wire", map[string]any{
+							"event": "access_unit", "direction": "in", "call_id": callID,
+							"frame": videoWireFrame, "ssrc": vh.Ssrc, "rtp_ts": ordered.Timestamp,
+							"idr": rtp.AUHasIDR(frame), "bytes": len(frame),
+						})
+					}
+					videoWireFrame++
+					e.c.diag.Emit("video", map[string]any{"event": "frame", "ssrc": vh.Ssrc, "bytes": len(frame)})
+					deliveredParticipantFrame := false
+					if call != nil {
+						deliveredParticipantFrame = call.dispatchParticipantVideoFrame(ParticipantVideoFrame{
+							Epoch:         media.Epoch,
+							ParticipantID: media.ParticipantID,
+							Sender:        media.UserJID,
+							Device:        media.DeviceJID,
+							PID:           media.PID,
+							HasPID:        media.HasPID,
+							SSRC:          vh.Ssrc,
+							Timestamp:     ordered.Timestamp, RequestKeyframe: func() { videoState.requestKeyframe.Store(true) },
+							Orientation: videoFrameOrientation(videoState.orientation),
+							ScreenShare: role.ScreenShare, RoleRevision: role.Revision,
+							AccessUnit: frame,
+						})
+					}
+					delivered := deliveredParticipantFrame
+					if sink := callVideoSink(call); sink != nil {
+						if err := sink.WriteVideo(frame); err != nil {
+							log.Warn().Err(err).Uint32("ssrc", vh.Ssrc).Int("bytes", len(frame)).Msg("failed to write WhatsApp video frame to sink")
+						} else {
+							if videoFrameIn == 0 {
+								log.Info().Uint32("ssrc", vh.Ssrc).Int("bytes", len(frame)).Msg("first WhatsApp video frame written to sink")
+							}
+							videoFrameIn++
+							delivered = true
+						}
+					} else if !deliveredParticipantFrame {
+						if videoSinkMissing == 0 {
+							log.Warn().Uint32("ssrc", vh.Ssrc).Int("bytes", len(frame)).Msg("WhatsApp video frame arrived with no sink attached")
+						}
+						videoSinkMissing++
+					}
+					videoState.noteVideoDelivery(delivered)
+				}
+			}
 			if send, explicit := videoState.takeVideoPLI(lastVideoPLI, vh.Ssrc, time.Now()); send {
 				packet, feedbackErr := videoRtcp.pictureLossIndication(vh.Ssrc)
 				if feedbackErr == nil {
@@ -1258,51 +1478,6 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 					}
 					log.Warn().Err(feedbackErr).Uint32("ssrc", vh.Ssrc).Msg("failed to request video keyframe after RTP loss")
 				}
-			}
-			if complete {
-				if videoWireFrame < videoWireFrameLimit {
-					e.c.diag.Emit("video_wire", map[string]any{
-						"event": "access_unit", "direction": "in", "call_id": callID,
-						"frame": videoWireFrame, "ssrc": vh.Ssrc, "rtp_ts": vh.Timestamp,
-						"idr": rtp.AUHasIDR(frame), "bytes": len(frame),
-					})
-				}
-				videoWireFrame++
-				e.c.diag.Emit("video", map[string]any{"event": "frame", "ssrc": vh.Ssrc, "bytes": len(frame)})
-				deliveredParticipantFrame := false
-				if call != nil {
-					deliveredParticipantFrame = call.dispatchParticipantVideoFrame(ParticipantVideoFrame{
-						Epoch:         media.Epoch,
-						ParticipantID: media.ParticipantID,
-						Sender:        media.UserJID,
-						Device:        media.DeviceJID,
-						PID:           media.PID,
-						HasPID:        media.HasPID,
-						SSRC:          vh.Ssrc,
-						Timestamp:     vh.Timestamp, RequestKeyframe: func() { videoState.requestKeyframe.Store(true) },
-						Orientation: videoState.orientation,
-						ScreenShare: role.ScreenShare, RoleRevision: role.Revision,
-						AccessUnit: frame,
-					})
-				}
-				delivered := deliveredParticipantFrame
-				if sink := callVideoSink(call); sink != nil {
-					if err := sink.WriteVideo(frame); err != nil {
-						log.Warn().Err(err).Uint32("ssrc", vh.Ssrc).Int("bytes", len(frame)).Msg("failed to write WhatsApp video frame to sink")
-					} else {
-						if videoFrameIn == 0 {
-							log.Info().Uint32("ssrc", vh.Ssrc).Int("bytes", len(frame)).Msg("first WhatsApp video frame written to sink")
-						}
-						videoFrameIn++
-						delivered = true
-					}
-				} else if !deliveredParticipantFrame {
-					if videoSinkMissing == 0 {
-						log.Warn().Uint32("ssrc", vh.Ssrc).Int("bytes", len(frame)).Msg("WhatsApp video frame arrived with no sink attached")
-					}
-					videoSinkMissing++
-				}
-				videoState.noteVideoDelivery(delivered)
 			}
 			if vidIn++; vidIn == 1 {
 				log.Info().Uint32("ssrc", vh.Ssrc).Msg("first video RTP demuxed from relay (NOT VALIDATED)")
@@ -1366,6 +1541,9 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		}
 		if playoutLocked {
 			audioPlayoutMu.Unlock()
+		}
+		if call != nil {
+			call.markRelayReady()
 		}
 		if rtpIn++; rtpIn == 1 {
 			log.Info().Msg("first RTP decoded from relay, inbound audio flowing")

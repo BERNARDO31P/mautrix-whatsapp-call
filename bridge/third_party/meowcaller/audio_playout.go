@@ -33,11 +33,13 @@ func (p *audioPlayoutBuffer) Push(timestamp uint32, frame []float32, sink AudioS
 	}
 
 	delta := timestamp - p.pending.timestamp
-	// Duplicate PCM must not replace the pending frame or reset prefill.
-	if delta == 0 {
+	scale := max(p.clockScale, 1)
+	// The relay can deliver recent packets out of order. Do not replace
+	// pending PCM or reset prefill for duplicates or late packets. Signed
+	// RTP arithmetic preserves forward progress across timestamp wraparound.
+	if delta == 0 || (int32(delta) < 0 && p.pending.timestamp-timestamp <= audioPlayoutMaxGapSamples*scale) {
 		return false, nil
 	}
-	scale := max(p.clockScale, 1)
 	if delta > audioPlayoutMaxGapSamples*scale || delta%scale != 0 {
 		p.reset(timestamp, frame)
 		return false, nil
@@ -67,11 +69,15 @@ func (p *audioPlayoutBuffer) Push(timestamp uint32, frame []float32, sink AudioS
 
 	for len(p.prefill) > 0 {
 		buffered := p.prefill[0]
-		if err = p.write(sink, buffered); err != nil {
-			return false, err
-		}
 		p.prefillSamples -= len(buffered)
 		p.prefill = p.prefill[1:]
+		if err = p.write(sink, buffered); err != nil {
+			// Do not replay stale prefill or a partially accepted batch.
+			p.prefill = nil
+			p.prefillSamples = 0
+			p.partialPCM = nil
+			return false, err
+		}
 	}
 	p.started = true
 	p.prefill = nil
@@ -133,12 +139,10 @@ func alignAudioFrame(frame []float32, samples int) []float32 {
 	return aligned
 }
 
-// The bridge wire accepts exact 60 ms frames. Standard Opus may decode 2.5–120
-// ms; combine/split only the Opus path, retaining at most one partial frame.
+// AudioSink uses exact 60 ms frames regardless of the negotiated codec.
+// Timestamp alignment can produce short or multi-frame PCM even for MLow.
+// Keep at most one incomplete frame between writes.
 func (p *audioPlayoutBuffer) write(sink AudioSink, pcm []float32) error {
-	if p.clockScale <= 1 {
-		return sink.WriteFrame(pcm)
-	}
 	p.partialPCM = append(p.partialPCM, pcm...)
 	for len(p.partialPCM) >= FrameSamples {
 		frame := append([]float32(nil), p.partialPCM[:FrameSamples]...)

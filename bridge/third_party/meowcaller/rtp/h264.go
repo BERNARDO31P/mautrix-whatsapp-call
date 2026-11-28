@@ -196,6 +196,12 @@ func (a *H264AccessUnitAssembler) RequireKeyframe() {
 // Push consumes one ordered RTP payload and returns a complete, decodable access
 // unit when the marker closes the frame.
 func (a *H264AccessUnitAssembler) Push(sequence uint16, timestamp uint32, marker bool, payload []byte) ([]byte, bool, bool) {
+	// Late or duplicate packets must not mutate the current assembly or move
+	// the expected sequence backwards. Signed distance handles RTP wrap.
+	// A genuine forward gap still triggers the existing loss recovery path.
+	if a.hasSequence && int16(sequence-a.expectedSeq) < 0 {
+		return nil, false, false
+	}
 	// Source of truth: https://github.com/JotaDev66/WaCalls/blob/2d6a1f666426049a89ef9541414e771acdcf8a16/internal/voip/transport/h264_packet.go#L138-L210
 	recoveryNeeded := false
 	invalidate := func() {
@@ -249,6 +255,12 @@ func (a *H264AccessUnitAssembler) Push(sequence uint16, timestamp uint32, marker
 	}
 	if a.keyframeNeeded {
 		if !AUHasIDR(accessUnit) {
+			// SPS/PPS can arrive in separate, marker-completed units before
+			// the first IDR. Preserve these for the downstream parameter
+			// cache without opening the gate to dependent pictures.
+			if auHasOnlyParameterSets(accessUnit) {
+				return accessUnit, true, recoveryNeeded
+			}
 			return nil, false, recoveryNeeded
 		}
 		a.keyframeNeeded = false
@@ -361,4 +373,20 @@ func (d *H264Depacketizer) Depacketize(payload []byte) [][]byte {
 	default:
 		return invalid()
 	}
+}
+
+// A recovery unit may carry parameter sets and non-picture metadata, but no
+// coded picture. Other non-VCL types are deliberately not admitted here.
+func auHasOnlyParameterSets(au []byte) bool {
+	hasParameters := false
+	for _, nal := range SplitAnnexB(au) {
+		switch nal[0] & 31 {
+		case 7, 8:
+			hasParameters = true
+		case 6, 9:
+		default:
+			return false
+		}
+	}
+	return hasParameters
 }

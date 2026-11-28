@@ -27,3 +27,15 @@ func watchSetupCancellation(ctx context.Context, socket io.Closer) func() bool {
 		return disarmed
 	}
 }
+
+// abortFailedSetup closes the socket before unwinding protocol resources.
+// A failed SCTP/DataChannel setup cannot rely on a functioning peer to finish
+// a graceful shutdown. Interrupt blocked transport I/O before closing layers.
+func abortFailedSetup(abortSocket func() error, cleanup []func() error) {
+	if abortSocket != nil {
+		_ = abortSocket()
+	}
+	for i := len(cleanup) - 1; i >= 0; i-- {
+		_ = cleanup[i]()
+	}
+}

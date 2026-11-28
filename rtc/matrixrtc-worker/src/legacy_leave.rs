@@ -16,6 +16,89 @@ struct DelayRecord {
     delay_id: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct MembershipSnapshot {
+    active: bool,
+    sent_delay_id: Option<String>,
+}
+
+impl MembershipSnapshot {
+    fn proves_sent(&self, id: &str) -> bool {
+        !self.active && !id.is_empty() && self.sent_delay_id.as_deref() == Some(id)
+    }
+}
+
+// Synapse may remove a delayed event from its pending lookup before the
+// corresponding state event becomes visible. Observe authoritative state for
+// a bounded interval while retaining the room/slot and ownership fences.
+// An empty state alone never proves that an older delayed write is settled.
+async fn await_published_leave<F, Fut>(id: &str, budget: std::time::Duration, mut read: F) -> io::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = io::Result<MembershipSnapshot>>,
+{
+    use std::time::Duration;
+    let result = tokio::time::timeout(budget, async {
+        loop {
+            if read().await?.proves_sent(id) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }).await;
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::other("delayed leave outcome is unconfirmed after bounded state observation")),
+    }
+}
+
+fn missing_delayed_event(error: &CommandError) -> bool {
+    error.backend_error().is_some_and(|error| {
+        error.status == Some(404) && error.errcode.as_deref() == Some("M_NOT_FOUND")
+    })
+}
+
+fn membership_snapshot(
+    events: Vec<serde_json::Value>, key: &str, user: &str, device: &str, member_id: &str,
+) -> io::Result<MembershipSnapshot> {
+    use matrix_rtc_core::compat::STATE_MEMBER_EVENT_TYPE;
+    let mut snapshot = MembershipSnapshot::default();
+    let mut found = false;
+    for event in events {
+        let kind = event["type"].as_str().ok_or_else(|| io::Error::other("state event type missing"))?;
+        if kind != STATE_MEMBER_EVENT_TYPE { continue; }
+        let state_key = event["state_key"].as_str().ok_or_else(|| io::Error::other("membership state key missing"))?;
+        if state_key != key { continue; }
+        if found { return Err(io::Error::other("duplicate membership state key")); }
+        found = true;
+        let content = event["content"].as_object().ok_or_else(|| io::Error::other("membership content missing or invalid"))?;
+        if event["sender"].as_str() != Some(user) {
+            return Err(io::Error::other("current membership has a different sender"));
+        }
+        if content.is_empty() {
+            // Only a server-returned event carrying this delay ID is proof of
+            // publication. An empty state event without a delay ID is not.
+            let unsigned = &event["unsigned"];
+            let stable = unsigned.get("delay_id");
+            let unstable = unsigned.get("org.matrix.msc4140.delay_id");
+            if stable.is_some() && unstable.is_some() && stable != unstable {
+                return Err(io::Error::other("conflicting delayed event IDs"));
+            }
+            if event["event_id"].as_str().is_some_and(|id| !id.is_empty()) {
+                snapshot.sent_delay_id = stable.or(unstable).and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.is_empty()).map(str::to_owned);
+            }
+        } else {
+            if content.get("device_id").and_then(serde_json::Value::as_str) != Some(device)
+                || content.get("membershipID").and_then(serde_json::Value::as_str) != Some(member_id) {
+                return Err(io::Error::other("current membership has a different owner"));
+            }
+            snapshot.active = true;
+        }
+    }
+    Ok(snapshot)
+}
+
 impl Journal {
     pub(crate) fn new(identity_folder: PathBuf) -> io::Result<Self> {
         let dir = identity_folder.join("legacy-membership-ownership");
@@ -125,6 +208,83 @@ impl Journal {
         Ok(false)
     }
 
+    // Called with the room/slot reservation and the outbox leave fence held.
+    // Never reconcile another room or a currently active call.
+    pub(crate) async fn recover_known(&self, client: &matrix_sdk::Client, room: &str, slot: &str) -> io::Result<()> {
+        use matrix_rtc_core::{MatrixBackend, compat::STATE_MEMBER_EVENT_TYPE};
+        use matrix_rtc_call_sdk::SdkMatrixBackend;
+        use matrix_sdk::ruma::{RoomId, api::client::state::get_state_events};
+        let backend = SdkMatrixBackend::new(client.clone());
+        let user = backend.own_user_id();
+        let device = backend.own_device_id();
+        let dialect = RoomStateDialect::new(user.clone(), device.clone(), room.to_owned(), slot.to_owned());
+        let key = dialect.state_key();
+        let (marker, expected) = self.record(room, &key);
+        if !fs::symlink_metadata(&marker)?.is_file() || fs::read(&marker)? != expected {
+            return Err(io::Error::other("membership ownership marker not confirmed"));
+        }
+        let mut records = Vec::new();
+        {
+            let _access = self.access.lock().map_err(|_| io::Error::other("journal lock poisoned"))?;
+            for entry in fs::read_dir(&self.operations)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    return Err(io::Error::other("invalid delayed membership operation file"));
+                }
+                let record: DelayRecord = serde_json::from_slice(&fs::read(entry.path())?).map_err(io::Error::other)?;
+                let op = &record.operation;
+                let op_key = RoomStateDialect::new(op.user_id.clone(), op.device_id.clone(), op.room_id.clone(), op.slot_id.clone()).state_key();
+                if op.room_id != room || op_key != key { continue; }
+                if entry.path() != self.operation_path(op)? || op.user_id != user || op.device_id != device
+                    || op.slot_id != slot || op.member_id != dialect.membership_id()
+                    || record.delay_id.as_deref().is_none_or(str::is_empty) {
+                    return Err(io::Error::other("unsettled delayed membership identity or ID"));
+                }
+                records.push(record);
+            }
+        }
+        let room_id = RoomId::parse(room).map_err(io::Error::other)?;
+        let member_id = dialect.membership_id();
+        // Read authoritative state, not a possibly stale SDK cache. Check it
+        // again after cancellation, since a delayed leave can fire meanwhile.
+        let read_membership = || async {
+            let response = client.send(get_state_events::v3::Request::new(room_id.clone())).await.map_err(io::Error::other)?;
+            let events = response.room_state.into_iter()
+                .map(|ev| serde_json::from_str(ev.json().get()).map_err(io::Error::other))
+                .collect::<io::Result<Vec<serde_json::Value>>>()?;
+            membership_snapshot(events, &key, &user, &device, &member_id)
+        };
+        read_membership().await?;
+        eprintln!("RTC membership recovery: checking {} known delayed operation(s)", records.len());
+        for record in &records {
+            let id = record.delay_id.as_ref().expect("validated above");
+            match backend.cancel_delayed_event(room.to_owned(), id.clone()).await {
+                Ok(()) => {
+                    eprintln!("RTC membership recovery: delayed cancellation confirmed");
+                },
+                Err(error) if missing_delayed_event(&error) => {
+                    // A 404 alone is not enough: Synapse excludes events that
+                    // are still being processed from its pending-event lookup.
+                    // Accept only the exact already-published empty state event.
+                    eprintln!("RTC membership recovery: pending event missing; observing authoritative leave state");
+                    await_published_leave(id, std::time::Duration::from_secs(5), &read_membership).await?;
+                    eprintln!("RTC membership recovery: matching delayed leave publication confirmed");
+                }
+                Err(error) => return Err(io::Error::other(error)),
+            }
+            self.settle_delay(&record.operation, Some(id.as_str())).map_err(io::Error::other)?;
+        }
+        if read_membership().await?.active {
+            backend.send_state_event(room.to_owned(), STATE_MEMBER_EVENT_TYPE.to_owned(), key.clone(), serde_json::json!({})).await.map_err(io::Error::other)?;
+        }
+        if read_membership().await?.active {
+            return Err(io::Error::other("membership remains active after withdrawal"));
+        }
+        self.clear(room, &key).map_err(io::Error::other)?;
+        eprintln!("RTC membership recovery: previous ownership settled");
+        Ok(())
+    }
+
     fn record(&self, room: &str, key: &str) -> (PathBuf, Vec<u8>) {
         let data = serde_json::to_vec(&(room, key)).expect("string pair serializes");
         (self.dir.join(hex::encode(Sha256::digest(&data))), data)
@@ -207,6 +367,74 @@ mod tests {
             user_id: "@ghost:a".to_owned(), device_id: "DEVICE".to_owned(),
         }
     }
+    #[test]
+    fn missing_delay_requires_exact_published_leave() {
+        use matrix_rtc_core::{BackendError, compat::STATE_MEMBER_EVENT_TYPE};
+        let error = |status, code: &str| CommandError::Backend(BackendError::with_matrix_error(
+            Some(code.to_owned()), Some(status), "test"));
+        assert!(missing_delayed_event(&error(404, "M_NOT_FOUND")));
+        assert!(!missing_delayed_event(&error(404, "M_UNRECOGNIZED")));
+        assert!(!missing_delayed_event(&error(500, "M_NOT_FOUND")));
+        let inspect = |events| membership_snapshot(events, "key", "@ghost:a", "DEVICE", "member");
+        let event = serde_json::json!({
+            "type": STATE_MEMBER_EVENT_TYPE, "state_key": "key", "sender": "@ghost:a",
+            "event_id": "$leave", "content": {}, "unsigned": {"org.matrix.msc4140.delay_id": "expected"}
+        });
+        assert!(inspect(vec![event.clone()]).unwrap().proves_sent("expected"));
+        assert!(!inspect(vec![event.clone()]).unwrap().proves_sent("other"));
+        assert!(!inspect(vec![]).unwrap().proves_sent("expected"));
+        let mut unknown = event.clone();
+        unknown["unsigned"] = serde_json::json!({});
+        assert!(!inspect(vec![unknown]).unwrap().proves_sent("expected"));
+        let mut conflicting = event.clone();
+        conflicting["unsigned"]["delay_id"] = serde_json::json!("other");
+        assert!(inspect(vec![conflicting]).is_err());
+        let mut foreign = event.clone();
+        foreign["sender"] = serde_json::json!("@other:a");
+        assert!(inspect(vec![foreign]).is_err());
+        let mut active = event.clone();
+        active["content"] = serde_json::json!({"device_id":"DEVICE","membershipID":"member"});
+        let snapshot = inspect(vec![active]).unwrap();
+        assert!(snapshot.active && !snapshot.proves_sent("expected"));
+        assert!(inspect(vec![event.clone(), event]).is_err());
+    }
+    #[tokio::test]
+    async fn delayed_publication_can_be_observed_after_pending_lookup_disappears() {
+        let mut snapshots = std::collections::VecDeque::from([
+            MembershipSnapshot { active: true, sent_delay_id: None },
+            MembershipSnapshot { active: false, sent_delay_id: Some("other".to_owned()) },
+            MembershipSnapshot { active: false, sent_delay_id: Some("expected".to_owned()) },
+        ]);
+        await_published_leave("expected", std::time::Duration::from_secs(5), || {
+            std::future::ready(Ok(snapshots.pop_front().expect("unexpected extra read")))
+        }).await.unwrap();
+        assert!(snapshots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delayed_publication_observation_preserves_authoritative_read_errors() {
+        let error = await_published_leave("expected", std::time::Duration::from_secs(5), || {
+            std::future::ready(Err(io::Error::other("membership owner changed")))
+        }).await.unwrap_err();
+        assert_eq!(error.to_string(), "membership owner changed");
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_empty_membership_does_not_settle_after_observation_timeout() {
+        let error = await_published_leave("expected", std::time::Duration::from_millis(20), || {
+            std::future::ready(Ok(MembershipSnapshot { active: false, sent_delay_id: None }))
+        }).await.unwrap_err();
+        assert!(error.to_string().contains("delayed leave outcome is unconfirmed"));
+    }
+
+    #[tokio::test]
+    async fn stalled_authoritative_read_does_not_block_recovery_indefinitely() {
+        let error = await_published_leave("expected", std::time::Duration::from_millis(20), || {
+            std::future::pending::<io::Result<MembershipSnapshot>>()
+        }).await.unwrap_err();
+        assert!(error.to_string().contains("delayed leave outcome is unconfirmed"));
+    }
+
     #[test]
     fn delayed_intent_and_exact_id_survive_reopen_and_settle_independently() {
         let root = std::env::temp_dir().join(format!("matrixrtc-delay-journal-{}", std::process::id()));

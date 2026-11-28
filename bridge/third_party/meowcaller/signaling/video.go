@@ -20,8 +20,10 @@ const VideoCodecH264 = "h264"
 const VideoStateDecH264 = "H264"
 
 const (
-	VideoDecRequest = "H264"
-	VideoDecAccept  = "H264,AV1"
+	// The bridge receives Annex-B H.264 only. Do not advertise AV1 on
+	// upgrades when neither the RTP demux nor the decoder supports it.
+	VideoDecRequest = VideoStateDecH264
+	VideoDecAccept  = VideoStateDecH264
 )
 
 const (

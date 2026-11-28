@@ -729,7 +729,38 @@ async fn legacy_uncertain_cancellation_blocks_rejoin() {
     let client = RtcClient::new(mock.clone());
     let room = open_legacy_for_fence(&client, &mock).await;
     let old = room.join(JoinOptions::application("m.call")).await.expect("legacy join");
-    mock.script(MockMethod::CancelDelayedEvent, [offline()]);
+    // A single transient failure is now retried. Keep cancellation unavailable
+    // for the entire retry budget to exercise genuinely unsettled ownership.
+    mock.script(MockMethod::CancelDelayedEvent, (0..32).map(|_| offline()));
+    old.leave(LeaveSessionParams::new()).await.expect("detach leave");
+    assert!(matches!(room.join(JoinOptions::application("m.call")).await,
+        Err(RtcError::Join(matrix_rtc_core::JoinError::Refused { .. }))));
+    assert!(mock.calls_to(MockMethod::CancelDelayedEvent).len() > 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn legacy_transient_cancellation_allows_rejoin_after_retry() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open_legacy_for_fence(&client, &mock).await;
+    let old = room.join(JoinOptions::application("m.call")).await.expect("legacy join");
+    let before = mock.calls_to(MockMethod::CancelDelayedEvent).len();
+    mock.script(MockMethod::CancelDelayedEvent, [offline(), MockOutcome::Ok]);
+    old.leave(LeaveSessionParams::new()).await.expect("detach leave");
+    let new = room.join(JoinOptions::application("m.call")).await.expect("legacy rejoin");
+    assert_eq!(mock.calls_to(MockMethod::CancelDelayedEvent).len(), before + 2);
+    assert!(new.is_live());
+}
+
+#[tokio::test(start_paused = true)]
+async fn legacy_missing_delayed_event_blocks_rejoin_without_settlement() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open_legacy_for_fence(&client, &mock).await;
+    let old = room.join(JoinOptions::application("m.call")).await.expect("legacy join");
+    mock.script(MockMethod::CancelDelayedEvent, [MockOutcome::Fail(
+        BackendError::with_matrix_error(Some("M_NOT_FOUND".to_owned()), Some(404), "missing delayed event"),
+    )]);
     old.leave(LeaveSessionParams::new()).await.expect("detach leave");
     assert!(matches!(room.join(JoinOptions::application("m.call")).await,
         Err(RtcError::Join(matrix_rtc_core::JoinError::Refused { .. }))));
