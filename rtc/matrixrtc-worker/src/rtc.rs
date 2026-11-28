@@ -36,6 +36,16 @@ impl Drop for AbortOnDrop {
 fn track_replaced<T: ?Sized>(previous: &Arc<T>, current: Option<&Arc<T>>) -> bool {
     current.is_none_or(|track| !Arc::ptr_eq(previous, track))
 }
+// A roster update can precede the actual remote video track. Start/unmute
+// is emitted only by the successful track attachment path, before its frames.
+// Mute and stop still follow the roster so an absent track cannot keep sending.
+fn direct_video_roster_control(previous: Option<Option<bool>>, state: Option<bool>) -> Option<&'static str> {
+    match (previous, state) {
+        (Some(Some(_)), None) => Some("matrix_video_stop"),
+        (_, Some(true)) => Some("matrix_video_mute"),
+        _ => None,
+    }
+}
 // Keep a retry budget per actual track, not per transient roster event.
 const REMOTE_RETRY_LIMIT: u8 = 2;
 const REMOTE_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -123,6 +133,18 @@ const OUTGOING_ANSWER_BUDGET: Duration = Duration::from_secs(50);
 // Local upper bound only; the gateway may expire its invitation sooner.
 const OUTGOING_ADMISSION_BUDGET: Duration = Duration::from_secs(50);
 const JOIN_BUDGET: Duration = Duration::from_secs(35);
+// Direct calls now wait for relay readiness as well as peer acceptance.
+// Keep a five-second delivery margin and retain ongoing caller validation.
+const OUTGOING_PEER_ACCEPTANCE_BUDGET: Duration = Duration::from_secs(125);
+const OUTGOING_DIRECT_RELAY_BUDGET: Duration = Duration::from_secs(30);
+
+fn outgoing_acceptance_budget(group: bool) -> Duration {
+    if group {
+        OUTGOING_PEER_ACCEPTANCE_BUDGET
+    } else {
+        OUTGOING_PEER_ACCEPTANCE_BUDGET + OUTGOING_DIRECT_RELAY_BUDGET
+    }
+}
 
 fn check_answer_deadline(deadline: tokio::time::Instant) -> io::Result<()> {
     if tokio::time::Instant::now() >= deadline {
@@ -496,17 +518,50 @@ async fn synced_room(incoming: &Message, accounts: &Accounts) -> io::Result<(Arc
     require_membership_support(&ghost.client, membership_format(incoming)?).await?;
     let room=wait_room(incoming,&ghost).await?;
     validate_room(incoming,&room).await?;
-    if membership_format(incoming)?.reads_state_membership() {
-        use matrix_rtc_core::{MatrixBackend, CommandError, compat::RoomStateDialect};
-        let backend = SdkMatrixBackend::new(ghost.client.clone());
-        let key = RoomStateDialect::new(backend.own_user_id(), backend.own_device_id(), incoming.room_id.clone(), incoming.slot_id.clone()).state_key();
-        tokio::time::timeout(Duration::from_secs(25), ghost.outbox.reconcile_legacy(&incoming.room_id, &key, || async {
-            ghost.identity.check().await.map_err(|err| CommandError::ClientRejected(err.to_string()))?;
-            ghost.journal.recover_known(&ghost.client, &incoming.room_id, &incoming.slot_id).await
-                .map_err(|err| CommandError::ClientRejected(format!("membership reconciliation failed: {err}")))
-        })).await.map_err(|_| error("membership reconciliation timed out"))?.map_err(io::Error::other)?;
-    }
+    reconcile_legacy_membership(incoming, &ghost).await?;
     Ok((ghost,room))
+}
+
+// The caller holds the room/slot reservation throughout reconciliation.
+// The journal and outbox fence authorize only the worker's own membership.
+async fn reconcile_legacy_membership(incoming: &Message, ghost: &Ghost) -> io::Result<()> {
+    if !membership_format(incoming)?.reads_state_membership() {
+        return Ok(());
+    }
+    use matrix_rtc_core::{MatrixBackend, CommandError, compat::RoomStateDialect};
+    let backend = SdkMatrixBackend::new(ghost.client.clone());
+    let key = RoomStateDialect::new(backend.own_user_id(), backend.own_device_id(), incoming.room_id.clone(), incoming.slot_id.clone()).state_key();
+    tokio::time::timeout(Duration::from_secs(25), ghost.outbox.reconcile_legacy(&incoming.room_id, &key, || async {
+        ghost.identity.check().await.map_err(|err| CommandError::ClientRejected(err.to_string()))?;
+        ghost.journal.recover_known(&ghost.client, &incoming.room_id, &incoming.slot_id).await
+            .map_err(|err| CommandError::ClientRejected(format!("membership reconciliation failed: {err}")))
+    })).await.map_err(|_| error("membership reconciliation timed out"))?.map_err(io::Error::other)
+}
+
+// A failed join can have published the legacy membership before the SFU
+// attachment fails. Reuse the same fenced recovery while the reservation is
+// still held; preserve the original setup error for the caller.
+async fn recover_failed_join<T>(result: io::Result<T>, recovery: impl std::future::Future<Output = io::Result<()>>) -> io::Result<T> {
+    if result.is_err() {
+        if let Err(err) = recovery.await {
+            eprintln!("RTC failed-join membership reconciliation failed: {err}");
+        }
+    }
+    result
+}
+
+// Do not defer a failed membership withdrawal until the next call. Keep the
+// original leave error visible even if recovery subsequently succeeds.
+async fn finish_call(incoming: &Message, ghost: &Ghost, call: LiveKitCall) -> io::Result<()> {
+    let leave_result = call.leave().await.map_err(io::Error::other);
+    if let Err(ref err) = leave_result {
+        eprintln!("RTC call cleanup failed: {err}");
+    }
+    let recovery_result = reconcile_legacy_membership(incoming, ghost).await;
+    if let Err(ref err) = recovery_result {
+        eprintln!("RTC post-call membership reconciliation failed: {err}");
+    }
+    leave_result.and(recovery_result)
 }
 
 async fn wait_room(incoming:&Message,ghost:&Ghost)->io::Result<matrix_sdk::Room> {
@@ -940,7 +995,7 @@ async fn run_incoming(incoming: &Message, reader: &mut protocol::FrameReader<Rea
     let recipients = CallKeyRecipients::new(incoming.expected_user_mxid.clone(),
         (!incoming.expected_device.is_empty()).then(|| incoming.expected_device.clone()));
     within_answer_budget(answer_deadline, ghost.identity.check()).await?;
-    let mut call = LiveKitCall::join_until_with_outbox(&room, LiveKitCallOptions {
+    let joined = LiveKitCall::join_until_with_outbox(&room, LiveKitCallOptions {
         trusted_focus: Some(focus),
         call_key_recipients: Some(recipients.clone()),
         slot_id: incoming.slot_id.clone(),
@@ -959,13 +1014,11 @@ async fn run_incoming(incoming: &Message, reader: &mut protocol::FrameReader<Rea
             }) }
         },
         ..Default::default()
-    },Some(join_deadline(tokio::time::Instant::now(), answer_deadline)),ghost.outbox.clone()).await.map_err(io::Error::other)?;
+    },Some(join_deadline(tokio::time::Instant::now(), answer_deadline)),ghost.outbox.clone()).await.map_err(io::Error::other);
+    let mut call = recover_failed_join(joined, reconcile_legacy_membership(incoming, &ghost)).await?;
     let result = connected_session(incoming, reader, writer, &mut call, &room, &ghost.identity, &admission, accounts, recipients, None, None, None, answer_deadline).await;
-    let leave_result = call.leave().await;
-    if let Err(ref err) = leave_result {
-        eprintln!("RTC call cleanup failed: {err}");
-    }
-    if result.is_ok() { leave_result.map_err(io::Error::other)?; }
+    let leave_result = finish_call(incoming, &ghost, call).await;
+    if result.is_ok() { leave_result?; }
     result
     }.await;
     if owned && tokio::fs::try_exists(&path).await? { release_slot(&room,incoming,&path).await?; }
@@ -1049,7 +1102,7 @@ async fn run_outgoing(incoming: &Message, reader: &mut protocol::FrameReader<Rea
     // acceptance deadline and tolerate those early keyframe requests instead of
     // treating them as a protocol violation.
     let mut recheck=tokio::time::interval(Duration::from_secs(1));
-    let acceptance_deadline = tokio::time::Instant::now() + Duration::from_secs(125);
+    let acceptance_deadline = tokio::time::Instant::now() + outgoing_acceptance_budget(incoming.group);
     loop {
         check_answer_deadline(acceptance_deadline)?;
         let frame=tokio::select! {
@@ -1112,7 +1165,7 @@ async fn run_outgoing(incoming: &Message, reader: &mut protocol::FrameReader<Rea
     let recipients = CallKeyRecipients::new(incoming.expected_user_mxid.clone(),
         (!incoming.expected_device.is_empty()).then(|| incoming.expected_device.clone()));
     within_answer_budget(answer_deadline, ghost.identity.check()).await?;
-    let mut call = LiveKitCall::join_until_with_outbox(&room, LiveKitCallOptions {
+    let joined = LiveKitCall::join_until_with_outbox(&room, LiveKitCallOptions {
         trusted_focus: Some(focus),
         call_key_recipients: Some(recipients.clone()),
         slot_id: incoming.slot_id.clone(),
@@ -1120,13 +1173,11 @@ async fn run_outgoing(incoming: &Message, reader: &mut protocol::FrameReader<Rea
         intent: Some(if incoming.video { CallIntent::Video } else { CallIntent::Audio }),
         kind: if incoming.group { CallKind::Group { notify: None } } else { CallKind::Direct { ring: None } },
         ..Default::default()
-    },Some(join_deadline(tokio::time::Instant::now(), answer_deadline)),ghost.outbox.clone()).await.map_err(io::Error::other)?;
+    },Some(join_deadline(tokio::time::Instant::now(), answer_deadline)),ghost.outbox.clone()).await.map_err(io::Error::other);
+    let mut call = recover_failed_join(joined, reconcile_legacy_membership(incoming, &ghost)).await?;
     let result = connected_session(incoming, reader, writer, &mut call, &room, &ghost.identity, &admission, accounts, recipients, Some(pin), wa_audio, wa_video, answer_deadline).await;
-    let leave_result = call.leave().await;
-    if let Err(ref err) = leave_result {
-        eprintln!("RTC call cleanup failed: {err}");
-    }
-    if result.is_ok() { leave_result.map_err(io::Error::other)?; }
+    let leave_result = finish_call(incoming, &ghost, call).await;
+    if result.is_ok() { leave_result?; }
     result
 }
 
@@ -1177,8 +1228,23 @@ async fn ensure_whatsapp_video_track(
         width: video::MATRIX_VIDEO_WIDTH,
         height: video::MATRIX_VIDEO_HEIGHT,
     })).await.map_err(io::Error::other)?;
-    *decoder = Some(video::WhatsAppVideoDecoder::spawn(camera)?);
-    Ok(())
+    match video::WhatsAppVideoDecoder::spawn(camera) {
+        Ok(created) => {
+            *decoder = Some(created);
+            Ok(())
+        }
+        Err(spawn_error) => {
+            // Publication succeeded before decoder initialization failed. Do
+            // not leave a phantom camera registered without an owned decoder.
+            // Preserve the failure if rollback cannot be completed.
+            match call.engine().unpublish(MediaStreamKind::Camera).await {
+                Ok(()) => Err(spawn_error),
+                Err(rollback_error) => Err(error(format!(
+                    "H.264 decoder initialization failed: {spawn_error}; camera rollback failed: {rollback_error}"
+                ))),
+            }
+        }
+    }
 }
 
 async fn stop_whatsapp_video_track(
@@ -1370,7 +1436,15 @@ async fn connected_session(incoming: &Message, reader: &mut protocol::FrameReade
         if !answered { check_answer_deadline(answer_deadline)?; }
         let connected = matches!(*status.borrow(), CallStatus::Connected { degraded: false, .. });
         if let Some(decoder) = video_decoder.as_mut() {
-            decoder.ensure_running()?;
+            if let Err(err) = decoder.ensure_running() {
+                if !answered { return Err(err); }
+                // Decoder failure is video-local after pickup. Do not end
+                // audio or the call; reject this generation until a fresh IDR.
+                rejected_generation = rejected_generation.max(decoder.generation);
+                let deadline = media_control_deadline(tokio::time::Instant::now(), answered, answer_deadline);
+                bounded_media_control(deadline, stop_whatsapp_video_track(call, &mut video_decoder)).await?;
+                send(writer, &Message::new("matrix_video_resync", &incoming.call_id)).await?;
+            }
         }
         // The roster is derived asynchronously from the core membership watch.
         // Read each once: a join may reach one before the other. Do not enable
@@ -1591,10 +1665,7 @@ async fn connected_session(incoming: &Message, reader: &mut protocol::FrameReade
                         let control=match (key,previous,state) {
                             ("audio",_,None|Some(true))=>Some("matrix_audio_mute"),
                             ("audio",_,Some(false))=>Some("matrix_audio_unmute"),
-                            ("video",Some(Some(_)),None)=>Some("matrix_video_stop"),
-                            ("video",_,Some(true))=>Some("matrix_video_mute"),
-                            ("video",Some(Some(true)),Some(false))=>Some("matrix_video_unmute"),
-                            ("video",_,Some(false))=>Some("matrix_video_start"),
+                            ("video",previous,state)=>direct_video_roster_control(previous,state),
                             _=>None
                         };
                         // For source-switching sessions, start only after a real
@@ -2065,6 +2136,23 @@ mod authorization_tests {
     use super::*;
 
     #[tokio::test]
+    async fn failed_join_recovers_membership_without_masking_setup_error() {
+        let attempted = AtomicBool::new(false);
+        let result = recover_failed_join::<()>(Err(error("join failed")), async {
+            attempted.store(true, Ordering::Release);
+            Err(error("recovery failed"))
+        }).await;
+        assert!(attempted.load(Ordering::Acquire));
+        assert_eq!(result.unwrap_err().to_string(), "join failed");
+        let result = recover_failed_join(Ok(42), async {
+            panic!("successful join must not withdraw membership");
+            #[allow(unreachable_code)]
+            Ok(())
+        }).await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
     async fn recovery_lease_revalidation_rejects_replaced_or_missing_generation() {
         let folder = std::env::temp_dir().join(format!("matrixrtc-lease-test-{}-{}",
             std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
@@ -2120,6 +2208,17 @@ mod authorization_tests {
         assert!(retry.ready(start + REMOTE_RETRY_DELAY * 2));
         assert!(retry.failed(start + REMOTE_RETRY_DELAY * 2).is_err());
         assert!(RemoteRetry::default().ready(start));
+    }
+
+    #[test]
+    fn direct_camera_start_is_owned_by_track_attachment() {
+        assert_eq!(direct_video_roster_control(None, Some(false)), None);
+        assert_eq!(direct_video_roster_control(Some(None), Some(false)), None);
+        assert_eq!(direct_video_roster_control(Some(Some(true)), Some(false)), None);
+        assert_eq!(direct_video_roster_control(Some(Some(false)), Some(true)), Some("matrix_video_mute"));
+        assert_eq!(direct_video_roster_control(Some(Some(false)), None), Some("matrix_video_stop"));
+        assert_eq!(direct_video_roster_control(Some(Some(true)), None), Some("matrix_video_stop"));
+        assert_eq!(direct_video_roster_control(None, None), None);
     }
 
     #[test]
@@ -2220,6 +2319,12 @@ mod authorization_tests {
     async fn completed_audio_capture_propagates_error() {
         let mut capture: Option<PendingAudio> = Some(Box::pin(async { Err(error("capture failed")) }));
         assert_eq!(poll_audio_capture(&mut capture).await.unwrap_err().to_string(), "capture failed");
+    }
+
+    #[test]
+    fn direct_acceptance_budget_includes_relay_setup_without_extending_group_budget() {
+        assert_eq!(outgoing_acceptance_budget(false), Duration::from_secs(155));
+        assert_eq!(outgoing_acceptance_budget(true), Duration::from_secs(125));
     }
 
     #[test]

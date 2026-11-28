@@ -77,6 +77,9 @@ func relayAttemptTimeout(candidateCount int) time.Duration {
 // is terminal even when the last transport returns a different error.
 func tryRelayCandidates[T, C any](ctx context.Context, candidates []C, attempt func(C, time.Duration) (T, error), report func(int, C, error), dispose func(T)) (T, error) {
 	var zero T
+	if err := relayContextError(ctx); err != nil {
+		return zero, err
+	}
 	if len(candidates) == 0 {
 		return zero, fmt.Errorf("relay has no usable endpoint")
 	}
@@ -96,6 +99,10 @@ func tryRelayCandidates[T, C any](ctx context.Context, candidates []C, attempt f
 			}
 			return value, nil
 		}
+		// A failed attempt can still return a partially constructed resource.
+		// The candidate dispatcher owns it until a successful handoff; release
+		// it before another attempt, including when cancellation races failure.
+		dispose(value)
 		failures = append(failures, fmt.Errorf("relay candidate %d: %w", i+1, err))
 		report(i+1, candidate, err)
 	}
@@ -154,18 +161,21 @@ func dialDirectRelayPorts[T any](ctx context.Context, advertised uint16, group b
 func awaitRelayPackets(ctx context.Context, recv func([]byte) (int, error), watch func(context.Context) func() bool, ready func([]byte) (bool, error)) ([][]byte, error) {
 	readCtx, cancel := context.WithTimeout(ctx, 900*time.Millisecond)
 	defer cancel()
-	stop := watch(readCtx)
-	defer stop()
 	if err := relayContextError(readCtx); err != nil {
 		return nil, err
 	}
+	stop := watch(readCtx)
+	defer stop()
 	const maxPackets = 32
 	packets := make([][]byte, 0, 4)
 	for len(packets) < maxPackets {
+		if err := relayContextError(readCtx); err != nil {
+			return nil, err
+		}
 		buf := make([]byte, 1500)
 		n, err := recv(buf)
 		if ctxErr := relayContextError(readCtx); ctxErr != nil {
-			return nil, ctxErr
+			return nil, errors.Join(ctxErr, err)
 		}
 		if err != nil {
 			return nil, err
@@ -175,6 +185,9 @@ func awaitRelayPackets(ctx context.Context, recv func([]byte) (int, error), watc
 		}
 		packet := buf[:n]
 		ok, err := ready(packet)
+		if ctxErr := relayContextError(readCtx); ctxErr != nil {
+			return nil, errors.Join(ctxErr, err)
+		}
 		if err != nil {
 			return nil, err
 		}

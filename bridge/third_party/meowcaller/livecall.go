@@ -23,8 +23,10 @@ type Call struct {
 	sink                                            AudioSink
 	onReady                                         func()
 	mediaReady                                      bool
+	relayReady                                      bool
 	onEnd                                           func(reason string)
 	terminalReason                                  string
+	terminalCleanupComplete                         bool
 	onState                                         func(CallPhase)
 	onPeerAccept                                    func()
 	peerAccepted                                    bool
@@ -412,6 +414,14 @@ func (c *Call) State() CallPhase {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.phase
+}
+
+// TerminalReason returns the reason recorded with the terminal phase, even
+// while media cleanup or the end callback is still in progress.
+func (c *Call) TerminalReason() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.terminalReason
 }
 
 // IsVideo reports whether either direction of the call currently has video.
@@ -1212,6 +1222,22 @@ func (c *Call) SendVideoWithDuration(accessUnit []byte, duration time.Duration) 
 	return c.eng.sendVideoFrame(c.id, accessUnit, duration)
 }
 
+// RelayReady reports acknowledged allocation and consent, or authenticated peer media.
+// It is a transport gate, not proof of bidirectional audio or video.
+func (c *Call) RelayReady() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.relayReady && c.phase != CallPhaseEnded
+}
+
+func (c *Call) markRelayReady() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.phase != CallPhaseEnded {
+		c.relayReady = true
+	}
+}
+
 // OnReady registers a callback fired once media is flowing (relay bound, first frames
 // exchanged).
 func (c *Call) OnReady(fn func()) {
@@ -1227,12 +1253,12 @@ func (c *Call) OnReady(fn func()) {
 // OnEnd registers a callback fired when the call ends, with a short reason string.
 func (c *Call) OnEnd(fn func(reason string)) {
 	c.mu.Lock()
-	reason := c.terminalReason
-	if reason == "" {
+	reason, complete := c.terminalReason, c.terminalCleanupComplete
+	if !complete {
 		c.onEnd = fn
 	}
 	c.mu.Unlock()
-	if reason != "" && fn != nil {
+	if complete && fn != nil {
 		fn(reason)
 	}
 }
@@ -1242,6 +1268,14 @@ func (c *Call) OnStateChange(fn func(CallPhase)) {
 	c.mu.Lock()
 	c.onState = fn
 	c.mu.Unlock()
+}
+
+// PeerAccepted reports the recorded acceptance independently of callback delivery.
+// A terminal call must never be treated as accepted.
+func (c *Call) PeerAccepted() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.peerAccepted && c.phase != CallPhaseEnded
 }
 
 // OnPeerAccept registers a one-shot callback for the remote peer accepting an outgoing

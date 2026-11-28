@@ -28,6 +28,30 @@ impl MembershipSnapshot {
     }
 }
 
+// Synapse may remove a delayed event from its pending lookup before the
+// corresponding state event becomes visible. Observe authoritative state for
+// a bounded interval while retaining the room/slot and ownership fences.
+// An empty state alone never proves that an older delayed write is settled.
+async fn await_published_leave<F, Fut>(id: &str, budget: std::time::Duration, mut read: F) -> io::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = io::Result<MembershipSnapshot>>,
+{
+    use std::time::Duration;
+    let result = tokio::time::timeout(budget, async {
+        loop {
+            if read().await?.proves_sent(id) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }).await;
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::other("delayed leave outcome is unconfirmed after bounded state observation")),
+    }
+}
+
 fn missing_delayed_event(error: &CommandError) -> bool {
     error.backend_error().is_some_and(|error| {
         error.status == Some(404) && error.errcode.as_deref() == Some("M_NOT_FOUND")
@@ -231,18 +255,20 @@ impl Journal {
             membership_snapshot(events, &key, &user, &device, &member_id)
         };
         read_membership().await?;
+        eprintln!("RTC membership recovery: checking {} known delayed operation(s)", records.len());
         for record in &records {
             let id = record.delay_id.as_ref().expect("validated above");
             match backend.cancel_delayed_event(room.to_owned(), id.clone()).await {
-                Ok(()) => {},
+                Ok(()) => {
+                    eprintln!("RTC membership recovery: delayed cancellation confirmed");
+                },
                 Err(error) if missing_delayed_event(&error) => {
                     // A 404 alone is not enough: Synapse excludes events that
                     // are still being processed from its pending-event lookup.
                     // Accept only the exact already-published empty state event.
-                    let snapshot = read_membership().await?;
-                    if !snapshot.proves_sent(id) {
-                        return Err(io::Error::other("delayed leave outcome is unconfirmed"));
-                    }
+                    eprintln!("RTC membership recovery: pending event missing; observing authoritative leave state");
+                    await_published_leave(id, std::time::Duration::from_secs(5), &read_membership).await?;
+                    eprintln!("RTC membership recovery: matching delayed leave publication confirmed");
                 }
                 Err(error) => return Err(io::Error::other(error)),
             }
@@ -372,6 +398,43 @@ mod tests {
         assert!(snapshot.active && !snapshot.proves_sent("expected"));
         assert!(inspect(vec![event.clone(), event]).is_err());
     }
+    #[tokio::test]
+    async fn delayed_publication_can_be_observed_after_pending_lookup_disappears() {
+        let mut snapshots = std::collections::VecDeque::from([
+            MembershipSnapshot { active: true, sent_delay_id: None },
+            MembershipSnapshot { active: false, sent_delay_id: Some("other".to_owned()) },
+            MembershipSnapshot { active: false, sent_delay_id: Some("expected".to_owned()) },
+        ]);
+        await_published_leave("expected", std::time::Duration::from_secs(5), || {
+            std::future::ready(Ok(snapshots.pop_front().expect("unexpected extra read")))
+        }).await.unwrap();
+        assert!(snapshots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delayed_publication_observation_preserves_authoritative_read_errors() {
+        let error = await_published_leave("expected", std::time::Duration::from_secs(5), || {
+            std::future::ready(Err(io::Error::other("membership owner changed")))
+        }).await.unwrap_err();
+        assert_eq!(error.to_string(), "membership owner changed");
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_empty_membership_does_not_settle_after_observation_timeout() {
+        let error = await_published_leave("expected", std::time::Duration::from_millis(20), || {
+            std::future::ready(Ok(MembershipSnapshot { active: false, sent_delay_id: None }))
+        }).await.unwrap_err();
+        assert!(error.to_string().contains("delayed leave outcome is unconfirmed"));
+    }
+
+    #[tokio::test]
+    async fn stalled_authoritative_read_does_not_block_recovery_indefinitely() {
+        let error = await_published_leave("expected", std::time::Duration::from_millis(20), || {
+            std::future::pending::<io::Result<MembershipSnapshot>>()
+        }).await.unwrap_err();
+        assert!(error.to_string().contains("delayed leave outcome is unconfirmed"));
+    }
+
     #[test]
     fn delayed_intent_and_exact_id_survive_reopen_and_settle_independently() {
         let root = std::env::temp_dir().join(format!("matrixrtc-delay-journal-{}", std::process::id()));

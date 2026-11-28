@@ -156,12 +156,16 @@ type countedPacketConn struct {
 	sent, received                      atomic.Uint64
 	peerReceived, foreignReceived       atomic.Uint64
 	peerHandshake, peerAlert, peerOther atomic.Uint64
+	firstOutboundRecord                 atomic.Uint32
 }
 
 func (c *countedPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	n, err := c.PacketConn.WriteTo(p, addr)
 	if err == nil {
 		c.sent.Add(1)
+		if n == len(p) {
+			c.firstOutboundRecord.CompareAndSwap(0, dtlsRecordMetadata(p))
+		}
 	}
 	return n, err
 }
@@ -200,6 +204,17 @@ func classifyHandshakeDatagram(p []byte) byte {
 		return 0
 	}
 	return p[0]
+}
+
+// dtlsRecordMetadata records only public record-header metadata. It deliberately
+// excludes handshake bodies, random values, cookies and all key material.
+// A zero value means the datagram did not contain a complete recognised record.
+func dtlsRecordMetadata(p []byte) uint32 {
+	kind := classifyHandshakeDatagram(p)
+	if kind == 0 {
+		return 0
+	}
+	return uint32(kind)<<16 | uint32(p[1])<<8 | uint32(p[2])
 }
 
 // ConnectRelayMedia connects the full media stack (UDP→DTLS→SCTP→DataChannel) to one
@@ -263,10 +278,13 @@ func ConnectRelayMediaContext(ctx context.Context, relayAddr *net.UDPAddr, opts 
 			Uint64("foreign_received", counted.foreignReceived.Load()).
 			Uint64("peer_dtls_handshake", counted.peerHandshake.Load()).
 			Uint64("peer_dtls_alert", counted.peerAlert.Load()).
-			Uint64("peer_other", counted.peerOther.Load()).Str("network", network).Msg("relay DTLS handshake failed")
+			Uint64("peer_other", counted.peerOther.Load()).
+			Uint32("first_outbound_dtls_record", counted.firstOutboundRecord.Load()).
+			Str("network", network).Msg("relay DTLS handshake failed")
 		return fail(fmt.Errorf("dtls handshake: %w", err))
 	}
-	lg.Debug().Msg("relay dtls handshake complete")
+	lg.Debug().Uint64("udp_sent", counted.sent.Load()).Uint64("peer_received", counted.peerReceived.Load()).
+		Uint32("first_outbound_dtls_record", counted.firstOutboundRecord.Load()).Msg("relay dtls handshake complete")
 
 	// 3. SCTP association over the DTLS conn.
 	assoc, err := sctp.ClientWithOptions(sctp.WithNetConn(dtlsConn), sctp.WithName("wa-voip"))
@@ -278,11 +296,17 @@ func ConnectRelayMediaContext(ctx context.Context, relayAddr *net.UDPAddr, opts 
 
 	// 4. Pre-negotiated DataChannel id=0. LoggerFactory is required: datachannel
 	// does not default it and dereferences it on construction.
-	dc, err := datachannel.Dial(assoc, 0, &datachannel.Config{
-		Negotiated:    true,
-		Label:         DataChannelLabel,
-		LoggerFactory: logging.NewDefaultLoggerFactory(),
-	})
+	// The relay media channel is negotiated out of band, so there is no DCEP
+	// ACK to commit reliability parameters. Apply them directly to the SCTP
+	// stream before the first media write, matching the native reference's
+	// unordered, zero-retransmission real-time transport.
+	// Reference: whatsapp-rust/src/voip/transport/native.rs, open_media_stream.
+	stream, err := assoc.OpenStream(0, sctp.PayloadTypeWebRTCBinary)
+	if err != nil {
+		return fail(fmt.Errorf("media stream open: %w", err))
+	}
+	stream.SetReliabilityParams(true, sctp.ReliabilityTypeRexmit, 0)
+	dc, err := datachannel.Client(stream, mediaDataChannelConfig())
 	if err != nil {
 		return fail(fmt.Errorf("datachannel dial: %w", err))
 	}
@@ -291,7 +315,17 @@ func ConnectRelayMediaContext(ctx context.Context, relayAddr *net.UDPAddr, opts 
 	if !stopSetup() || ctx.Err() != nil {
 		return fail(ctx.Err())
 	}
-	lg.Debug().Str("label", DataChannelLabel).Msg("relay datachannel open")
+	lg.Debug().Str("label", DataChannelLabel).Bool("ordered", false).Int("max_retransmits", 0).Msg("relay datachannel open")
 
 	return &RelayMediaChannel{udp: udp, dtlsConn: dtlsConn, assoc: assoc, dc: dc, log: lg}, nil
+}
+
+func mediaDataChannelConfig() *datachannel.Config {
+	return &datachannel.Config{
+		Negotiated:           true,
+		Label:                DataChannelLabel,
+		ChannelType:          datachannel.ChannelTypePartialReliableRexmitUnordered,
+		ReliabilityParameter: 0,
+		LoggerFactory:        logging.NewDefaultLoggerFactory(),
+	}
 }

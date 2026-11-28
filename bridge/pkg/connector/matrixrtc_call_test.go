@@ -147,12 +147,25 @@ func TestRTCUnansweredRingExpires(t *testing.T) {
 	}
 }
 
+func TestRTCRingLifetimeExplicitStopAfterAccept(t *testing.T) {
+	ctx, stop, accept := newRTCRingLifetime(context.Background(), time.Now().Add(time.Hour))
+	defer stop()
+	accept()
+	accept()
+	stop()
+	stop()
+	if ctx.Err() != context.Canceled {
+		t.Fatalf("explicit stop did not cancel accepted call: %v", ctx.Err())
+	}
+}
+
 func TestWhatsAppEndReasonFormatting(t *testing.T) {
 	cases := map[string]string{
 		"server:406":          "WhatsApp rejected this destination (server 406)",
 		"remote-rejected":     "WhatsApp peer rejected the call",
 		"remote-hangup":       "WhatsApp peer ended the call",
 		"whatsapp-disconnect": "WhatsApp disconnected while placing the call",
+		"media_failed":        "WhatsApp relay media setup failed",
 	}
 	for raw, want := range cases {
 		if got := formatWhatsAppEndReason(raw); got != want {

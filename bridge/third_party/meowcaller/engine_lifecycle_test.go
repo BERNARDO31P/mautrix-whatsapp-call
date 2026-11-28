@@ -1102,6 +1102,24 @@ func TestPendingVideoCannotAnnounceEnabledOrientation(t *testing.T) {
 	}
 }
 
+func TestVideoFrameBeforeSenderInstallationIsRecoverable(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	if !call.IsVideoTransmitReady() {
+		t.Fatal("expected negotiated camera before sender installation")
+	}
+	if err := call.SendVideo([]byte{0, 0, 0, 1, 0x65}); !errors.Is(err, ErrVideoFrameDropped) {
+		t.Fatalf("startup frame must be recoverable: %v", err)
+	}
+	call.phase = CallPhaseEnded
+	if err := call.SendVideo([]byte{0, 0, 0, 1, 0x65}); err == nil || errors.Is(err, ErrVideoFrameDropped) {
+		t.Fatalf("terminal call must remain a fatal error: %v", err)
+	}
+	delete(eng.calls, call.ID())
+	if err := call.SendVideo([]byte{0, 0, 0, 1, 0x65}); err == nil || errors.Is(err, ErrVideoFrameDropped) {
+		t.Fatalf("absent call must remain a fatal error: %v", err)
+	}
+}
+
 func TestDirectRelayTokensIgnoreInvalidIndices(t *testing.T) {
 	node := &waBinary.Node{Tag: "relay", Content: []waBinary.Node{
 		{Tag: "token", Attrs: waBinary.Attrs{"id": "-1"}, Content: []byte{1}},
@@ -1126,5 +1144,87 @@ func TestPeerOnlyRelayUpdatePreservesDirectAllocation(t *testing.T) {
 	eng.onRelay(types.BasicCallMeta{CallID: call.ID(), From: peerJID(), CallCreator: creatorJID()}, &waBinary.Node{Tag: "relay"})
 	if m.relay != previous || m.started {
 		t.Fatal("peer-only relay update replaced valid allocation or started media")
+	}
+}
+
+func TestMediaFailureTerminatesExactCall(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	var sent []waBinary.Node
+	eng.sendCallNode = func(_ context.Context, node waBinary.Node) error {
+		sent = append(sent, node)
+		return nil
+	}
+	var reason string
+	call.OnEnd(func(got string) { reason = got })
+	if err := eng.endLocallyWithReason(call, false, "media_failed"); err != nil {
+		t.Fatal(err)
+	}
+	if reason != "media_failed" || call.State() != CallPhaseEnded || eng.lookup(call.ID()) != nil {
+		t.Fatalf("media failure not retired: reason=%q state=%v", reason, call.State())
+	}
+	if len(sent) != 1 || sent[0].GetChildren()[0].Tag != "terminate" {
+		t.Fatalf("expected one terminate, got %#v", sent)
+	}
+	if err := call.Hangup(); err != nil || len(sent) != 1 {
+		t.Fatalf("duplicate termination: count=%d err=%v", len(sent), err)
+	}
+}
+
+func TestRelayReadinessDoesNotSurviveEnd(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	if call.RelayReady() {
+		t.Fatal("relay ready before evidence")
+	}
+	call.markRelayReady()
+	if !call.RelayReady() {
+		t.Fatal("relay readiness not recorded")
+	}
+	eng.finishCallIfCurrent(call, "hangup")
+	call.markRelayReady()
+	if call.RelayReady() {
+		t.Fatal("ended call became relay ready")
+	}
+}
+
+func TestTerminalReasonPublishedBeforeCleanupCallback(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	var callbackReason string
+	call.OnStateChange(func(phase CallPhase) {
+		if phase != CallPhaseEnded {
+			return
+		}
+		if got := call.TerminalReason(); got != "media_failed" {
+			t.Fatalf("terminal reason not published with phase: %q", got)
+		}
+		call.OnEnd(func(reason string) { callbackReason = reason })
+		if callbackReason != "" {
+			t.Fatal("end callback ran before cleanup completed")
+		}
+	})
+	eng.finishCallIfCurrent(call, "media_failed")
+	if callbackReason != "media_failed" {
+		t.Fatalf("end callback lost: %q", callbackReason)
+	}
+	callbackReason = ""
+	call.OnEnd(func(reason string) { callbackReason = reason })
+	if callbackReason != "media_failed" {
+		t.Fatalf("late registration lost terminal reason: %q", callbackReason)
+	}
+}
+
+func TestPeerAcceptedSnapshotDoesNotDependOnCallback(t *testing.T) {
+	call := &Call{phase: CallPhaseCalling}
+	if call.PeerAccepted() {
+		t.Fatal("unanswered call is accepted")
+	}
+	call.markPeerAccepted()
+	if !call.PeerAccepted() {
+		t.Fatal("recorded acceptance invisible without callback")
+	}
+	call.mu.Lock()
+	call.phase = CallPhaseEnded
+	call.mu.Unlock()
+	if call.PeerAccepted() {
+		t.Fatal("terminal call still reports acceptance")
 	}
 }

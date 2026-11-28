@@ -65,7 +65,11 @@ func (s *VideoForwardState) forwardAt(now time.Time, enabled, idr bool, orientat
 	if !s.orientationSent || s.orientation != orientation {
 		if err := setOrientation(orientation); err != nil {
 			if errors.Is(err, ErrVideoFrameDropped) {
-				s.Reset()
+				// A recoverable orientation race invalidates this frame, not the
+				// outstanding keyframe request. Preserve the retry interval just
+				// as for a recoverable send failure.
+				s.ready = false
+				s.orientationSent = false
 				return s.requestKeyframeAt(now, request)
 			}
 			return err

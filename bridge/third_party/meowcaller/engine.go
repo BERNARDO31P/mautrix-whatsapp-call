@@ -294,13 +294,17 @@ func (e *engine) nextCallNodeID() string {
 // video send pipeline is live for the call.
 func (e *engine) sendVideoFrame(callID string, au []byte, duration time.Duration) error {
 	e.mu.Lock()
-	var vs *videoSender
-	if m := e.calls[callID]; m != nil {
-		vs = m.videoTx
+	m := e.calls[callID]
+	if m == nil || m.call == nil || m.call.State() == CallPhaseEnded {
+		e.mu.Unlock()
+		return errors.New("meowcaller: call is not active")
 	}
+	vs := m.videoTx
 	e.mu.Unlock()
 	if vs == nil {
-		return errors.New("meowcaller: call has no active video media")
+		// Camera negotiation can finish before relay setup installs the RTP
+		// sender. Do not end the call for a frame from that startup window.
+		return ErrVideoFrameDropped
 	}
 	return vs.send(au, duration)
 }
@@ -1057,11 +1061,20 @@ func (e *engine) reject(c *Call) error { return e.endLocally(c, true) }
 func (e *engine) hangup(c *Call) error { return e.endLocally(c, false) }
 
 func (e *engine) endLocally(c *Call, reject bool) error {
-	to, creator, owner := e.terminalTarget(c)
 	reason := "hangup"
 	if reject {
 		reason = "rejected"
 	}
+	return e.endLocallyWithReason(c, reject, reason)
+}
+
+// Media failures must retire the exact call and signal its remote termination,
+// just like a user hangup. Preserve the failure reason for local observers.
+func (e *engine) endLocallyWithReason(c *Call, reject bool, reason string) error {
+	if c == nil {
+		return nil
+	}
+	to, creator, owner := e.terminalTarget(c)
 	if owner == nil || !e.finishCallMatching(c.id, reason, false, c) {
 		return nil
 	}
@@ -1951,7 +1964,12 @@ func (e *engine) finishCallMatchingOffer(callID, reason string, reserveUnknown b
 		call.mu.Unlock()
 		return false
 	}
-	// Fence late media and acceptance updates before potentially blocking cleanup.
+	// Publish the reason together with the terminal phase before potentially
+	// blocking cleanup. Keep end callback delivery ordered after cleanup.
+	if reason == "" {
+		reason = "ended"
+	}
+	call.terminalReason = reason
 	call.phase = CallPhaseEnded
 	onState := call.onState
 	player := call.player
@@ -1970,11 +1988,8 @@ func (e *engine) finishCallMatchingOffer(callID, reason string, reserveUnknown b
 	if onState != nil {
 		onState(CallPhaseEnded)
 	}
-	if reason == "" {
-		reason = "ended"
-	}
 	call.mu.Lock()
-	call.terminalReason = reason
+	call.terminalCleanupComplete = true
 	fn := call.onEnd
 	call.onEnd = nil
 	call.mu.Unlock()

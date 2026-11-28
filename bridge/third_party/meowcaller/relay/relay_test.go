@@ -4,6 +4,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/pion/datachannel"
 )
 
 // TestClassifyFirstByte pins every branch of the first-byte relay packet demux
@@ -99,5 +101,28 @@ func TestRelayHandshakePacketDiagnostics(t *testing.T) {
 	}
 	if c.received.Load() != 5 || c.peerReceived.Load() != 4 || c.foreignReceived.Load() != 1 || c.peerHandshake.Load() != 1 || c.peerAlert.Load() != 1 || c.peerOther.Load() != 2 {
 		t.Fatal("incorrect peer or DTLS diagnostic counts")
+	}
+}
+
+func TestDTLSRecordMetadata(t *testing.T) {
+	valid := []byte{22, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 42}
+	if got := dtlsRecordMetadata(valid); got != 0x16fefd {
+		t.Fatalf("unexpected DTLS metadata: %x", got)
+	}
+	valid[13] = 99
+	if got := dtlsRecordMetadata(valid); got != 0x16fefd {
+		t.Fatal("handshake body must not influence metadata")
+	}
+	for _, invalid := range [][]byte{nil, valid[:12], valid[:13], {22, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}} {
+		if got := dtlsRecordMetadata(invalid); got != 0 {
+			t.Fatalf("invalid record classified: %x", got)
+		}
+	}
+}
+
+func TestMediaDataChannelUsesRealtimeReliability(t *testing.T) {
+	cfg := mediaDataChannelConfig()
+	if !cfg.Negotiated || cfg.ChannelType != datachannel.ChannelTypePartialReliableRexmitUnordered || cfg.ReliabilityParameter != 0 || cfg.Label != DataChannelLabel || cfg.LoggerFactory == nil {
+		t.Fatalf("unexpected media data channel config: %+v", cfg)
 	}
 }

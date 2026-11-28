@@ -291,3 +291,54 @@ func TestH264TimestampChangeAfterMarkerDoesNotRequireIDR(t *testing.T) {
 		t.Fatalf("normal boundary = %x %t %t", got, complete, request)
 	}
 }
+
+func TestH264RecoveryPreservesSeparateParameterSets(t *testing.T) {
+	var a H264AccessUnitAssembler
+	a.RequireKeyframe()
+	for i, nal := range [][]byte{{0x67, 1}, {0x68, 2}} {
+		au, complete, _ := a.Push(uint16(i+1), 100, true, nal)
+		if !complete || !bytes.Equal(au, append([]byte{0, 0, 0, 1}, nal...)) || !a.NeedsKeyframe() {
+			t.Fatalf("parameter unit %d: %x, complete=%t, gate=%t", i, au, complete, a.NeedsKeyframe())
+		}
+	}
+	if _, complete, _ := a.Push(3, 200, true, PackageH264STAPA([][]byte{{0x67, 1}, {0x41, 2}})); complete || !a.NeedsKeyframe() {
+		t.Fatal("dependent picture escaped recovery gate")
+	}
+	if _, complete, _ := a.Push(4, 300, true, []byte{0x65, 3}); !complete || a.NeedsKeyframe() {
+		t.Fatal("IDR did not open gate")
+	}
+}
+
+func TestH264AssemblerLateDuplicateDoesNotDamageOpenFrame(t *testing.T) {
+	var a H264AccessUnitAssembler
+	idr := []byte{0x65, 1}
+	if _, complete, _ := a.Push(65534, 100, true, idr); !complete {
+		t.Fatal("initial IDR missing")
+	}
+	a.Push(65535, 200, false, []byte{0x7c, 0x81, 2})
+	for _, seq := range []uint16{65534, 65535} {
+		if got, complete, recovery := a.Push(seq, 100, true, idr); got != nil || complete || recovery {
+			t.Fatal("old packet modified current assembly")
+		}
+	}
+	got, complete, recovery := a.Push(0, 200, true, []byte{0x7c, 0x41, 3})
+	if !complete || recovery || !bytes.Equal(got, []byte{0, 0, 0, 1, 0x61, 2, 3}) {
+		t.Fatalf("fragmented frame after late packet: %x %t %t", got, complete, recovery)
+	}
+	if a.NeedsKeyframe() {
+		t.Fatal("late packets requested unnecessary recovery")
+	}
+}
+
+func TestH264AssemblerDuplicateMarkerDoesNotReopenRecovery(t *testing.T) {
+	var a H264AccessUnitAssembler
+	if _, complete, _ := a.Push(10, 100, true, []byte{0x65, 1}); !complete {
+		t.Fatal("initial IDR missing")
+	}
+	if _, complete, recovery := a.Push(10, 100, true, []byte{0x65, 1}); complete || recovery {
+		t.Fatal("duplicate IDR emitted or caused recovery")
+	}
+	if _, complete, recovery := a.Push(11, 200, true, []byte{0x41, 2}); !complete || recovery {
+		t.Fatal("next delta lost after duplicate")
+	}
+}

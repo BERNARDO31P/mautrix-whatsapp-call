@@ -68,6 +68,25 @@ def fixture_call_bindings(model, root):
 
 
 class ProjectRegression(unittest.TestCase):
+    def test_delayed_membership_inspector_distinguishes_missing_and_empty_journal(self):
+        script = DEPLOY / "inspect-delayed-membership.py"
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = [sys.executable, "-B", str(script), str(root)]
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("Cannot inspect delayed membership journal", result.stderr)
+            self.assertFalse((root / "delayed-membership-operations").exists())
+            journal = root / "delayed-membership-operations"
+            journal.mkdir(mode=0o700)
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), {"records": [], "errors": [], "automatic_settlement": False})
+            self.assertEqual(list(journal.iterdir()), [])
+            strict = subprocess.run(command + ["--require-empty"], capture_output=True, text=True)
+            self.assertEqual(strict.returncode, 0, strict.stderr)
+            self.assertEqual(json.loads(strict.stdout), json.loads(result.stdout))
+
     def test_delayed_membership_inspector_preserves_known_unknown_and_interrupted_records(self):
         script = DEPLOY / "inspect-delayed-membership.py"
         with TemporaryDirectory() as tmp:
@@ -90,6 +109,10 @@ class ProjectRegression(unittest.TestCase):
             self.assertEqual([entry["status"] for entry in report["records"]], ["unknown", "interrupted-identification", "known"])
             self.assertEqual([entry["delay_id"] for entry in report["records"]], [None, "late-id", "known-id"])
             self.assertEqual(report["errors"], [])
+            strict_command = [sys.executable, "-B", str(script), "--require-empty", str(root)]
+            strict_result = subprocess.run(strict_command, capture_output=True, text=True)
+            self.assertEqual(strict_result.returncode, 3, strict_result.stderr)
+            self.assertEqual(json.loads(strict_result.stdout), report)
             self.assertEqual({p.name: (p.read_bytes(), p.stat().st_mode, p.stat().st_mtime_ns) for p in paths}, before)
 
     def test_delayed_membership_inspector_refuses_malformed_conflicting_or_linked_records(self):
@@ -115,6 +138,71 @@ class ProjectRegression(unittest.TestCase):
             self.assertNotIn("DO_NOT_READ", result.stdout + result.stderr)
             self.assertEqual(sorted(p.name for p in journal.iterdir()), before)
             self.assertTrue((journal / ("c" * 32)).is_symlink())
+
+    def test_delayed_membership_inspector_rejects_hardlinks_and_fifos(self):
+        script = DEPLOY / "inspect-delayed-membership.py"
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            journal = root / "delayed-membership-operations"
+            journal.mkdir(mode=0o700)
+            external = root / "private"
+            external.write_text("PRIVATE_FIXTURE")
+            external.chmod(0o600)
+            linked = journal / ("d" * 32)
+            os.link(external, linked)
+            fifo = journal / ("e" * 32)
+            os.mkfifo(fifo, 0o600)
+            result = subprocess.run([sys.executable, "-B", str(script), str(root)],
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 2)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["records"], [])
+            self.assertEqual(len(report["errors"]), 2)
+            self.assertTrue(all("single link" in item["error"] for item in report["errors"]))
+            self.assertNotIn("PRIVATE_FIXTURE", result.stdout + result.stderr)
+            self.assertEqual(external.read_text(), "PRIVATE_FIXTURE")
+            self.assertTrue(stat.S_ISFIFO(fifo.stat().st_mode))
+
+    def test_delayed_membership_inspector_rejects_linked_or_public_identity(self):
+        script = DEPLOY / "inspect-delayed-membership.py"
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            identity = root / "identity"
+            identity.mkdir(mode=0o700)
+            (identity / "delayed-membership-operations").mkdir(mode=0o700)
+            alias = root / "alias"
+            alias.symlink_to(identity, target_is_directory=True)
+            for path in (alias, identity):
+                if path == identity:
+                    identity.chmod(0o755)
+                result = subprocess.run([sys.executable, "-B", str(script), str(path)],
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("identity directory is not a private real directory", result.stderr)
+                self.assertEqual(result.stdout, "")
+            self.assertEqual(list((identity / "delayed-membership-operations").iterdir()), [])
+
+    def test_delayed_membership_inspector_rejects_linked_or_public_journal(self):
+        script = DEPLOY / "inspect-delayed-membership.py"
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            identity = root / "identity"
+            identity.mkdir(mode=0o700)
+            journal = identity / "delayed-membership-operations"
+            other = root / "other"
+            other.mkdir(mode=0o700)
+            journal.symlink_to(other, target_is_directory=True)
+            command = [sys.executable, "-B", str(script), str(identity)]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("journal directory is not a private real directory", result.stderr)
+            self.assertEqual(result.stdout, "")
+            journal.unlink()
+            journal.mkdir(mode=0o755)
+            result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("journal directory is not a private real directory", result.stderr)
+            self.assertEqual(result.stdout, "")
 
     def test_candidate_validation_is_read_only_and_precedes_pause(self):
         script = (DEPLOY / "install-or-upgrade.sh").read_text()

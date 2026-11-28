@@ -260,7 +260,11 @@ func TestRelayCandidateFailuresAndCancellation(t *testing.T) {
 			if i != candidate || err == nil {
 				t.Fatalf("report %d %d %v", i, candidate, err)
 			}
-		}, func(int) { t.Fatal("disposed failed attempt") })
+		}, func(value int) {
+			if value != 0 {
+				t.Fatalf("unexpected failed resource %d", value)
+			}
+		})
 		cancel()
 		wantCalls := 2
 		if cancelAt == 1 {
@@ -300,5 +304,86 @@ func TestRelayCandidateSuccessfulHandoff(t *testing.T) {
 		} else if got != 42 || err != nil || disposed != 0 {
 			t.Fatalf("active handoff: got=%d err=%v disposed=%d", got, err, disposed)
 		}
+	}
+}
+
+func TestRelayCandidateDisposesPartialFailureBeforeRetry(t *testing.T) {
+	failure := errors.New("partial setup failed")
+	for _, cancelled := range []bool{false, true} {
+		ctx, cancel := context.WithCancel(context.Background())
+		var disposed []int
+		calls := 0
+		got, err := tryRelayCandidates(ctx, []int{1, 2}, func(candidate int, _ time.Duration) (int, error) {
+			calls++
+			if candidate == 1 {
+				if cancelled {
+					cancel()
+				}
+				return 41, failure
+			}
+			if len(disposed) != 1 || disposed[0] != 41 {
+				t.Fatalf("retry before disposal: %v", disposed)
+			}
+			return 42, nil
+		}, func(_ int, _ int, _ error) {}, func(value int) { disposed = append(disposed, value) })
+		cancel()
+		if len(disposed) != 1 || disposed[0] != 41 {
+			t.Fatalf("disposed %v", disposed)
+		}
+		if cancelled {
+			if calls != 1 || got != 0 || !errors.Is(err, context.Canceled) || !errors.Is(err, failure) {
+				t.Fatalf("cancelled: calls=%d got=%d err=%v", calls, got, err)
+			}
+		} else if calls != 2 || got != 42 || err != nil {
+			t.Fatalf("retry: calls=%d got=%d err=%v", calls, got, err)
+		}
+	}
+}
+
+func TestAwaitRelayPacketsCancellationDuringClassification(t *testing.T) {
+	cause := errors.New("call ended")
+	for _, readyResult := range []bool{false, true} {
+		ctx, cancel := context.WithCancelCause(context.Background())
+		reads := 0
+		packets, err := awaitRelayPackets(ctx, func(buf []byte) (int, error) {
+			reads++
+			buf[0] = 1
+			return 1, nil
+		}, func(context.Context) func() bool { return func() bool { return true } }, func([]byte) (bool, error) {
+			cancel(cause)
+			return readyResult, nil
+		})
+		if reads != 1 || packets != nil || !errors.Is(err, context.Canceled) || !errors.Is(err, cause) {
+			t.Fatalf("ready=%v reads=%d packets=%v err=%v", readyResult, reads, packets, err)
+		}
+	}
+}
+
+func TestAwaitRelayPacketsPreservesReadFailureOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cause := errors.New("call ended")
+	readFailure := errors.New("socket closed")
+	_, err := awaitRelayPackets(ctx, func([]byte) (int, error) {
+		cancel(cause)
+		return 0, readFailure
+	}, func(context.Context) func() bool { return func() bool { return true } }, func([]byte) (bool, error) {
+		t.Fatal("classification after cancellation")
+		return false, nil
+	})
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, cause) || !errors.Is(err, readFailure) {
+		t.Fatal(err)
+	}
+}
+
+func TestRelayCandidateCancellationPrecedesEmptyInventory(t *testing.T) {
+	cause := errors.New("call ended before candidate discovery")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(cause)
+	_, err := tryRelayCandidates(ctx, []int{}, func(int, time.Duration) (int, error) {
+		t.Fatal("unexpected attempt")
+		return 0, nil
+	}, func(int, int, error) { t.Fatal("unexpected report") }, func(int) { t.Fatal("unexpected disposal") })
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, cause) {
+		t.Fatalf("lost cancellation classification: %v", err)
 	}
 }

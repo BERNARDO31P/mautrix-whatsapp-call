@@ -170,3 +170,26 @@ func TestVideoForwardOrientationRaceDropsFrame(t *testing.T) {
 		t.Fatal(err, sends, state)
 	}
 }
+
+func TestVideoForwardOrientationDropsKeepKeyframeRetryInterval(t *testing.T) {
+	var state VideoForwardState
+	now := time.Unix(100, 0)
+	requests, sends := 0, 0
+	request := func() error { requests++; return nil }
+	send := func() error { sends++; return nil }
+	dropped := func(int) error { return ErrVideoFrameDropped }
+	for _, offset := range []time.Duration{0, time.Millisecond, videoKeyframeRetryInterval - time.Nanosecond, videoKeyframeRetryInterval} {
+		if err := state.forwardAt(now.Add(offset), true, true, 1, request, dropped, send); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if requests != 2 || sends != 0 || state.ready || state.orientationSent {
+		t.Fatalf("orientation retries: requests=%d sends=%d state=%+v", requests, sends, state)
+	}
+	if err := state.forwardAt(now.Add(videoKeyframeRetryInterval+time.Millisecond), true, true, 1, request, func(int) error { return nil }, send); err != nil {
+		t.Fatal(err)
+	}
+	if !state.ready || sends != 1 || !state.lastRequest.IsZero() {
+		t.Fatalf("recovery failed: sends=%d state=%+v", sends, state)
+	}
+}

@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/purpshell/meowcaller"
@@ -20,6 +21,11 @@ import (
 	"go.mau.fi/mautrix-whatsapp/pkg/connector/voipbridge/rtcwire"
 	"go.mau.fi/whatsmeow/types"
 	"maunium.net/go/mautrix/bridgev2/database"
+)
+
+const (
+	rtcOutgoingPeerAnswerBudget = 120 * time.Second
+	rtcRelayReadyBudget         = 30 * time.Second
 )
 
 // dispatchIncomingToRTCGateway is opt-in. Until a real MatrixRTC worker is
@@ -310,6 +316,11 @@ func incomingRTCMembershipFormat(value string) (string, error) {
 func (wa *WhatsAppClient) runIncomingRTCGateway(ctx context.Context, call *meowcaller.Call) error {
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
+	// Terminal phase precedes media cleanup and OnEnd delivery. Close the
+	// worker connection promptly even if cleanup or a callback is blocked.
+	go monitorRTCPeerEnd(ctx, 100*time.Millisecond, func() bool {
+		return call.State() == meowcaller.CallPhaseEnded
+	}, stop)
 	answered := false
 	pickupStarted := false
 	defer func() {
@@ -345,7 +356,7 @@ func (wa *WhatsAppClient) runIncomingRTCGateway(ctx context.Context, call *meowc
 	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopClose()
 	wire := rtcwire.NewPeer(conn, conn)
-	err = wire.Send(rtcwire.Message{
+	err = wire.SendContext(ctx, rtcwire.Message{
 		Type: "incoming", LoginID: string(wa.UserLogin.ID),
 		CallID: call.ID(), RoomID: roomID, SlotID: matrixRTCSlotDefault, MembershipFormat: format, GhostMXID: ghostMXID, BridgeBotMXID: wa.Main.Bridge.Bot.GetMXID().String(), ExpectedUserMXID: expectedMXID,
 		Peer: peer, Group: group, GroupJID: groupJID, Video: call.IsVideo(),
@@ -398,6 +409,18 @@ func (wa *WhatsAppClient) runIncomingRTCGateway(ctx context.Context, call *meowc
 			}
 			answered = true
 			wa.UserLogin.Log.Info().Str("call_id", call.ID()).Msg("MatrixRTC pickup submitted to WhatsApp")
+			// Pickup acknowledgement is not proof of an operational media path.
+			// Keep consuming worker controls while the bounded watchdog runs.
+			if !group {
+				go func() {
+					if err := awaitRTCRelay(ctx, rtcRelayReadyBudget, 100*time.Millisecond, call.RelayReady, func() bool {
+						return call.State() == meowcaller.CallPhaseEnded
+					}); err != nil && ctx.Err() == nil {
+						wa.UserLogin.Log.Warn().Err(err).Str("call_id", call.ID()).Msg("Incoming WhatsApp relay unavailable after pickup")
+						stop()
+					}
+				}()
+			}
 			for _, control := range pending.Controls {
 				if err := ctx.Err(); err != nil {
 					return err
@@ -489,6 +512,8 @@ func formatWhatsAppEndReason(raw string) string {
 		return "WhatsApp peer rejected the call"
 	case "remote-hangup", "hangup":
 		return "WhatsApp peer ended the call"
+	case "media_failed":
+		return "WhatsApp relay media setup failed"
 	case "whatsapp-disconnect":
 		return "WhatsApp disconnected while placing the call"
 	case "whatsapp-ended":
@@ -498,26 +523,139 @@ func formatWhatsAppEndReason(raw string) string {
 	}
 }
 
-func (wa *WhatsAppClient) outgoingWhatsAppEndReason(callID string) string {
-	if wa.callManager == nil {
-		return formatWhatsAppEndReason("")
-	}
-	session, ok := wa.callManager.Get(wa.callKey(callID))
-	if !ok {
-		return formatWhatsAppEndReason("")
-	}
-	return formatWhatsAppEndReason(session.EndReason)
-}
-
 // Ring lifetime cancels unanswered calls, not active calls. stop always cancels
 // on explicit decline, bridge shutdown or normal hangup. accept disarms only
 // the ring timer; it does NOT detach the bridge's parent cancellation.
 func newRTCRingLifetime(parent context.Context, deadline time.Time) (context.Context, context.CancelFunc, func()) {
 	ctx, cancel := context.WithCancel(parent)
-	timer := time.AfterFunc(time.Until(deadline), cancel)
-	stop := func() { timer.Stop(); cancel() }
-	accept := func() { timer.Stop() }
+	// Timer.Stop alone cannot prevent a callback that has already been
+	// scheduled. Acceptance and expiry must claim the same one-shot fence.
+	var ringSettled atomic.Bool
+	timer := time.AfterFunc(time.Until(deadline), func() {
+		if ringSettled.CompareAndSwap(false, true) {
+			cancel()
+		}
+	})
+	stop := func() {
+		ringSettled.Store(true)
+		timer.Stop()
+		cancel()
+	}
+	accept := func() {
+		ringSettled.CompareAndSwap(false, true)
+		timer.Stop()
+	}
 	return ctx, stop, accept
+}
+
+var errRTCRelayEnded = errors.New("WhatsApp call ended before relay readiness")
+
+// Await transport readiness without treating remote acceptance as media success.
+func awaitRTCRelay(ctx context.Context, timeout, interval time.Duration, ready, ended func() bool) error {
+	return awaitRTCRelayWithReader(ctx, timeout, interval, ready, ended, nil)
+}
+
+// The optional reader detects worker termination or an invalid early answer
+// during the outgoing relay gate. A nil reader disables that select case.
+func awaitRTCRelayWithReader(ctx context.Context, timeout, interval time.Duration, ready, ended func() bool, reading <-chan error) error {
+	parent := ctx
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return rtcRelayGateCancellation(parent, err, ended, reading)
+		}
+		if err := checkRTCEarlyAnswer(reading); err != nil {
+			return err
+		}
+		if ended() {
+			return errRTCRelayEnded
+		}
+		if ready() {
+			// Readiness may race terminal state or cancellation while the
+			// transport callback is running. Prefer termination at the gate.
+			if err := ctx.Err(); err != nil {
+				return rtcRelayGateCancellation(parent, err, ended, reading)
+			}
+			if err := checkRTCEarlyAnswer(reading); err != nil {
+				return err
+			}
+			if ended() {
+				return errRTCRelayEnded
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return rtcRelayGateCancellation(parent, ctx.Err(), ended, reading)
+		case err := <-reading:
+			if err != nil {
+				return err
+			}
+			return errors.New("unexpected Matrix answer before WhatsApp acceptance notification")
+		case <-ticker.C:
+		}
+	}
+}
+
+// Preserve authoritative worker and peer outcomes when the local readiness
+// deadline expires concurrently. Parent cancellation still takes precedence.
+func rtcRelayGateCancellation(parent context.Context, gateErr error, ended func() bool, reading <-chan error) error {
+	workerErr := checkRTCEarlyAnswer(reading)
+	if err := parent.Err(); err != nil {
+		return errors.Join(err, workerErr)
+	}
+	if workerErr != nil {
+		return workerErr
+	}
+	if ended() {
+		return errRTCRelayEnded
+	}
+	return gateErr
+}
+
+// Check before deciding a pre-answer terminal outcome, since the worker may
+// have revoked admission concurrently with the ring or peer deadline.
+func checkRTCPreAnswer(ctx context.Context, reading <-chan error) error {
+	return errors.Join(ctx.Err(), checkRTCEarlyAnswer(reading))
+}
+
+// An already queued reader result predates the acceptance notification. A
+// successful answer at this point is a protocol error, not media readiness.
+func checkRTCEarlyAnswer(reading <-chan error) error {
+	select {
+	case err := <-reading:
+		if err != nil {
+			return err
+		}
+		return errors.New("unexpected Matrix answer before WhatsApp acceptance notification")
+	default:
+		return nil
+	}
+}
+
+// Wait for the worker answer without losing a concurrently queued failure.
+// A successful answer does not override cancellation of the call lifetime.
+func awaitRTCMatrixAnswer(ctx context.Context, reading <-chan error) error {
+	select {
+	case err, ok := <-reading:
+		if !ok {
+			err = io.EOF
+		}
+		return errors.Join(ctx.Err(), err)
+	case <-ctx.Done():
+		select {
+		case err, ok := <-reading:
+			if !ok {
+				err = io.EOF
+			}
+			return errors.Join(ctx.Err(), err)
+		default:
+			return ctx.Err()
+		}
+	}
 }
 
 // Keep monitoring WhatsApp after pickup, including while Matrix is still
@@ -581,7 +719,7 @@ func (wa *WhatsAppClient) runOutgoingRTCGateway(ctx context.Context, sessionID, 
 	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopClose()
 	wire := rtcwire.NewPeer(conn, conn)
-	if err = wire.Send(rtcwire.Message{
+	if err = wire.SendContext(ctx, rtcwire.Message{
 		Type: "outgoing", LoginID: string(wa.UserLogin.ID), CallID: sessionID,
 		RoomID: roomID, SlotID: slotID, MembershipFormat: membershipFormat, ExpectedDevice: expectedDevice, ExpectedSigningKey: expectedSigningKey, ExpectedIdentityKey: expectedIdentityKey, MemberEvent: memberEvent, MemberJoinID: memberJoinID, MemberJoinTS: memberJoinTS, GhostMXID: ghostMXID, BridgeBotMXID: wa.Main.Bridge.Bot.GetMXID().String(), ExpectedUserMXID: expectedMXID, Peer: peer, Group: group && linkToken == "", GroupJID: groupJID, Intent: intent,
 	}); err != nil {
@@ -639,17 +777,24 @@ func (wa *WhatsAppClient) runOutgoingRTCGateway(ctx context.Context, sessionID, 
 		call, bus, err = wa.StartVoIPCall(ctx, peer, video)
 	}
 	if err != nil {
-		_ = wire.Send(rtcwire.Message{Type: "reject", CallID: sessionID, Reason: func() string {
+		if ctx.Err() != nil {
+			return errors.Join(err, ctx.Err(), checkRTCEarlyAnswer(reading))
+		}
+		if sendErr := wire.SendContext(ctx, rtcwire.Message{Type: "reject", CallID: sessionID, Reason: func() string {
 			if linkToken != "" {
 				return "WhatsApp call-link outcome unavailable"
 			}
 			return err.Error()
-		}()})
+		}()}); sendErr != nil {
+			return errors.Join(err, sendErr)
+		}
 		return err
 	}
 	defer func() {
 		if call.State() != meowcaller.CallPhaseEnded {
-			_ = call.Hangup()
+			if err := call.Hangup(); err != nil {
+				wa.UserLogin.Log.Warn().Err(err).Str("call_id", call.ID()).Msg("Outgoing WhatsApp terminal settlement unconfirmed")
+			}
 		}
 	}()
 	if linkToken != "" && !wa.bindRTCLinkCall(roomID, slotID, sessionID, call) {
@@ -676,13 +821,15 @@ func (wa *WhatsAppClient) runOutgoingRTCGateway(ctx context.Context, sessionID, 
 	}
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
-	acceptTimer := time.NewTimer(120 * time.Second)
+	acceptTimer := time.NewTimer(rtcOutgoingPeerAnswerBudget)
 	defer acceptTimer.Stop()
 	waiting := true
 	for waiting {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			// Admission revocation queues the worker error before cancellation.
+			// Preserve it even when the cancellation case wins the select.
+			return checkRTCPreAnswer(ctx, reading)
 		case err := <-reading:
 			if err == nil {
 				return fmt.Errorf("unexpected early Matrix answer")
@@ -691,42 +838,115 @@ func (wa *WhatsAppClient) runOutgoingRTCGateway(ctx context.Context, sessionID, 
 		case <-accepted:
 			waiting = false
 		case <-ticker.C:
+			if err := checkRTCPreAnswer(ctx, reading); err != nil {
+				return err
+			}
 			if call.State() == meowcaller.CallPhaseEnded {
-				_ = wire.Send(rtcwire.Message{Type: "reject", CallID: sessionID, Reason: wa.outgoingWhatsAppEndReason(call.ID())})
-				return nil
+				return wire.SendContext(ctx, rtcwire.Message{Type: "reject", CallID: sessionID, Reason: formatWhatsAppEndReason(call.TerminalReason())})
+			}
+			// Acceptance is recorded before its callback is delivered. Recover
+			// promptly from a delayed callback rather than waiting for the
+			// invitation timeout. Group and link admission remain separate.
+			if !group && linkToken == "" && call.PeerAccepted() {
+				markAccepted()
 			}
 			if linkToken != "" && call.IsCallLinkAdmitted() {
 				markAccepted()
 			}
 		case <-acceptTimer.C:
-			_ = wire.Send(rtcwire.Message{Type: "reject", CallID: sessionID, Reason: "WhatsApp call was not answered before timeout"})
+			if err := checkRTCPreAnswer(ctx, reading); err != nil {
+				return err
+			}
+			// The acceptance callback may have queued its notification at the
+			// same instant as the timeout. Prefer a queued acceptance; the
+			// checks below still reject canceled or terminal calls.
+			select {
+			case <-accepted:
+				waiting = false
+				continue
+			default:
+			}
+			// Preserve a terminal outcome instead of misreporting it as
+			// a no-answer timeout when both become observable together.
+			if call.State() == meowcaller.CallPhaseEnded {
+				return wire.SendContext(ctx, rtcwire.Message{Type: "reject", CallID: sessionID, Reason: formatWhatsAppEndReason(call.TerminalReason())})
+			}
+			// Recheck the same recorded admission conditions as polling.
+			// A call-link admission can race the timer just like direct pickup.
+			if (!group && linkToken == "" && call.PeerAccepted()) || (linkToken != "" && call.IsCallLinkAdmitted()) {
+				waiting = false
+				continue
+			}
+			if err := wire.SendContext(ctx, rtcwire.Message{Type: "reject", CallID: sessionID, Reason: "WhatsApp call was not answered before timeout"}); err != nil {
+				return errors.Join(errors.New("WhatsApp call was not answered before timeout"), err)
+			}
 			return fmt.Errorf("WhatsApp call was not answered before timeout")
 		}
 	}
 
-	if ctx.Err() != nil {
-		return ctx.Err()
+	if err := checkRTCPreAnswer(ctx, reading); err != nil {
+		return err
 	}
 	if call.State() == meowcaller.CallPhaseEnded || (linkToken != "" && !call.IsCallLinkAdmitted()) {
-		_ = wire.Send(rtcwire.Message{Type: "reject", CallID: sessionID, Reason: wa.outgoingWhatsAppEndReason(call.ID())})
-		return nil
+		return wire.SendContext(ctx, rtcwire.Message{Type: "reject", CallID: sessionID, Reason: formatWhatsAppEndReason(call.TerminalReason())})
 	}
-	ringAccepted() // Do not cancel an established call when the ring expires.
+	ringAccepted() // Do not cancel an accepted call when the ring expires.
+	// Direct calls must not join the ghost to MatrixRTC merely because the
+	// remote phone accepted. The relay can still be silent or reject allocation.
+	// Keep the existing group and call-link admission paths unchanged.
+	if !group && linkToken == "" {
+		gateErr := awaitRTCRelayWithReader(ctx, rtcRelayReadyBudget, 100*time.Millisecond, call.RelayReady, func() bool {
+			return call.State() == meowcaller.CallPhaseEnded
+		}, reading)
+		if gateErr != nil {
+			if ctx.Err() != nil {
+				return errors.Join(gateErr, ctx.Err())
+			}
+			if errors.Is(gateErr, errRTCRelayEnded) {
+				return wire.SendContext(ctx, rtcwire.Message{Type: "reject", CallID: sessionID, Reason: formatWhatsAppEndReason(call.TerminalReason())})
+			}
+			if errors.Is(gateErr, context.DeadlineExceeded) {
+				timeoutErr := errors.New("WhatsApp relay media setup timed out")
+				if err := wire.SendContext(ctx, rtcwire.Message{Type: "reject", CallID: sessionID, Reason: timeoutErr.Error()}); err != nil {
+					return errors.Join(timeoutErr, err)
+				}
+				return timeoutErr
+			}
+			return gateErr
+		}
+		wa.UserLogin.Log.Info().Str("call_id", call.ID()).Msg("WhatsApp relay transport ready; forwarding peer acceptance")
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.Join(err, checkRTCEarlyAnswer(reading))
+	}
+	if call.State() == meowcaller.CallPhaseEnded {
+		return wire.SendContext(ctx, rtcwire.Message{Type: "reject", CallID: sessionID, Reason: formatWhatsAppEndReason(call.TerminalReason())})
+	}
+	// The worker must not have answered before we announced peer acceptance.
+	// Check the queued reader result again at the readiness boundary, including
+	// when the relay became ready without entering the waiting loop.
+	if err = checkRTCEarlyAnswer(reading); err != nil {
+		return err
+	}
 	go monitorRTCPeerEnd(ctx, 100*time.Millisecond, func() bool {
 		return call.State() == meowcaller.CallPhaseEnded
 	}, stop)
-	if err = wire.Send(rtcwire.Message{Type: "whatsapp_answered", CallID: sessionID}); err != nil {
+	if err = wire.SendContext(ctx, rtcwire.Message{Type: "whatsapp_answered", CallID: sessionID}); err != nil {
 		return err
 	}
 	wa.UserLogin.Log.Info().Str("call_id", call.ID()).Msg("WhatsApp acceptance forwarded to MatrixRTC worker")
 	_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	select {
-	case err := <-reading:
-		if err != nil {
-			return err
-		}
-	case <-ctx.Done():
-		return ctx.Err()
+	if err := awaitRTCMatrixAnswer(ctx, reading); err != nil {
+		return err
+	}
+	// A queued answer can race cancellation or remote termination. Do not
+	// advertise an established bridge or suppress the terminal notification
+	// when the call has already ended.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if call.State() == meowcaller.CallPhaseEnded {
+		return errors.New("WhatsApp call ended during MatrixRTC media join")
 	}
 	matrixConnected = true
 	_ = conn.SetReadDeadline(time.Time{})
