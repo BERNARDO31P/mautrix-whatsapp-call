@@ -327,7 +327,7 @@ func (p *MediaPipeline) ProtectAudio(opusPayload []byte) ([]byte, error) {
 // and appends the WARP MI tag. It is the generic form of ProtectAudio used by the video
 // send path, which manages its own PT-97 sequencer (header) per WaCalls.
 //
-// NOT VALIDATED: the video send media path is unproven.
+// Live outbound video interoperability remains unverified.
 func (p *MediaPipeline) ProtectRTP(header *rtp.RtpHeader, payload []byte) ([]byte, error) {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/cbe1446dabb5842362b1a4362d4100ec15d8254f/datasheets/group-media-key-epoch.md#L122-L136
 	p.sendMu.Lock()

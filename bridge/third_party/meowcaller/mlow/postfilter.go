@@ -21,10 +21,9 @@ type SmplPostfilterState struct {
 // excitation.
 func SmplCombPostfilter(st *SmplPostfilterState, input []float32, n int, active bool, gain8 float32, nrgEnv [2]float32, out []float32) {
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/ed12f359a086b28e807ba236f0977af1000859fe/wacore/src/voip/mlow/smpl_postfilter.rs#L249-L443
-	// TODO
-	// agent suggestion: port smpl_comb_postfilter — per-subframe autocorrelation →
-	//   resonator, de-emphasis FIR, env-shaped noise (LCG) add; carries biquad state.
-	// human input:
+	// TODO: Implement the excitation-domain comb postfilter: per-subframe
+	// autocorrelation, resonator, de-emphasis FIR and envelope-shaped noise
+	// (LCG), with persistent biquad state.
 	panic("mlow: SmplCombPostfilter not yet implemented (scaffold)")
 }
 

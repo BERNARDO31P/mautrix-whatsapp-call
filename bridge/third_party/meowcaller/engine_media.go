@@ -153,7 +153,7 @@ func (e *engine) maybeStartMediaMatching(callID string, expected *engineCall) {
 // connectAndAllocate opens the relay DataChannel and sends the STUN allocate, returning
 // the channel and the allocate bytes (re-sent by the keepalive).
 //
-// NOT VALIDATED: live-relay only.
+// Requires live relay validation.
 // Check allocation prerequisites before spending a transport attempt.
 func usableRelayEndpoint(rd *relayData, ep *relayEndpoint) bool {
 	if rd == nil || ep == nil || len(rd.relayKeyASCII) == 0 ||
@@ -362,7 +362,7 @@ func relayControlReady(allocationConfirmed, consentConfirmed bool) bool {
 // binding-success. The working recipe is preserved exactly: a consent ping (0x0801) goes
 // out with the allocate at t+0, BEFORE any RTP; no STUN binding-requests are ever sent.
 //
-// NOT VALIDATED: live-relay only.
+// Requires live relay validation.
 func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKey []byte, selfLID, peerLID string, rd *relayData, inbound bool) error {
 	ctx, cancelMedia := context.WithCancelCause(ctx)
 	defer cancelMedia(nil)
@@ -895,8 +895,8 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// without it the relay drops the binding and the peer's call fails.
 	// Video receive uses participant-scoped WARP pipelines keyed on each video SSRC.
 	//
-	// NOT VALIDATED: no live video-RTP vector; assumes video shares the audio E2E keys and
-	// WARP framing, and that the relay bridges the video SSRC.
+	// Live video RTP validation remains pending. This path assumes shared audio
+	// E2E keys and WARP framing, and relay forwarding of the video SSRC.
 	rekeyPeer := func(answeringPeer string) error {
 		return audioReceivers.RekeyFallback(answeringPeer)
 	}
@@ -1699,7 +1699,7 @@ func videoRtpDurationSamples(duration time.Duration) uint32 {
 // protects them with the video pipeline, and sends them to the relay. The send path is
 // fed encoded H.264 (e.g. from the VideoBridge / WebCodecs), not raw frames.
 //
-// NOT VALIDATED: the video send media path is unproven.
+// Live outbound video interoperability remains unverified.
 type videoSender struct {
 	mediaContext     context.Context
 	cancelMedia      context.CancelCauseFunc

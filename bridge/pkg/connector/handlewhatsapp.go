@@ -109,7 +109,7 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 	case *events.CallPreAccept:
 		wa.trackWACallEvent(evt.BasicCallMeta, "preaccept", "")
 	case *events.CallRelayLatency, *events.CallTransport, *events.UnknownCallEvent:
-		// Media and signalling transport are not yet integrated.
+		// Call transport events are handled by the VoIP engine.
 	case *events.IdentityChange:
 		wa.handleWAIdentityChange(ctx, evt)
 	case *events.MarkChatAsRead:

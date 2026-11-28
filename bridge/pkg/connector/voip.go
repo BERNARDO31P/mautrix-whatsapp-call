@@ -296,8 +296,8 @@ func (wa *WhatsAppClient) WhatsAppVoIPCall(callID string) (*meowcaller.Call, boo
 	return call, ok
 }
 
-// AttachVoIPMedia creates a bounded, bidirectional PCM/H.264 handoff for a
-// future MatrixRTC transport. The transport must start before AnswerVoIPCall.
+// AttachVoIPMedia creates a bounded, bidirectional PCM/H.264 media bus.
+// The MatrixRTC transport must start before AnswerVoIPCall.
 func (wa *WhatsAppClient) AttachVoIPMedia(callID string) (*voipbridge.MediaBus, error) {
 	wa.voipCallsMu.Lock()
 	call, ok := wa.voipCalls[callID]
@@ -344,8 +344,7 @@ func (wa *WhatsAppClient) AttachVoIPMedia(callID string) (*voipbridge.MediaBus, 
 	return bus, nil
 }
 
-// AnswerVoIPCall refuses to accept a WhatsApp call until there is a media
-// handoff. A real MatrixRTC client still needs to be wired to that handoff.
+// AnswerVoIPCall requires an attached media bus before accepting a WhatsApp call.
 func (wa *WhatsAppClient) AnswerVoIPCall(callID string) error {
 	wa.voipCallsMu.RLock()
 	call, found := wa.voipCalls[callID]

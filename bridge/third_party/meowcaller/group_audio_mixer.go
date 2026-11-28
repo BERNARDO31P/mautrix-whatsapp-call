@@ -29,7 +29,7 @@ type participantAudioSinkFramer struct {
 
 func newParticipantAudioMixer() *participantAudioMixer {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/fabad4acce2147da4e40c1e8c6a1643053ae8c59/datasheets/group-audio-mixer.md#L29-L38
-	// NOT VALIDATED: validated once live group-call playout includes every connected remote participant.
+	// Live validation requires playout from all connected remote participants.
 	return &participantAudioMixer{
 		streams: make(map[string]*participantAudioMixQueue),
 		allowed: make(map[string]struct{}),
@@ -43,7 +43,7 @@ func shouldStartParticipantMixing(activeParticipantIDs []string) bool {
 
 func (m *participantAudioMixer) Add(participantID string, pcm []float32) bool {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/fabad4acce2147da4e40c1e8c6a1643053ae8c59/datasheets/group-audio-mixer.md#L31-L37
-	// NOT VALIDATED: validated once live group-call playout includes every connected remote participant.
+	// Live validation requires playout from all connected remote participants.
 	if participantID == "" || len(pcm) == 0 {
 		return false
 	}
@@ -73,7 +73,7 @@ func (m *participantAudioMixer) Add(participantID string, pcm []float32) bool {
 
 func (m *participantAudioMixer) Retain(participantIDs []string) {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/fabad4acce2147da4e40c1e8c6a1643053ae8c59/datasheets/group-audio-mixer.md#L35-L37
-	// NOT VALIDATED: validated once a departed participant stops contributing to live playout.
+	// Live validation requires confirming that departed participants cease contributing to playout.
 	allowed := make(map[string]struct{}, len(participantIDs))
 	for _, participantID := range participantIDs {
 		if participantID != "" {
@@ -93,7 +93,7 @@ func (m *participantAudioMixer) Retain(participantIDs []string) {
 
 func (m *participantAudioMixer) MixChunk() ([]float32, bool) {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/fabad4acce2147da4e40c1e8c6a1643053ae8c59/datasheets/group-audio-mixer.md#L31-L38
-	// NOT VALIDATED: validated once two live remote speakers are simultaneously audible without extending playout duration.
+	// Live validation requires simultaneous speakers without extending playout duration.
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -141,7 +141,7 @@ func (m *participantAudioMixer) MixChunk() ([]float32, bool) {
 
 func (f *participantAudioSinkFramer) Push(chunk []float32) ([]float32, bool) {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/fabad4acce2147da4e40c1e8c6a1643053ae8c59/datasheets/group-audio-mixer.md#L20-L26
-	// NOT VALIDATED: validated once live mixed playout reaches a public AudioSink in 960-sample frames.
+	// Live validation requires mixed playout to reach AudioSink in 960-sample frames.
 	f.pending = append(f.pending, chunk...)
 	if len(f.pending) < FrameSamples {
 		return nil, false

@@ -2007,8 +2007,8 @@ func (e *engine) finishCallMatchingOffer(callID, reason string, reserveUnknown b
 // learns the relay endpoint and media never starts. Called before Connect so the map
 // write never races the receive loop.
 //
-// NOT VALIDATED: reaches into the client's unexported nodeHandlers via reflection +
-// unsafe; covered only by a live call against the real relay.
+// This integration uses reflection and unsafe to access the client's private
+// nodeHandlers map. Live relay interoperability requires separate validation.
 func (e *engine) installCallAckHook() error {
 	// Source of truth: https://github.com/tulir/whatsmeow/blob/e9a033b24933cc8d90fa5ff8991b1268ba80a140/client.go#L110-L120
 	cli := e.c.wa

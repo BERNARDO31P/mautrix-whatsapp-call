@@ -123,7 +123,7 @@ func (c *RelayMediaChannel) Close() error {
 
 // Send writes one media/STUN packet as a binary DataChannel message.
 func (c *RelayMediaChannel) Send(data []byte) (int, error) {
-	// NOT VALIDATED: no vector exists for the live transport; exercised only against a real relay.
+	// Live transport validation requires a real relay; no test vector is available.
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/src/voip/transport.rs#L118-L124
 	n, err := c.dc.Write(data)
 	err = relayWriteResult(n, len(data), err)
@@ -137,7 +137,7 @@ func (c *RelayMediaChannel) Send(data []byte) (int, error) {
 
 // Recv reads one DataChannel message into buf, returning its length.
 func (c *RelayMediaChannel) Recv(buf []byte) (int, error) {
-	// NOT VALIDATED: no vector exists for the live transport; exercised only against a real relay.
+	// Live transport validation requires a real relay; no test vector is available.
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/src/voip/transport.rs#L126-L132
 	n, err := c.dc.Read(buf)
 	if err != nil {
@@ -221,7 +221,7 @@ func dtlsRecordMetadata(p []byte) uint32 {
 // relay endpoint. Self-signed cert; server-cert verification skipped (media auth is
 // HBH SRTP, not DTLS). No vector — validated only against a live relay.
 func ConnectRelayMedia(relayAddr *net.UDPAddr, opts ...Option) (*RelayMediaChannel, error) {
-	// NOT VALIDATED: no vector exists for the live transport; exercised only against a real relay.
+	// Live transport validation requires a real relay; no test vector is available.
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/src/voip/transport.rs#L136-L195
 	return ConnectRelayMediaContext(context.Background(), relayAddr, opts...)
 }
